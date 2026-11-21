@@ -120,6 +120,18 @@
       "logical_id": "",
       "sha256": "f4f71c45eb10f80df03cec4f7843fae34e2310b61fe540ddb10428bde0062cbb"
     },
+    ".agents/skills/assess-all/SKILL.md": {
+      "host": "",
+      "kind": "file",
+      "logical_id": "",
+      "sha256": "e03cd5216d7156d07118dffa2d6eacbbc28655196b5b726c2aaae6571ff3db53"
+    },
+    ".agents/skills/assess-all/reference/canonical-body.md": {
+      "host": "",
+      "kind": "file",
+      "logical_id": "",
+      "sha256": "507b2990b3dd9dc37155d0fdb6f05bad15032f8fa387753a43f0f8ed248e72b7"
+    },
     ".agents/skills/assess-api-design/SKILL.md": {
       "host": "",
       "kind": "file",
@@ -504,6 +516,18 @@
       "logical_id": "",
       "sha256": "236d5b88357fde8196975637189fd9118825f16e21ef103094a67b45205afb8b"
     },
+    ".agents/skills/benchmark/SKILL.md": {
+      "host": "",
+      "kind": "file",
+      "logical_id": "",
+      "sha256": "2ed6cbb87d7e7c7812f9099a5a18da90d79c49b4e54ac71165ca263c144dc14b"
+    },
+    ".agents/skills/benchmark/reference/canonical-body.md": {
+      "host": "",
+      "kind": "file",
+      "logical_id": "",
+      "sha256": "9704bf785e13c6354f424c7944e6e4bffe4037ab9756ba4b9047c1379baf68bd"
+    },
     ".agents/skills/exec-set/SKILL.md": {
       "host": "",
       "kind": "file",
@@ -515,6 +539,18 @@
       "kind": "file",
       "logical_id": "",
       "sha256": "02f3bbedd2070da600b252ed8b09f5edc6bcb859f4f47bfd24eec83705bf23d4"
+    },
+    ".agents/skills/getting-started/SKILL.md": {
+      "host": "",
+      "kind": "file",
+      "logical_id": "",
+      "sha256": "6d5ceaa708003b0be930dc00e2f8690510bc118156579f975a68c903b755530b"
+    },
+    ".agents/skills/getting-started/reference/canonical-body.md": {
+      "host": "",
+      "kind": "file",
+      "logical_id": "",
+      "sha256": "bcf3583a58697534721b00d194a21d0dd24e27176e6e0f435241e5054cb988f1"
     },
     ".agents/skills/handoff/SKILL.md": {
       "host": "",
@@ -528,6 +564,30 @@
       "logical_id": "",
       "sha256": "d9400c3579e05dafc863ccee2964befe75e2960ebd148c68249e4cc5a40b83d9"
     },
+    ".agents/skills/incident/SKILL.md": {
+      "host": "",
+      "kind": "file",
+      "logical_id": "",
+      "sha256": "0797f88b2d001e3c10cfdec77a66dd4fe16d5f966831453e6662824a756ad1dc"
+    },
+    ".agents/skills/incident/reference/canonical-body.md": {
+      "host": "",
+      "kind": "file",
+      "logical_id": "",
+      "sha256": "9d36156dc5c8e97420e8b7f488acac9378c758dc0411b05316a6b479f9f42d27"
+    },
+    ".agents/skills/ipd-lifecycle/SKILL.md": {
+      "host": "",
+      "kind": "file",
+      "logical_id": "",
+      "sha256": "0db771c6f92b0c69508d770e6e11f5794fe9e69f3c973bc09a79e460698dafd4"
+    },
+    ".agents/skills/ipd-lifecycle/reference/canonical-body.md": {
+      "host": "",
+      "kind": "file",
+      "logical_id": "",
+      "sha256": "a2de300bf226c0aed8421da4986f2cbcdf0612b8330391913e1e6b0907d1b212"
+    },
     ".agents/skills/list-workflows/SKILL.md": {
       "host": "",
       "kind": "file",
@@ -539,6 +599,18 @@
       "kind": "file",
       "logical_id": "",
       "sha256": "e3c2462b7907633ceda8110eec35b134e20a3d342149cfc204f5d31672b75e35"
+    },
+    ".agents/skills/migrate/SKILL.md": {
+      "host": "",
+      "kind": "file",
+      "logical_id": "",
+      "sha256": "9ee37d0969eeb98f48e02bff89be7fb30f3ad6d767015c130c370528e5cacab2"
+    },
+    ".agents/skills/migrate/reference/canonical-body.md": {
+      "host": "",
+      "kind": "file",
+      "logical_id": "",
+      "sha256": "24fb0d1227007a44bca66a717128f7db8c21d508a2254032db7d0b08af2df94f"
     },
     ".agents/skills/plain/SKILL.md": {
       "host": "",
@@ -552,6 +624,66 @@
       "logical_id": "",
       "sha256": "b223cf601fb5f9a2fdada0f8d99acf72d2bc9dacefa6515939ccdfbe7e45a848"
     },
+    ".agents/skills/plan-review-long/SKILL.md": {
+      "host": "",
+      "kind": "file",
+      "logical_id": "",
+      "sha256": "2ab63bb3b4ad386faea3d982bd254672b595f6dee1bbb0ab77ea0801bc8d67f6"
+    },
+    ".agents/skills/plan-review-long/reference/canonical-body.md": {
+      "host": "",
+      "kind": "file",
+      "logical_id": "",
+      "sha256": "5651aea069bc502a22245b43db85a3924cb94551ebadd9329cd829f5cebdeb90"
+    },
+    ".agents/skills/plan-review/SKILL.md": {
+      "host": "",
+      "kind": "file",
+      "logical_id": "",
+      "sha256": "ff3ff56dab5d402f39dd1caa544e0e15f292734b0b20c2cb5314f799378a6905"
+    },
+    ".agents/skills/plan-review/reference/canonical-body.md": {
+      "host": "",
+      "kind": "file",
+      "logical_id": "",
+      "sha256": "630efe95d9fdccd90746162fa426f2a60bfda98efb0629f68179cb08a6505863"
+    },
+    ".agents/skills/release-notes/SKILL.md": {
+      "host": "",
+      "kind": "file",
+      "logical_id": "",
+      "sha256": "caed134e1524f2e99e8c1f97999132955fd5486e43e04296990e9607f5fbb0f3"
+    },
+    ".agents/skills/release-notes/reference/canonical-body.md": {
+      "host": "",
+      "kind": "file",
+      "logical_id": "",
+      "sha256": "e0289d80dd5bcea61d6ec6bc163fb98120b2f3a88838be266bfeffdacb76b4ac"
+    },
+    ".agents/skills/release-review-plan/SKILL.md": {
+      "host": "",
+      "kind": "file",
+      "logical_id": "",
+      "sha256": "826ce33644e06272cbc558db68f2f16b95cb43e2c23caf0e630b41cf87ee9418"
+    },
+    ".agents/skills/release-review-plan/reference/canonical-body.md": {
+      "host": "",
+      "kind": "file",
+      "logical_id": "",
+      "sha256": "38403db6808b1a8b046a7a515040d5c96209dc0f639335cd1b896c35f2c58ac4"
+    },
+    ".agents/skills/release-review/SKILL.md": {
+      "host": "",
+      "kind": "file",
+      "logical_id": "",
+      "sha256": "a7e858e3de6b690f912377526d7f4fe18e4c21bbd586db9f0cb03b8064b42432"
+    },
+    ".agents/skills/release-review/reference/canonical-body.md": {
+      "host": "",
+      "kind": "file",
+      "logical_id": "",
+      "sha256": "9f043a374c3d412d6a6bf0e2cf559475d409c4c5d78bf6a619cdcde753590599"
+    },
     ".agents/skills/research/SKILL.md": {
       "host": "",
       "kind": "file",
@@ -563,6 +695,78 @@
       "kind": "file",
       "logical_id": "",
       "sha256": "e3dd0f7f21c7de4c07bd166785139f3ad88d420dea8e85c31f47c1d5b3912248"
+    },
+    ".agents/skills/scaffold/SKILL.md": {
+      "host": "",
+      "kind": "file",
+      "logical_id": "",
+      "sha256": "fdcaa12c28bf50866ba75a4c4dcc7d9bbacc22f1bfb59357c8f1774fe06f4c06"
+    },
+    ".agents/skills/scaffold/reference/canonical-body.md": {
+      "host": "",
+      "kind": "file",
+      "logical_id": "",
+      "sha256": "1a645dc5750ce766047a1eca89af3791e86155d3b351a873090ba39de99d9abb"
+    },
+    ".agents/skills/setup-repo/SKILL.md": {
+      "host": "",
+      "kind": "file",
+      "logical_id": "",
+      "sha256": "62c88c88d8bf7713d866c5833cc7f321ba7c5ec239fe6fe648884b6f48b0894b"
+    },
+    ".agents/skills/setup-repo/reference/canonical-body.md": {
+      "host": "",
+      "kind": "file",
+      "logical_id": "",
+      "sha256": "42f0380eaf61c915922e7b856dfc13a49bbea59f52fd796c64193f4f74dba156"
+    },
+    ".agents/skills/spec-review/SKILL.md": {
+      "host": "",
+      "kind": "file",
+      "logical_id": "",
+      "sha256": "49909f40a1d5daf4fad2f00e0ff318acd6709527965db9eeb5268c1e3a2ff004"
+    },
+    ".agents/skills/spec-review/reference/canonical-body.md": {
+      "host": "",
+      "kind": "file",
+      "logical_id": "",
+      "sha256": "111907c08a1991b671fd32c7bebe0fd81e5f343e79f57fc801a4a3d60d840ac2"
+    },
+    ".agents/skills/spec/SKILL.md": {
+      "host": "",
+      "kind": "file",
+      "logical_id": "",
+      "sha256": "3b0232578c0e2601d792e6e786455c145d92a517f5b061dead5348d3b7bbb98e"
+    },
+    ".agents/skills/spec/reference/canonical-body.md": {
+      "host": "",
+      "kind": "file",
+      "logical_id": "",
+      "sha256": "d0cb15c123cbf16a034bb009470d15639e17e0fc72fdd9b68780fa4f60acf0e1"
+    },
+    ".agents/skills/verify-execution/SKILL.md": {
+      "host": "",
+      "kind": "file",
+      "logical_id": "",
+      "sha256": "595ed269639365a941c7d246490594a97a206872ab6eb12e47167be8b07928b8"
+    },
+    ".agents/skills/verify-execution/reference/canonical-body.md": {
+      "host": "",
+      "kind": "file",
+      "logical_id": "",
+      "sha256": "5a52d112086008770b49577cb8a25d78ce643cc3f759249caeaec98fb872a9fa"
+    },
+    ".agents/skills/verify/SKILL.md": {
+      "host": "",
+      "kind": "file",
+      "logical_id": "",
+      "sha256": "135d64e7ba3135765265126108e8f86c98a353d4e75270dddfb0f0f9172ab7bf"
+    },
+    ".agents/skills/verify/reference/canonical-body.md": {
+      "host": "",
+      "kind": "file",
+      "logical_id": "",
+      "sha256": "dbdaf216fce20a2c6dd0bbdbc8f9b550773ff2430c1ac295a76366b04e815aeb"
     },
     ".agents/skills/whatnext/SKILL.md": {
       "host": "",
@@ -580,7 +784,7 @@
       "host": "",
       "kind": "file",
       "logical_id": "",
-      "sha256": "e7af9ea8412bdf5b93d1a35dbe51a54a8809bb88aaa0bb6c10664ee26d4be74a"
+      "sha256": "8f6ef7595a7f20c5d4894f80d02fbb768c7f1bfb31b66572089ab1718943a896"
     },
     ".aw/system/workflows/README.md": {
       "host": "",
@@ -1006,7 +1210,7 @@
       "host": "",
       "kind": "file",
       "logical_id": "",
-      "sha256": "3dc752e7d89d8f0ba79c72590151bad24bdd7fcf87c9b89ee309aa803440d1d9"
+      "sha256": "4900cd16f8e296e39574e271c49acec58784d1b15f63ac8d58ade22fd368e6fa"
     },
     ".aw/system/workflows/ipd-lifecycle/README.md": {
       "host": "",
@@ -2005,7 +2209,7 @@
       "sha256": "46970f75c6d377d7b6280eb07f05ff97f4a6ab3a305120fb5e433b1ad3469078"
     }
   },
-  "installed_version": "1.3.0rc2.dev13510+g0ca22e122",
+  "installed_version": "1.3.0rc2.dev13549+g373f4d9c8",
   "installer": "agent-workflows",
   "managed_sections": {},
   "schema_version": 2

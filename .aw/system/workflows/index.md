@@ -1,7 +1,7 @@
 # Agent Workflows
 
-<!-- WORKFLOWS-VERSION: 1.3.0rc2.dev13510+g0ca22e122 -->
-Version: `1.3.0rc2.dev13510+g0ca22e122` (source of truth: `.aw/system/VERSION`). Scheme:
+<!-- WORKFLOWS-VERSION: 1.3.0rc2.dev13549+g373f4d9c8 -->
+Version: `1.3.0rc2.dev13549+g373f4d9c8` (source of truth: `.aw/system/VERSION`). Scheme:
 git-tag-driven semantic versioning (baseline `v1.0.0`); `VERSION` is DERIVED from the
 tag, not hand-edited. The installer stamps this into each target so `/list-workflows`
 and `setup-repo` can report the installed version.
