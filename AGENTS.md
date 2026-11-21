@@ -22,6 +22,9 @@ When asked to write a prompt to give to another AI (e.g. a research prompt for a
 2. It is self-contained, so the user can select-all-and-copy it, or upload it and say "read and execute the attached prompt", with nothing to edit.
 3. It instructs the target AI to return its answer as a DOWNLOADABLE markdown (`.md`) file, so the result can be handed back for consumption.
 
+### Companion records storage (do NOT write to target-local `.aw/records/`)
+This repository uses companion records storage (`public-target-private-companion`). Durable records (plans, specs, backlog items, research, walkthroughs, and reviews) live in the external companion repository located by `aw path records`, never under target-local `.aw/records/`. Author records with `aw ipd scaffold`, `aw backlog new`, `aw specs new`, and `aw research new` so they land in the companion root automatically. Never stage or commit `.aw/records/` paths in this target repository; commit record changes only inside the companion Git repository.
+
 ### Durable reference and walkthroughs documentation
 1. Immortalize research/analysis you rely on for a decision to `.aw/records/research/`. Do NOT hand-name research files or hand-maintain the index: use the `aw research` and `aw archive` verbs (`aw research new`/`new-comparison` to create, `index [--check]`/`find` to manage the manifest, `set-assign`/`mv` to regroup, `aw archive` to deep-shelve). See `aw research --help` and `.aw/records/research/README.md`.
 2. Save narrative walkthroughs to `.aw/records/walkthroughs/` with `...-walkthrough.md`.

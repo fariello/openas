@@ -580,7 +580,7 @@
       "host": "",
       "kind": "file",
       "logical_id": "",
-      "sha256": "d9dd8659b2e3f681ab14814e6d48c86e55badb917b596b8f76d58932da79fab2"
+      "sha256": "e7af9ea8412bdf5b93d1a35dbe51a54a8809bb88aaa0bb6c10664ee26d4be74a"
     },
     ".aw/system/workflows/README.md": {
       "host": "",
@@ -682,7 +682,7 @@
       "host": "",
       "kind": "file",
       "logical_id": "",
-      "sha256": "514005d4b1f739a63f7275fc608a6068788b70e1ba0e5e0a76e716fe6cca716f"
+      "sha256": "a3f20daa4ae5ff9407c47066996cb8798d6e7dbe880a37120baa0d2e30bf847f"
     },
     ".aw/system/workflows/assess/lenses/accessibility.md": {
       "host": "",
@@ -1006,7 +1006,7 @@
       "host": "",
       "kind": "file",
       "logical_id": "",
-      "sha256": "dfc8cbe13f92139d8d09038a605791546b3c5b3e510ded64663f18fe989780ca"
+      "sha256": "3dc752e7d89d8f0ba79c72590151bad24bdd7fcf87c9b89ee309aa803440d1d9"
     },
     ".aw/system/workflows/ipd-lifecycle/README.md": {
       "host": "",
@@ -1996,7 +1996,7 @@
       "host": "",
       "kind": "section",
       "logical_id": "pointer",
-      "sha256": "c59a6c7358470e9fc7392d6a51f31cb25e17eb690ed0b00ae93822a1be22da74"
+      "sha256": "8bdf1a58d44aee86ef6c55a71666bf6849c57c13de5830744b3ee16ba5bd8129"
     },
     "AGENTS.md#aw:reporting": {
       "host": "",
@@ -2005,7 +2005,7 @@
       "sha256": "46970f75c6d377d7b6280eb07f05ff97f4a6ab3a305120fb5e433b1ad3469078"
     }
   },
-  "installed_version": "1.3.0rc2.dev13262+gc18b45ab2",
+  "installed_version": "1.3.0rc2.dev13510+g0ca22e122",
   "installer": "agent-workflows",
   "managed_sections": {},
   "schema_version": 2

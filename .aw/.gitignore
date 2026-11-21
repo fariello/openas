@@ -81,3 +81,5 @@ records/prompts/INDEX.md
 # embedded gitlink (mode 160000) pointing at an unpushed lane commit.
 # ANCHORED for the `/inbox/` reason (a bare `worktrees/` would match at any depth).
 /worktrees/
+# companion backend: durable records live in the companion repository, not target-local .aw/records/
+/records/
