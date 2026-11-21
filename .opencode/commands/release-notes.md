@@ -1,0 +1,13 @@
+---
+description: Release discipline: decide the version bump from the actual changes, draft the changelog and human release notes (prose-style guide; breaking changes prominent), and update CHANGELOG/version files with confirmation. Never publishes, tags, pushes, or deploys. Distinct from release-review Section 9 (which executes a release).
+agent: build
+---
+
+<!-- Deprecation notice: `/release-notes` is deprecated; prefer `/aw release-notes`. This alias continues to work for now but will eventually be pruned. -->
+
+Read and execute @.aw/system/workflows/release-notes/release-notes.md.
+
+If the user provided arguments, treat them as the target path(s) and/or flags for this workflow: $ARGUMENTS
+
+Treat the referenced file as the controlling instruction and follow it fully.
+Reporting: follow `AGENTS.md#aw:reporting` (concise prose; required reports still in full).

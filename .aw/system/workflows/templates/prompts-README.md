@@ -1,0 +1,79 @@
+# .aw/records/prompts/
+
+Operational STAGING for prompts, organized by lifecycle state. Prompt files use the uniform artifact
+grammar `YYYYMMDD-<setid>-NN-<id6>-<slug>.prompt.md` (the creating machine's local date; `<setid>` is
+the Set id, defaulting to the slug for a prompt that belongs to no group; `NN` is the order within
+that Set; `<id6>` is the prompt's own stable 6-character citation handle; `<slug>` is lowercase
+kebab-case; `.prompt` is the uniform artifact-type facet), the same convention as plans and specs.
+Do NOT hand-name a staged prompt: `aw prompts new` mints the id6 and derives the name and metadata
+(dry-run by default, `--apply` to write, never auto-staged).
+
+A legacy `YYYYMMDD-HHMM-NN-<slug>.prompt.md` name dated before this repository's `prompt_id6` cutover
+stays valid and is grandfathered; convert one on demand with
+`aw rename prompts <legacy-name> --to-id6`.
+
+Pipeline metadata lives in a SINGLE leading HTML comment on the first line of the file, and the
+prompt's `Id:` is one of its fields (never a `- Id:` bullet, which would render as visible text above
+the prompt body):
+
+```text
+<!-- aw-prompt: Kind: research | Id: <id6> | Set: <setid> | Status: pending | Created: 2026-08-30 | Author: <agent> (<model>) | Targets: ... | Concerns: ... -->
+```
+
+Recognized prompt kinds (the `Kind:` field of that comment): run-once / research prompts QUEUED to be
+executed (the original staging use), and `session-handoff` resume prompts produced by `/handoff` (a
+prompt for the NEXT session rather than a task to run now). Handoff drafts are written to the
+gitignored `untracked/` lane (below) and promoted only after review.
+
+This is NOT the same as `.aw/records/prompt-library/`. The two prompt homes are:
+
+- **`.aw/records/prompts/`** (here): operational staging. "What prompt is queued to run?" A prompt lands
+  in `pending/`, is run, and its lifecycle is tracked by MOVING it between the buckets below. Answer
+  the question `ls .aw/records/prompts/pending/` with a glance.
+- **`.aw/records/prompt-library/`**: the evergreen, copy-paste prompt LIBRARY (reference material, not stamped
+  with a framework version, not a run queue).
+
+## The prompt -> results convention
+
+A staged prompt produces RESULTS. Keep them apart:
+
+- The PROMPT lives here (`.aw/records/prompts/<bucket>/`).
+- Its RESULTS (the durable research/analysis you rely on) are filed under
+  `.aw/records/research/<topic>/` (see `.aw/records/research/README.md`).
+
+This separation follows the filesystem-encoded-state principle (GUIDING_PRINCIPLES P5, DECISIONS D91):
+the prompt's lifecycle is glanceable from its directory; the results are durable, path-cited artifacts.
+
+## The lifecycle
+
+- **`pending/`** - queued to run, or being iterated on.
+- **`executed/`** - the prompt has been run and its results filed (terminal; `done/` is an accepted alias).
+- **`superseded/`** - replaced by a better/subsequent prompt; kept for the record.
+- **`not-executed/`** - deliberately decided against, no replacement.
+- **`reusable/`** - prompts meant to be re-run repeatedly (e.g. a recurring verification runbook); not a
+  terminal state.
+
+Retire a prompt by prepending a `RETIRED YYYY-MM-DD: <reason>; superseded by <path/commit>` header and
+`git mv`ing it to `superseded/` or `not-executed/`. Never silently delete a prompt; retiring preserves
+the record and the reason.
+
+## The `untracked/` quarantine lane (gitignored) - DECISIONS D94
+
+`.aw/records/prompts/untracked/` is a GITIGNORED quarantine lane for raw, sensitive, or work-in-progress
+prompts that must NOT be accidentally committed - most importantly `/handoff` session-handoff drafts,
+which capture raw session context. It mirrors the inter-agent comms `untracked/` lane (D81): the directory
+you write to IS the privilege level.
+
+This lane is named `untracked/`; its retired name was `local/`, which an older checkout or an older
+adopter repo may still show for the same lane. Run `aw normalize-lanes` to rename it forward.
+
+- **`untracked/`** (gitignored): never committed. Write raw/sensitive/WIP prompts here. The
+  framework-owned `.aw/.gitignore` ignores it via `records/*/untracked/` (it does not touch the repo
+  root `.gitignore`). The installer materializes the dir so it is discoverable, but git does not track
+  it empty and its contents can never be committed.
+- **The tracked lifecycle buckets** (`pending/`, `executed/`, ...): durable prompts that travel with the
+  repo, visible to other agents and humans.
+
+To make an `untracked/` prompt durable: REVIEW and scrub it (remove secrets, personal/sensitive content;
+consider `aw check-local-leaks`), then `git mv .aw/records/prompts/untracked/<file> .aw/records/prompts/pending/<file>`.
+Promotion is a deliberate human act, never automatic.
