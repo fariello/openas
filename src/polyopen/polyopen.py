@@ -85,7 +85,7 @@ import io
 import lzma
 import os
 import time
-from typing import Optional
+from typing import Optional, Union
 from urllib.parse import ParseResult, urlparse
 
 _NETWORK_SCHEMES = frozenset(('http', 'https', 'ftp', 'ssh', 'sftp', 's3', 'gs', 'az', 'hdfs'))
@@ -95,6 +95,71 @@ _LINK_FALLBACK_ERRNOS = frozenset(
     for code in (getattr(errno, name, None),)
     if code is not None
 )
+
+
+class _CountingByteStream:
+    """Lightweight binary stream proxy that counts exact raw bytes read."""
+
+    def __init__(self, stream):
+        self._stream = stream
+        self.bytes_read = 0
+
+    def read(self, size: int = -1):
+        data = self._stream.read(size)
+        if data:
+            self.bytes_read += len(data)
+        return data
+
+    def read1(self, size: int = -1):
+        read1_fn = getattr(self._stream, 'read1', None)
+        if read1_fn is not None:
+            data = read1_fn(size)
+        else:
+            data = self._stream.read(size)
+        if data:
+            self.bytes_read += len(data)
+        return data
+
+    def readinto(self, b):
+        readinto_fn = getattr(self._stream, 'readinto', None)
+        if readinto_fn is not None:
+            n = readinto_fn(b)
+            if n:
+                self.bytes_read += n
+            return n
+        data = self._stream.read(len(b))
+        n = len(data)
+        b[:n] = data
+        self.bytes_read += n
+        return n
+
+    def readable(self) -> bool:
+        fn = getattr(self._stream, 'readable', None)
+        return fn() if fn is not None else True
+
+    def writable(self) -> bool:
+        return False
+
+    def seekable(self) -> bool:
+        fn = getattr(self._stream, 'seekable', None)
+        return fn() if fn is not None else False
+
+    def close(self):
+        close_fn = getattr(self._stream, 'close', None)
+        if close_fn is not None:
+            close_fn()
+
+    def __getattr__(self, name):
+        return getattr(self._stream, name)
+
+
+def format_bytes(num: float) -> str:
+    """Format bytes to human readable sizes."""
+    for unit in ['B', 'KB', 'MB', 'GB', 'TB', 'PB', 'EB', 'ZB']:
+        if num < 1024.0:
+            return f"{num:3.1f}{unit}"
+        num /= 1024.0
+    return f"{num:3.1f}YB"
 
 
 def _normalized_path(filename: str, parsed: ParseResult) -> str:
@@ -197,18 +262,18 @@ class PolyReader:
         Closes the file.
     """
 
-    def __init__(self, filename: str, show_progress: bool = False):
+    def __init__(self, filename: Union[str, os.PathLike], show_progress: bool = False):
         """
         Initialize PolyReader with a filename.
 
         Parameters
         ----------
-        filename : str
+        filename : str or os.PathLike
             The name of the file to read.
         show_progress : bool
             Whether to show a progress bar.
         """
-        self.filename = filename
+        self.filename = os.fsdecode(filename)
         self.show_progress = show_progress
         self._fh = None
         self._raw_fh = None
@@ -219,8 +284,33 @@ class PolyReader:
         self._ftp_path = None
         self._response = None
         self._progress = None
+        self._counting_stream = None
+        self._progress_raw_bytes = 0
         self._request_iterator = False
+        self._iter_buffer = ""
         self._http_file_size = None
+
+    def _make_counted_stream(self, stream):
+        """Wrap binary stream in _CountingByteStream when show_progress is enabled."""
+        if self.show_progress:
+            self._counting_stream = _CountingByteStream(stream)
+            return self._counting_stream
+        return stream
+
+    def _ensure_open(self):
+        if self._fh is None:
+            raise ValueError("I/O operation on closed file.")
+
+    def _update_progress(self, text: str = ""):
+        if not (self.show_progress and self._progress is not None):
+            return
+        if self._counting_stream is not None:
+            delta = self._counting_stream.bytes_read - self._progress_raw_bytes
+            if delta > 0:
+                self._progress.update(delta)
+                self._progress_raw_bytes += delta
+        elif text:
+            self._progress.update(len(text.encode('utf-8')))
 
     def __enter__(self) -> 'PolyReader':
         """
@@ -270,7 +360,84 @@ class PolyReader:
         """
         return self
 
-    def __next__(self):
+    def readline(self, size: int = -1) -> str:
+        """Read and return one line from the stream, or up to size characters."""
+        self._ensure_open()
+        if self._request_iterator:
+            if size == 0:
+                return ""
+            if self._iter_buffer:
+                chunk = self._iter_buffer
+                if size is not None and size > 0 and len(chunk) > size:
+                    self._iter_buffer = chunk[size:]
+                    return chunk[:size]
+                self._iter_buffer = ""
+                return chunk
+            try:
+                raw = next(self._fh)
+            except StopIteration:
+                return ""
+            line = raw.decode('utf-8') if isinstance(raw, bytes) else raw
+            self._update_progress(line)
+            if size is not None and size > 0 and len(line) > size:
+                self._iter_buffer = line[size:]
+                return line[:size]
+            return line
+
+        line = self._fh.readline() if (size is None or size < 0) else self._fh.readline(size)
+        if isinstance(line, bytes):
+            line = line.decode('utf-8')
+        self._update_progress(line)
+        return line
+
+    def read(self, size: int = -1) -> str:
+        """Read and return up to size characters, or the entire remaining stream if size < 0."""
+        self._ensure_open()
+        if self._request_iterator:
+            if size == 0:
+                return ""
+            if size is None or size < 0:
+                parts = [self._iter_buffer] if self._iter_buffer else []
+                self._iter_buffer = ""
+                for raw in self._fh:
+                    chunk = raw.decode('utf-8') if isinstance(raw, bytes) else raw
+                    self._update_progress(chunk)
+                    parts.append(chunk)
+                return "".join(parts)
+            while len(self._iter_buffer) < size:
+                try:
+                    raw = next(self._fh)
+                except StopIteration:
+                    break
+                chunk = raw.decode('utf-8') if isinstance(raw, bytes) else raw
+                self._update_progress(chunk)
+                self._iter_buffer += chunk
+            out = self._iter_buffer[:size]
+            self._iter_buffer = self._iter_buffer[size:]
+            return out
+
+        data = self._fh.read() if (size is None or size < 0) else self._fh.read(size)
+        if isinstance(data, bytes):
+            data = data.decode('utf-8')
+        self._update_progress(data)
+        return data
+
+    def readlines(self, hint: int = -1) -> list:
+        """Read and return a list of lines from the stream."""
+        self._ensure_open()
+        lines = []
+        total = 0
+        while True:
+            line = self.readline()
+            if not line:
+                break
+            lines.append(line)
+            total += len(line)
+            if hint is not None and hint > 0 and total >= hint:
+                break
+        return lines
+
+    def __next__(self) -> str:
         """
         Provide the next line in the file.
 
@@ -286,19 +453,9 @@ class PolyReader:
         StopIteration
             When the end of the file is reached.
         """
-        if self._request_iterator:
-            line = next(self._fh)
-        else:
-            line = self._fh.readline()
-
-        if self.show_progress and self._progress is not None:
-            self._progress.update(len(line))
-
+        line = self.readline()
         if not line:
-            # End of file
             raise StopIteration
-        if isinstance(line, bytes):
-            return line.decode()
         return line
 
     def _wrap_ftp(self, parsed: ParseResult):
@@ -326,23 +483,24 @@ class PolyReader:
         self._ftp_path = parsed.path
         raw_fh = self._ftp.open(parsed.path, 'rb')
         self._raw_fh = raw_fh
+        stream = self._make_counted_stream(self._raw_fh)
 
         norm = _normalized_path(self.filename, parsed)
         if norm.endswith('.zst'):
             import zstandard as zstd
             dctx = zstd.ZstdDecompressor(max_window_size=2**31)
             self._fh = io.TextIOWrapper(
-                dctx.stream_reader(self._raw_fh, read_across_frames=True),
+                dctx.stream_reader(stream, read_across_frames=True),
                 encoding='utf-8',
             )
         elif norm.endswith('.bz2'):
-            self._fh = bz2.open(self._raw_fh, 'rt')
+            self._fh = bz2.open(stream, 'rt', encoding='utf-8')
         elif norm.endswith('.xz'):
-            self._fh = lzma.open(self._raw_fh, 'rt')
+            self._fh = lzma.open(stream, 'rt', encoding='utf-8')
         elif norm.endswith('.gz'):
-            self._fh = gzip.open(self._raw_fh, 'rt')
+            self._fh = gzip.open(stream, 'rt', encoding='utf-8')
         else:
-            self._fh = io.TextIOWrapper(self._raw_fh, encoding='utf-8')
+            self._fh = io.TextIOWrapper(stream, encoding='utf-8')
 
     def _wrap_ssh(self, parsed: ParseResult):
         """
@@ -380,21 +538,23 @@ class PolyReader:
             self.close()
             raise
 
-        self._fh = sftp_file
+        stream = self._make_counted_stream(self._sftp_file)
         norm = _normalized_path(self.filename, parsed)
         if norm.endswith('.zst'):
             import zstandard as zstd
             dctx = zstd.ZstdDecompressor(max_window_size=2**31)
             self._fh = io.TextIOWrapper(
-                dctx.stream_reader(self._sftp_file, read_across_frames=True),
+                dctx.stream_reader(stream, read_across_frames=True),
                 encoding='utf-8',
             )
         elif norm.endswith('.bz2'):
-            self._fh = bz2.BZ2File(self._sftp_file)
+            self._fh = bz2.open(stream, 'rt', encoding='utf-8')
         elif norm.endswith('.xz'):
-            self._fh = lzma.open(self._sftp_file, 'rt')
+            self._fh = lzma.open(stream, 'rt', encoding='utf-8')
         elif norm.endswith('.gz'):
-            self._fh = gzip.GzipFile(fileobj=self._sftp_file)
+            self._fh = gzip.open(stream, 'rt', encoding='utf-8')
+        else:
+            self._fh = io.TextIOWrapper(stream, encoding='utf-8')
 
     def _wrap_http(self, parsed: Optional[ParseResult] = None):
         """
@@ -433,17 +593,21 @@ class PolyReader:
         norm = _normalized_path(self.filename, parsed)
         if norm.endswith('.zst'):
             import zstandard as zstd
+            stream = self._make_counted_stream(response.raw)
             dctx = zstd.ZstdDecompressor(max_window_size=2**31)
             self._fh = io.TextIOWrapper(
-                dctx.stream_reader(response.raw, read_across_frames=True),
+                dctx.stream_reader(stream, read_across_frames=True),
                 encoding='utf-8',
             )
         elif norm.endswith('.bz2'):
-            self._fh = bz2.open(response.raw, 'rt')
+            stream = self._make_counted_stream(response.raw)
+            self._fh = bz2.open(stream, 'rt', encoding='utf-8')
         elif norm.endswith('.xz'):
-            self._fh = lzma.open(response.raw, 'rt')
+            stream = self._make_counted_stream(response.raw)
+            self._fh = lzma.open(stream, 'rt', encoding='utf-8')
         elif norm.endswith('.gz'):
-            self._fh = gzip.open(response.raw, 'rt')
+            stream = self._make_counted_stream(response.raw)
+            self._fh = gzip.open(stream, 'rt', encoding='utf-8')
         else:
             self._fh = response.iter_lines()
             self._request_iterator = True
@@ -471,18 +635,35 @@ class PolyReader:
             import zstandard as zstd
             dctx = zstd.ZstdDecompressor(max_window_size=2**31)
             self._raw_fh = open(self.filename, 'rb')
+            stream = self._make_counted_stream(self._raw_fh)
             self._fh = io.TextIOWrapper(
-                dctx.stream_reader(self._raw_fh, read_across_frames=True),
+                dctx.stream_reader(stream, read_across_frames=True),
                 encoding='utf-8',
             )
         elif norm.endswith('.bz2'):
-            self._fh = bz2.open(self.filename, 'rt')
+            if self.show_progress:
+                self._raw_fh = open(self.filename, 'rb')
+                self._fh = bz2.open(self._make_counted_stream(self._raw_fh), 'rt', encoding='utf-8')
+            else:
+                self._fh = bz2.open(self.filename, 'rt', encoding='utf-8')
         elif norm.endswith('.xz'):
-            self._fh = lzma.open(self.filename, 'rt')
+            if self.show_progress:
+                self._raw_fh = open(self.filename, 'rb')
+                self._fh = lzma.open(self._make_counted_stream(self._raw_fh), 'rt', encoding='utf-8')
+            else:
+                self._fh = lzma.open(self.filename, 'rt', encoding='utf-8')
         elif norm.endswith('.gz'):
-            self._fh = gzip.open(self.filename, 'rt')
+            if self.show_progress:
+                self._raw_fh = open(self.filename, 'rb')
+                self._fh = gzip.open(self._make_counted_stream(self._raw_fh), 'rt', encoding='utf-8')
+            else:
+                self._fh = gzip.open(self.filename, 'rt', encoding='utf-8')
         else:
-            self._fh = open(self.filename, 'r')
+            if self.show_progress:
+                self._raw_fh = open(self.filename, 'rb')
+                self._fh = io.TextIOWrapper(self._make_counted_stream(self._raw_fh), encoding='utf-8')
+            else:
+                self._fh = open(self.filename, 'r', encoding='utf-8')
 
     def open(self) -> 'PolyReader':
         """
@@ -530,8 +711,10 @@ class PolyReader:
             if self.show_progress:
                 from tqdm import tqdm
                 file_size = self._get_file_size()
-                if file_size is not None:
-                    self._progress = tqdm(total=file_size, unit='B', unit_scale=True)
+                initial_bytes = self._counting_stream.bytes_read if self._counting_stream is not None else 0
+                self._progress_raw_bytes = initial_bytes
+                total = file_size if (file_size is not None and file_size > 0) else None
+                self._progress = tqdm(total=total, initial=initial_bytes, unit='B', unit_scale=True)
         except Exception:
             self.close()
             raise
@@ -587,7 +770,10 @@ class PolyReader:
         self._response = None
         self._http_file_size = None
         self._progress = None
+        self._counting_stream = None
+        self._progress_raw_bytes = 0
         self._request_iterator = False
+        self._iter_buffer = ""
 
         _close_handles(fh, raw_fh, sftp_file, sftp_client, ssh_client, ftp, response, progress)
 
@@ -612,16 +798,21 @@ class PolyWriter:
         Closes the file.
     """
 
-    def __init__(self, filename: str):
+    def __init__(self, filename: Union[str, os.PathLike], show_progress: bool = False):
         """
         Initialize PolyWriter with a filename.
 
         Parameters
         ----------
-        filename : str
+        filename : str or os.PathLike
             The name of the file to write to.
+        show_progress : bool, optional
+            Progress tracking on writers is not implemented; passing True raises NotImplementedError.
         """
-        self.filename = filename
+        if show_progress:
+            raise NotImplementedError('Progress tracking is currently isolated to reader paths. Write implementations are deferred.')
+        self.filename = os.fsdecode(filename)
+        self.show_progress = show_progress
         self._fh = None
         self._raw_fh = None
         self._ftp = None
@@ -716,23 +907,20 @@ class PolyWriter:
 
         mode = 'ab' if append else 'wb'
         raw_fh = self._ftp.open(parsed.path, mode)
+        self._raw_fh = raw_fh
         norm = _normalized_path(self.filename, parsed)
         if norm.endswith('.zst'):
             import zstandard as zstd
-            self._raw_fh = raw_fh
             dctx = zstd.ZstdCompressor(level=22)
             self._fh = io.TextIOWrapper(dctx.stream_writer(self._raw_fh), encoding='utf-8')
         elif norm.endswith('.bz2'):
-            self._raw_fh = raw_fh
-            self._fh = bz2.open(self._raw_fh, compresslevel=9, mode='at' if append else 'wt')
+            self._fh = bz2.open(self._raw_fh, compresslevel=9, mode='at' if append else 'wt', encoding='utf-8')
         elif norm.endswith('.xz'):
-            self._raw_fh = raw_fh
-            self._fh = lzma.open(self._raw_fh, preset=9, mode='at' if append else 'wt')
+            self._fh = lzma.open(self._raw_fh, preset=9, mode='at' if append else 'wt', encoding='utf-8')
         elif norm.endswith('.gz'):
-            self._raw_fh = raw_fh
-            self._fh = gzip.open(self._raw_fh, compresslevel=9, mode='at' if append else 'wt')
+            self._fh = gzip.open(self._raw_fh, compresslevel=9, mode='at' if append else 'wt', encoding='utf-8')
         else:
-            self._fh = raw_fh
+            self._fh = io.TextIOWrapper(self._raw_fh, encoding='utf-8')
 
     def _ssh_backup_if(self, sftp, path):
         """
@@ -835,11 +1023,11 @@ class PolyWriter:
             dctx = zstd.ZstdCompressor(level=22)
             self._fh = io.TextIOWrapper(dctx.stream_writer(self._sftp_file), encoding='utf-8')
         elif norm.endswith('.bz2'):
-            self._fh = bz2.open(self._sftp_file, compresslevel=9, mode='at' if append else 'wt')
+            self._fh = bz2.open(self._sftp_file, compresslevel=9, mode='at' if append else 'wt', encoding='utf-8')
         elif norm.endswith('.xz'):
-            self._fh = lzma.open(self._sftp_file, preset=9, mode='at' if append else 'wt')
+            self._fh = lzma.open(self._sftp_file, preset=9, mode='at' if append else 'wt', encoding='utf-8')
         elif norm.endswith('.gz'):
-            self._fh = gzip.open(self._sftp_file, compresslevel=9, mode='at' if append else 'wt')
+            self._fh = gzip.open(self._sftp_file, compresslevel=9, mode='at' if append else 'wt', encoding='utf-8')
 
     def _backup_local_file(self):
         """Atomically rotate an existing local file to the next free .bu slot."""
@@ -922,13 +1110,13 @@ class PolyWriter:
             self._raw_fh = open(self.filename, mode)
             self._fh = io.TextIOWrapper(cctx.stream_writer(self._raw_fh), encoding='utf-8')
         elif norm.endswith('.bz2'):
-            self._fh = bz2.open(self.filename, 'at' if append else 'wt')
+            self._fh = bz2.open(self.filename, 'at' if append else 'wt', encoding='utf-8')
         elif norm.endswith('.xz'):
-            self._fh = lzma.open(self.filename, 'at' if append else 'wt')
+            self._fh = lzma.open(self.filename, 'at' if append else 'wt', encoding='utf-8')
         elif norm.endswith('.gz'):
-            self._fh = gzip.open(self.filename, 'at' if append else 'wt')
+            self._fh = gzip.open(self.filename, 'at' if append else 'wt', encoding='utf-8')
         else:
-            self._fh = open(self.filename, 'a' if append else 'w')
+            self._fh = open(self.filename, 'a' if append else 'w', encoding='utf-8')
 
     def open(self, append: bool = False, backup: bool = True) -> 'PolyWriter':
         """
@@ -1008,7 +1196,15 @@ class PolyWriter:
         -------
         None
         """
+        if self._fh is None:
+            raise ValueError("I/O operation on closed file.")
         self._fh.write(data)
+
+    def flush(self) -> None:
+        """Flush buffered write data to the underlying stream."""
+        if self._fh is None:
+            raise ValueError("I/O operation on closed file.")
+        self._fh.flush()
 
     def close(self):
         """
@@ -1038,7 +1234,7 @@ class PolyWriter:
         _close_handles(fh, raw_fh, sftp_file, sftp_client, ssh_client, ftp)
 
 
-def polyopen(filename: str, mode: str = 'r', backup: Optional[bool] = None, show_progress: bool = False):
+def polyopen(filename: Union[str, os.PathLike], mode: str = 'r', backup: Optional[bool] = None, show_progress: bool = False):
     """
     Open a file for reading or writing, determining the appropriate stream and compression 
     automatically based on the file extension and protocol scheme.
@@ -1048,7 +1244,7 @@ def polyopen(filename: str, mode: str = 'r', backup: Optional[bool] = None, show
     
     Parameters
     ----------
-    filename : str
+    filename : str or os.PathLike
         The path or URL to open.
     mode : str, optional
         The mode in which the file is opened. 'r' for reading (default), 'w' for writing, 
@@ -1065,16 +1261,17 @@ def polyopen(filename: str, mode: str = 'r', backup: Optional[bool] = None, show
     PolyReader or PolyWriter
         The appropriate reader or writer context manager object.
     """
+    filename = os.fsdecode(filename)
     if show_progress and mode in ('w', 'wt', 'wb', 'a', 'at', 'ab'):
         raise NotImplementedError('Progress tracking is currently isolated to reader paths. Write implementations are deferred.')
     if mode in ('r', 'rt', 'rb'):
         return PolyReader(filename, show_progress=show_progress).open()
     elif mode in ('w', 'wt', 'wb'):
         effective_backup = True if backup is None else backup
-        return PolyWriter(filename).open(append=False, backup=effective_backup)
+        return PolyWriter(filename, show_progress=show_progress).open(append=False, backup=effective_backup)
     elif mode in ('a', 'at', 'ab'):
         effective_backup = False if backup is None else backup
-        return PolyWriter(filename).open(append=True, backup=effective_backup)
+        return PolyWriter(filename, show_progress=show_progress).open(append=True, backup=effective_backup)
     else:
         raise ValueError(f"Unsupported mode: '{mode}'. Supported modes are 'r', 'w', 'a'.")
 
@@ -1086,16 +1283,6 @@ def main():
     This function serves as the entry point for the script, providing functionality to read from and write to files.
     It supports various compression formats (plain text, gzipped, bzip2, zstandard) and remote sources (HTTP, HTTPS, FTP, SSH, SFTP).
     """
-    import time
-
-    def format_bytes(num: float) -> str:
-        """Format bytes to human readable sizes."""
-        for unit in ['B', 'KB', 'MB', 'GB', 'TB', 'PB']:
-            if num < 1024.0:
-                return f"{num:3.1f}{unit}"
-            num /= 1024.0
-        return f"{num:.1f}Y"
-
     def format_rate(rate: float, unit: str = "") -> str:
         """Format rate with standard units."""
         if not rate:
@@ -1127,13 +1314,13 @@ def main():
             f"at {rate:,.1f}/s ({format_rate(byterate)}). "
             f"Total time: {seconds:0.2f} Secs."
         )
-        pass  # for auto-indentation
 
     # Set up argument parser for command-line interface
     parser = argparse.ArgumentParser(description='Test reading of plain text, gzipped, bzip2, or zstandard compressed files locally and remotely.')
 
     # Add argument for input files to process
     parser.add_argument('files', type=str, nargs='*', default=[], help='The input file(s) to process', metavar="file")
+    parser.add_argument('--input-file', '-i', type=str, default=None, help='Source input file for --write mode')
 
     # Add mutually exclusive group for read/write modes
     group = parser.add_mutually_exclusive_group(required=True)
@@ -1145,6 +1332,8 @@ def main():
 
     # If read mode is specified
     if args.read:
+        if args.input_file is not None:
+            parser.error("--input-file/-i is only valid with --write")
         for input_file in args.files:
             print(f"TESTING reading {input_file}")
             with PolyReader(input_file) as reader:
@@ -1153,23 +1342,22 @@ def main():
                 bytes_count = 0
                 for line in reader:
                     line_count += 1
-                    bytes_count += len(line)
-                    pass  # for auto-indentation
+                    bytes_count += len(line.encode('utf-8'))
                 # Print final reading statistics
                 pinfo("FINISHED Reading.", reader.filename, line_count, bytes_count, time.monotonic() - t0)
-                pass  # for auto-indentation
-            pass  # for auto-indentation
-        pass  # for auto-indentation
     else:
         # If write mode is specified
-        if len(args.files) < 2:
-            parser.error("Write mode requires at least one source file and one destination file (e.g., 'python -m polyopen.polyopen -w src dest')")
-            exit(1)
-            pass # for auto-indentation
-            
-        source_file = args.files[0]
-        output_files = args.files[1:]
-        
+        if args.input_file is not None:
+            if len(args.files) < 1:
+                parser.error("Write mode with --input-file/-i requires at least one destination file")
+            source_file = args.input_file
+            output_files = args.files
+        else:
+            if len(args.files) < 2:
+                parser.error("Write mode requires at least one source file and one destination file (e.g., 'python -m polyopen.polyopen -w src dest')")
+            source_file = args.files[0]
+            output_files = args.files[1:]
+
         print(f"Will Read from {source_file}")
         for output_file in output_files:
             with PolyReader(source_file) as reader:
@@ -1180,16 +1368,10 @@ def main():
                     bytes_count = 0
                     for line in reader:
                         line_count += 1
-                        bytes_count += len(line)
+                        bytes_count += len(line.encode('utf-8'))
                         writer.write(line)
-                        pass  # for auto-indentation
                     # Print final writing statistics
                     pinfo("FINISHED Writing.", writer.filename, line_count, bytes_count, time.monotonic() - t0)
-                    pass  # for auto-indentation
-                pass  # for auto-indentation
-            pass  # for auto-indentation
-        pass  # for auto-indentation
-    pass  # for auto-indentation
 
 
 if __name__ == "__main__":
