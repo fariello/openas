@@ -454,26 +454,29 @@ def test_ssh_reads_via_fake_paramiko(tmp_path, monkeypatch, ext):
 
 
 def test_http_uncompressed_blank_line_not_truncated(monkeypatch):
-    """PERF-02: blank line b'' from HTTP iter_lines() does not end for-loop or next() early."""
+    """PERF-02/PERF-05: blank line in uncompressed HTTP body does not end for-loop or next() early."""
+    import io
 
     class FakeResponse:
         headers = {}
 
+        def __init__(self):
+            self.raw = io.BytesIO(b"a\n\nb\n")
+
         def raise_for_status(self):
             pass
-
-        def iter_lines(self):
-            return iter([b"a", b"", b"b"])
 
         def close(self):
             pass
 
-    fake_requests = types.ModuleType("requests")
-    fake_requests.get = lambda url, stream=True: FakeResponse()
-    monkeypatch.setitem(sys.modules, "requests", fake_requests)
+    class FakeSession:
+        def get(self, url, stream=True):
+            return FakeResponse()
+
+    monkeypatch.setattr(sys.modules["polyopen.polyopen"], "_get_http_session", lambda: FakeSession())
 
     with PolyReader("http://example.invalid/plain.txt") as r:
-        assert list(r) == ["a", "", "b"]
+        assert list(r) == ["a\n", "\n", "b\n"]
 
     with PolyReader("http://example.invalid/plain.txt") as r:
         got = []
@@ -482,4 +485,4 @@ def test_http_uncompressed_blank_line_not_truncated(monkeypatch):
                 got.append(next(r))
             except StopIteration:
                 break
-        assert got == ["a", "", "b"]
+        assert got == ["a\n", "\n", "b\n"]

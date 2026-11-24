@@ -28,19 +28,15 @@ def test_ssh_routing(mock_ssh):
     assert mock_instance.connect.called
     assert mock_instance.open_sftp.called
 
-@patch('requests.get')
+@patch('requests.Session.get')
 def test_http_routing(mock_get):
     """
-    Assert polyopen cleanly traps http:// streams and yields to the requests pipeline natively.
+    Assert polyopen cleanly traps http:// streams, reads via response.raw with preserved newlines,
+    and explicitly closes the HTTP response.
     """
     mock_response = MagicMock()
     mock_response.headers = {'Content-Length': '100'}
-    
-    # Mocking standard UTF-8 stream decoding fallback using a true generator
-    def mock_iter():
-        yield b"line 1\n"
-        yield b"line 2\n"
-    mock_response.iter_lines.return_value = mock_iter()
+    mock_response.raw = io.BytesIO(b"line 1\nline 2\n")
     mock_get.return_value = mock_response
     
     lines = []
@@ -49,8 +45,8 @@ def test_http_routing(mock_get):
              lines.append(line)
              
     assert mock_get.called
-    assert len(lines) == 2
-    assert lines[0] == "line 1\n"
+    assert lines == ["line 1\n", "line 2\n"]
+    assert mock_response.close.called
 
 
 @patch('ftputil.FTPHost')
@@ -88,6 +84,7 @@ def test_ftp_write_default_port_compressed_close_and_999_cap(mock_host):
 
     existing = {"/dir/out.gz"} | {f"/dir/out.gz.{i:03d}.bu" for i in range(1, 1000)}
     host.path.exists.side_effect = lambda p: p in existing
+    host.listdir.return_value = ["out.gz"] + [f"out.gz.{i:03d}.bu" for i in range(1, 1000)]
 
     buf = io.BytesIO()
     host.open.return_value = buf
@@ -175,7 +172,7 @@ def test_sftp_read_port_stat_and_utf8_decompression(mock_ssh):
         assert r.read() == "café 日本語\n"
 
 
-@patch('requests.get')
+@patch('requests.Session.get')
 def test_http_errors_query_extensions_unknown_size_and_file_methods(mock_get):
     """BUG-03, BUG-06, BUG-07: HTTP 404 close+raise, query strings, unknown Content-Length total=None, and read methods."""
     resp404 = MagicMock()
@@ -200,7 +197,6 @@ def test_http_errors_query_extensions_unknown_size_and_file_methods(mock_get):
         resp_unknown = MagicMock()
         resp_unknown.headers = headers
         resp_unknown.raw = io.BytesIO(b"line1\nline2\nline3\n")
-        resp_unknown.iter_lines.return_value = iter([b"line1\n", b"line2\n", b"line3\n"])
         mock_get.return_value = resp_unknown
         with patch("os.path.getsize", side_effect=AssertionError("os.path.getsize must not be called")):
             with PolyReader("https://example.com/stream.txt", show_progress=True) as r:
