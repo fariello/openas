@@ -3,11 +3,51 @@ import pytest
 import os
 import sys
 
+_SRC_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "src"))
+
+
+def _cli_env():
+    """Return os.environ with this checkout's src/ first on PYTHONPATH for CLI subprocesses."""
+    env = os.environ.copy()
+    existing = env.get("PYTHONPATH")
+    env["PYTHONPATH"] = _SRC_DIR + os.pathsep + existing if existing else _SRC_DIR
+    return env
+
+
+def _is_inside(directory, path):
+    directory = os.path.realpath(directory)
+    path = os.path.realpath(path)
+    return os.path.commonpath([directory, path]) == directory
+
+
 def run_cli(*args):
     """Utility to spawn subprocess commands targeting polyopen module structurally."""
     cmd = [sys.executable, "-m", "polyopen.polyopen"] + list(args)
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    result = subprocess.run(cmd, capture_output=True, text=True, env=_cli_env())
     return result
+
+
+def test_tests_import_polyopen_from_checkout_src(tmp_path):
+    """mux2cz: pytest and CLI subprocesses import polyopen from this checkout's src/."""
+    import polyopen
+
+    assert _is_inside(_SRC_DIR, polyopen.__file__), (
+        f"pytest process imported {polyopen.__file__}, not a module under {_SRC_DIR}"
+    )
+
+    res = subprocess.run(
+        [sys.executable, "-c", "import polyopen; print(polyopen.__file__)"],
+        capture_output=True,
+        text=True,
+        env=_cli_env(),
+        cwd=str(tmp_path),
+    )
+    assert res.returncode == 0, res.stderr
+    sub_path = res.stdout.strip()
+    assert _is_inside(_SRC_DIR, sub_path), (
+        f"subprocess imported {sub_path}, not a module under {_SRC_DIR}"
+    )
+
 
 def test_cli_illegal_modes():
     """Asserts that the argparse module mutually excludes overlapping rules securely."""
@@ -40,7 +80,7 @@ def test_cli_write_execution(tmp_path):
     target = str(tmp_path / "write_mock.txt")
     
     cmd = [sys.executable, "-m", "polyopen.polyopen", "--write", source, target]
-    result = subprocess.run(cmd, text=True, capture_output=True)
+    result = subprocess.run(cmd, text=True, capture_output=True, env=_cli_env())
     
     assert result.returncode == 0
     assert os.path.exists(target)
@@ -58,12 +98,11 @@ def test_cli_input_file_flag_utf8_bytes_and_errors(tmp_path):
     expected_bytes = len(content.encode("utf-8"))
     source.write_text(content, encoding="utf-8")
 
-    env = {**os.environ, "PYTHONPATH": "src"}
     res_ok = subprocess.run(
         [sys.executable, "-m", "polyopen.polyopen", "--write", "-i", str(source), str(target)],
         capture_output=True,
         text=True,
-        env=env,
+        env=_cli_env(),
     )
     assert res_ok.returncode == 0, res_ok.stderr
     assert target.read_text(encoding="utf-8") == content
@@ -73,7 +112,7 @@ def test_cli_input_file_flag_utf8_bytes_and_errors(tmp_path):
         [sys.executable, "-m", "polyopen.polyopen", "--read", str(source)],
         capture_output=True,
         text=True,
-        env=env,
+        env=_cli_env(),
     )
     assert res_read.returncode == 0, res_read.stderr
     assert f"{expected_bytes:.1f}B" in res_read.stdout
@@ -82,7 +121,7 @@ def test_cli_input_file_flag_utf8_bytes_and_errors(tmp_path):
         [sys.executable, "-m", "polyopen.polyopen", "--write", "-i", str(source)],
         capture_output=True,
         text=True,
-        env=env,
+        env=_cli_env(),
     )
     assert res_missing_dst.returncode != 0
     assert "destination" in res_missing_dst.stderr.lower()
@@ -91,7 +130,7 @@ def test_cli_input_file_flag_utf8_bytes_and_errors(tmp_path):
         [sys.executable, "-m", "polyopen.polyopen", "--read", "-i", str(source)],
         capture_output=True,
         text=True,
-        env=env,
+        env=_cli_env(),
     )
     assert res_read_i.returncode != 0
     assert "--write" in res_read_i.stderr
@@ -164,7 +203,6 @@ def test_cli_write_broadcast_single_read_identical_outputs_and_messages(tmp_path
 
     # Also verify --input-file/-i multi-target broadcast via real subprocess
     sub_dsts = [tmp_path / f"sub_{k}.txt" for k in (1, 2, 3)]
-    env = {**os.environ, "PYTHONPATH": "src"}
     res = subprocess.run(
         [
             sys.executable,
@@ -177,7 +215,7 @@ def test_cli_write_broadcast_single_read_identical_outputs_and_messages(tmp_path
         ],
         capture_output=True,
         text=True,
-        env=env,
+        env=_cli_env(),
     )
     assert res.returncode == 0, res.stderr
     for d in sub_dsts:
