@@ -172,6 +172,54 @@ def test_sftp_read_port_stat_and_utf8_decompression(mock_ssh):
         assert r.read() == "café 日本語\n"
 
 
+@patch('paramiko.SSHClient')
+def test_sftp_prefetch_guard_when_stat_fails_or_size_none(mock_ssh):
+    """E-03: Skip SFTP prefetch when stat() raises OSError or st_size is None instead of crashing."""
+    client = MagicMock()
+    sftp = MagicMock()
+    mock_ssh.return_value = client
+    client.open_sftp.return_value = sftp
+
+    class ParamikoLikeSFTPFile(io.BytesIO):
+        def __init__(self, data, *, stat_raises=False, st_size_none=False):
+            super().__init__(data)
+            self.stat_raises = stat_raises
+            self.st_size_none = st_size_none
+            self.prefetch_calls = []
+
+        def stat(self):
+            if self.stat_raises:
+                raise OSError("FSTAT denied")
+            st = MagicMock()
+            st.st_size = None if self.st_size_none else len(self.getvalue())
+            return st
+
+        def prefetch(self, file_size=None, max_concurrent_requests=None):
+            if file_size is None:
+                file_size = self.stat().st_size
+            if file_size is None:
+                raise TypeError("'<' not supported between instances of 'int' and 'NoneType'")
+            self.prefetch_calls.append((file_size, max_concurrent_requests))
+
+    f_err = ParamikoLikeSFTPFile(b"ok\n", stat_raises=True)
+    sftp.file.return_value = f_err
+    with PolyReader("sftp://u:p@host/a.txt") as r:
+        assert r.read() == "ok\n"
+    assert f_err.prefetch_calls == []
+
+    f_none = ParamikoLikeSFTPFile(b"ok\n", st_size_none=True)
+    sftp.file.return_value = f_none
+    with PolyReader("sftp://u:p@host/a.txt") as r:
+        assert r.read() == "ok\n"
+    assert f_none.prefetch_calls == []
+
+    f_ok = ParamikoLikeSFTPFile(b"ok\n")
+    sftp.file.return_value = f_ok
+    with PolyReader("sftp://u:p@host/a.txt") as r:
+        assert r.read() == "ok\n"
+    assert f_ok.prefetch_calls == [(3, 64)]
+
+
 @patch('requests.Session.get')
 def test_http_errors_query_extensions_unknown_size_and_file_methods(mock_get):
     """BUG-03, BUG-06, BUG-07: HTTP 404 close+raise, query strings, unknown Content-Length total=None, and read methods."""

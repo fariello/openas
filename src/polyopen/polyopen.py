@@ -723,7 +723,7 @@ class PolyReader:
             self._sftp_file_size = file_size
 
             prefetch_fn = getattr(sftp_file, 'prefetch', None)
-            if prefetch_fn is not None:
+            if prefetch_fn is not None and file_size is not None:
                 try:
                     prefetch_fn(file_size, max_concurrent_requests=64)
                 except TypeError:
