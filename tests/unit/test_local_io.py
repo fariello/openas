@@ -1,5 +1,10 @@
+import bz2
 import errno
+import gzip
 import os
+import subprocess
+import sys
+import types
 from unittest.mock import MagicMock, patch
 import pytest
 import zstandard as zstd
@@ -272,3 +277,209 @@ def test_compressed_progress_tracks_raw_bytes(tmp_path, ext):
         assert reader._progress.n == reader._progress.total
     finally:
         reader.close()
+
+
+def test_lazy_imports_and_ftp_session_wrapper_factory():
+    """PERF-06: import polyopen loads no optional stdlib/FTP modules; FTPSessionWrapper is cached."""
+    script = (
+        "import sys; "
+        "before = set(sys.modules); "
+        "import polyopen; "
+        "added = set(sys.modules) - before; "
+        "forbidden = ('argparse', 'ftplib', 'ssl', 'bz2', 'gzip', 'lzma', 'urllib.parse'); "
+        "loaded = [m for m in forbidden if m in added]; "
+        "assert loaded == [], f'unexpected eager imports: {loaded}'; "
+        "from polyopen import FTPSessionWrapper as A; "
+        "from polyopen import FTPSessionWrapper as B; "
+        "import ftplib; "
+        "assert issubclass(A, ftplib.FTP); "
+        "assert A is B; "
+        "print('OK')"
+    )
+    src_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "src"))
+    env = os.environ.copy()
+    existing_pp = env.get("PYTHONPATH", "")
+    env["PYTHONPATH"] = f"{src_dir}{os.pathsep}{existing_pp}" if existing_pp else src_dir
+    res = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    assert res.returncode == 0, res.stderr
+    assert res.stdout.strip() == "OK"
+
+
+@pytest.mark.parametrize("ext", [".txt", ".gz", ".bz2", ".xz", ".zst"])
+def test_polyreader_for_loop_direct_next_and_file_uri(tmp_path, ext):
+    """PERF-02: PolyReader supports for-iteration, direct next(), and file: URLs."""
+    expected = [f"row-{i}\n" for i in range(10)]
+    fp = tmp_path / f"iter_check{ext}"
+    with PolyWriter(fp) as w:
+        for line in expected:
+            w.write(line)
+
+    with PolyReader(fp) as r:
+        assert list(r) == expected
+
+    with PolyReader(fp) as r:
+        got = []
+        while True:
+            try:
+                got.append(next(r))
+            except StopIteration:
+                break
+        assert got == expected
+
+    if ext == ".txt":
+        with PolyReader(fp.as_uri()) as r:
+            assert list(r) == expected
+
+
+def test_polyreader_progress_batched_full_and_early_break_flush(tmp_path):
+    """PERF-02: show_progress=True flushes exact remainder on EOF and early break + close."""
+    # Size: 7,500 * 10 = 75,000 bytes (not a multiple of 65,536).
+    lines = [f"{i:09d}\n" for i in range(7500)]
+    fp = tmp_path / "ascii_progress.txt"
+    fp.write_text("".join(lines), encoding="utf-8")
+    expected_size = os.path.getsize(fp)
+    assert expected_size % 65536 != 0
+
+    reader = PolyReader(fp, show_progress=True).open()
+    try:
+        pbar = reader._progress
+        assert pbar is not None
+        seen = list(reader)
+        assert len(seen) == len(lines)
+        assert reader._progress.n == expected_size
+    finally:
+        reader.close()
+    assert pbar.n == expected_size
+
+    # Early break followed by close() flushes exact summed length of yielded lines.
+    reader2 = PolyReader(fp, show_progress=True).open()
+    pbar2 = reader2._progress
+    assert pbar2 is not None
+    yielded = []
+    for line in reader2:
+        yielded.append(line)
+        if len(yielded) == 25:
+            break
+    reader2.close()
+    assert pbar2.n == sum(len(line) for line in yielded)
+
+    # Paused iterator still alive when close() runs flushes pending progress before close.
+    reader3 = PolyReader(fp, show_progress=True).open()
+    pbar3 = reader3._progress
+    assert pbar3 is not None
+    it = iter(reader3)
+    yielded3 = [next(it) for _ in range(7)]
+    reader3.close()
+    assert pbar3.n == sum(len(line) for line in yielded3)
+
+
+def test_polywriter_writelines_subclass_override_and_closed_error(tmp_path):
+    """PERF-08: PolyWriter.writelines(), subclass write() override preservation, and closed ValueError."""
+    fp = tmp_path / "writelines.txt"
+    payload = ["alpha\n", "beta\n", "gamma\n"]
+    writer = PolyWriter(fp).open(append=False, backup=False)
+    writer.writelines(payload)
+    writer.close()
+    assert fp.read_text(encoding="utf-8") == "".join(payload)
+
+    with pytest.raises(ValueError):
+        writer.write("after close\n")
+    with pytest.raises(ValueError):
+        writer.writelines(["after close\n"])
+
+    class CountingWriter(PolyWriter):
+        def __init__(self, filename):
+            super().__init__(filename)
+            self.calls = []
+
+        def write(self, data):
+            self.calls.append(data)
+            return super().write(data)
+
+    fp_sub = tmp_path / "subclass.txt"
+    with CountingWriter(fp_sub) as cw:
+        cw.write("one\n")
+        cw.write("two\n")
+    assert cw.calls == ["one\n", "two\n"]
+    assert fp_sub.read_text(encoding="utf-8") == "one\ntwo\n"
+
+
+@pytest.mark.parametrize("ext", ["", ".gz", ".bz2"])
+def test_ssh_reads_via_fake_paramiko(tmp_path, monkeypatch, ext):
+    """PERF-02 (E-06): SSH reads of .gz, .bz2, and uncompressed files yield original str lines."""
+    expected = ["ssh line 1\n", "ssh café 2\n", "ssh line 3\n"]
+    raw_bytes = "".join(expected).encode("utf-8")
+    fp = tmp_path / f"remote_sample{ext}"
+    if ext == ".gz":
+        fp.write_bytes(gzip.compress(raw_bytes))
+    elif ext == ".bz2":
+        fp.write_bytes(bz2.compress(raw_bytes))
+    else:
+        fp.write_bytes(raw_bytes)
+
+    class FakeSFTP:
+        def file(self, path, mode="r"):
+            return open(fp, "rb")
+
+        def close(self):
+            pass
+
+    class FakeSSHClient:
+        def load_system_host_keys(self):
+            pass
+
+        def connect(self, hostname, port=22, username=None, password=None):
+            pass
+
+        def open_sftp(self):
+            return FakeSFTP()
+
+        def close(self):
+            pass
+
+    fake_paramiko = types.ModuleType("paramiko")
+    fake_paramiko.SSHClient = FakeSSHClient
+    monkeypatch.setitem(sys.modules, "paramiko", fake_paramiko)
+
+    url = f"ssh://user:pass@host/dir/remote_sample{ext}"
+    with PolyReader(url) as r:
+        got = list(r)
+    assert got == expected
+    assert all(isinstance(line, str) for line in got)
+
+
+def test_http_uncompressed_blank_line_not_truncated(monkeypatch):
+    """PERF-02: blank line b'' from HTTP iter_lines() does not end for-loop or next() early."""
+
+    class FakeResponse:
+        headers = {}
+
+        def raise_for_status(self):
+            pass
+
+        def iter_lines(self):
+            return iter([b"a", b"", b"b"])
+
+        def close(self):
+            pass
+
+    fake_requests = types.ModuleType("requests")
+    fake_requests.get = lambda url, stream=True: FakeResponse()
+    monkeypatch.setitem(sys.modules, "requests", fake_requests)
+
+    with PolyReader("http://example.invalid/plain.txt") as r:
+        assert list(r) == ["a", "", "b"]
+
+    with PolyReader("http://example.invalid/plain.txt") as r:
+        got = []
+        while True:
+            try:
+                got.append(next(r))
+            except StopIteration:
+                break
+        assert got == ["a", "", "b"]

@@ -59,6 +59,8 @@ Version
 0.1.0
 """
 
+from __future__ import annotations
+
 __version__ = "0.1.0"
 __author__ = "Gabriele Fariello"
 
@@ -76,17 +78,14 @@ class UnsupportedProtocolError(PolyopenError):
 
 UNSUPPORTED_ARCHIVES = ('.zip', '.tar', '.tgz', '.rar', '.7z', '.gz.tar', '.tar.gz', '.tar.bz2', '.tar.zst')
 
-import argparse
-import bz2
 import errno
-import ftplib
-import gzip
 import io
-import lzma
 import os
 import time
-from typing import Optional, Union
-from urllib.parse import ParseResult, urlparse
+from typing import TYPE_CHECKING, Optional, Union
+
+if TYPE_CHECKING:
+    from urllib.parse import ParseResult
 
 _NETWORK_SCHEMES = frozenset(('http', 'https', 'ftp', 'ssh', 'sftp', 's3', 'gs', 'az', 'hdfs'))
 _LINK_FALLBACK_ERRNOS = frozenset(
@@ -162,9 +161,9 @@ def format_bytes(num: float) -> str:
     return f"{num:3.1f}YB"
 
 
-def _normalized_path(filename: str, parsed: ParseResult) -> str:
+def _normalized_path(filename: str, parsed: Optional[ParseResult] = None) -> str:
     """Return lowercase path component for network URLs and lowercase filename for local paths."""
-    if parsed.scheme.lower() in _NETWORK_SCHEMES:
+    if parsed is not None and parsed.scheme.lower() in _NETWORK_SCHEMES:
         return parsed.path.lower()
     return filename.lower()
 
@@ -189,57 +188,76 @@ def _close_handles(*handles):
         raise first_err
 
 
-class FTPSessionWrapper(ftplib.FTP):
-    """
-    A wrapper around ftplib.FTP for handling FTP connections with a specified port.
+_FTP_SESSION_WRAPPER_CLASS = None
 
-    This class extends ftplib.FTP to allow connections to FTP servers on non-standard ports.
-    It is primarily intended for internal use within the PolyReader and PolyWriter classes
-    and not for direct use by end users.
 
-    Attributes
-    ----------
-    host : str
-        The hostname of the FTP server.
-    userid : str
-        The username for FTP login.
-    password : str
-        The password for FTP login.
-    port : int
-        The port to connect to on the FTP server.
+def _ftp_session_wrapper_class():
+    """Lazily import ftplib and return the cached FTPSessionWrapper subclass."""
+    global _FTP_SESSION_WRAPPER_CLASS
+    if _FTP_SESSION_WRAPPER_CLASS is None:
+        import ftplib
 
-    Methods
-    -------
-    __init__(host, userid, password, port=21):
-        Initializes the FTP connection and logs in with the provided credentials.
-    """
+        class FTPSessionWrapper(ftplib.FTP):
+            """
+            A wrapper around ftplib.FTP for handling FTP connections with a specified port.
 
-    def __init__(self, host: str, userid: str, password: str, port: Optional[int] = 21):
-        """
-        Initialize the FTPSessionWrapper with the given host, userid, password, and port.
+            This class extends ftplib.FTP to allow connections to FTP servers on non-standard ports.
+            It is primarily intended for internal use within the PolyReader and PolyWriter classes
+            and not for direct use by end users.
 
-        This method connects to the specified FTP server on the given port and logs in
-        using the provided credentials.
+            Attributes
+            ----------
+            host : str
+                The hostname of the FTP server.
+            userid : str
+                The username for FTP login.
+            password : str
+                The password for FTP login.
+            port : int
+                The port to connect to on the FTP server.
 
-        Parameters
-        ----------
-        host : str
-            The hostname of the FTP server.
-        userid : str
-            The username for FTP login.
-        password : str
-            The password for FTP login.
-        port : int or None, optional
-            The port to connect to on the FTP server (defaults to 21 when None).
-        """
-        if port is None:
-            port = 21
-        # Initialize the parent ftplib.FTP class
-        ftplib.FTP.__init__(self)
-        # Connect to the specified FTP server on the given port
-        self.connect(host, port)
-        # Log in to the FTP server with the provided username and password
-        self.login(userid, password)
+            Methods
+            -------
+            __init__(host, userid, password, port=21):
+                Initializes the FTP connection and logs in with the provided credentials.
+            """
+
+            def __init__(self, host: str, userid: str, password: str, port: Optional[int] = 21):
+                """
+                Initialize the FTPSessionWrapper with the given host, userid, password, and port.
+
+                This method connects to the specified FTP server on the given port and logs in
+                using the provided credentials.
+
+                Parameters
+                ----------
+                host : str
+                    The hostname of the FTP server.
+                userid : str
+                    The username for FTP login.
+                password : str
+                    The password for FTP login.
+                port : int or None, optional
+                    The port to connect to on the FTP server (defaults to 21 when None).
+                """
+                if port is None:
+                    port = 21
+                # Initialize the parent ftplib.FTP class
+                ftplib.FTP.__init__(self)
+                # Connect to the specified FTP server on the given port
+                self.connect(host, port)
+                # Log in to the FTP server with the provided username and password
+                self.login(userid, password)
+
+        _FTP_SESSION_WRAPPER_CLASS = FTPSessionWrapper
+    return _FTP_SESSION_WRAPPER_CLASS
+
+
+def __getattr__(name: str):
+    """Lazily resolve optional attributes such as FTPSessionWrapper (PEP 562)."""
+    if name == 'FTPSessionWrapper':
+        return _ftp_session_wrapper_class()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 class PolyReader:
@@ -286,6 +304,7 @@ class PolyReader:
         self._progress = None
         self._counting_stream = None
         self._progress_raw_bytes = 0
+        self._progress_pending = 0
         self._request_iterator = False
         self._iter_buffer = ""
         self._http_file_size = None
@@ -301,9 +320,26 @@ class PolyReader:
         if self._fh is None:
             raise ValueError("I/O operation on closed file.")
 
+    def _flush_progress(self) -> None:
+        """Apply any buffered progress delta to the progress bar once."""
+        progress = self._progress
+        if progress is None:
+            self._progress_pending = 0
+            return
+        if self._counting_stream is not None:
+            delta = self._counting_stream.bytes_read - self._progress_raw_bytes
+            if delta > 0:
+                self._progress_raw_bytes += delta
+                self._progress_pending += delta
+        if self._progress_pending > 0:
+            progress.update(self._progress_pending)
+            self._progress_pending = 0
+
     def _update_progress(self, text: str = ""):
         if not (self.show_progress and self._progress is not None):
             return
+        if self._progress_pending > 0:
+            self._flush_progress()
         if self._counting_stream is not None:
             delta = self._counting_stream.bytes_read - self._progress_raw_bytes
             if delta > 0:
@@ -347,18 +383,107 @@ class PolyReader:
         """
         self.close()
 
-    def __iter__(self) -> 'PolyReader':
+    def __iter__(self):
         """
-        Make the PolyReader object iterable.
+        Return an iterator over lines in the stream.
 
-        This method allows the PolyReader to be used as an iterator.
-
-        Returns
-        -------
-        PolyReader
-            The PolyReader instance itself.
+        When progress tracking is disabled and the underlying handle is an
+        ``io.TextIOBase``, this returns the handle's own C-level iterator directly.
         """
-        return self
+        self._ensure_open()
+        if self.show_progress:
+            return self._iter_progress()
+        if isinstance(self._fh, io.TextIOBase):
+            return iter(self._fh)
+        return self._iter_decoded()
+
+    def _iter_decoded(self):
+        """Yield decoded text lines from a non-text handle (HTTP iter_lines or binary stream)."""
+        if self._iter_buffer:
+            chunk = self._iter_buffer
+            self._iter_buffer = ""
+            yield chunk
+        for line in self._fh:
+            if isinstance(line, bytes):
+                yield line.decode('utf-8')
+            else:
+                yield line
+
+    def _iter_progress(self):
+        """Yield text lines while batching tqdm progress updates to 64 KiB."""
+        try:
+            fh = self._fh
+            progress = self._progress
+            is_text = isinstance(fh, io.TextIOBase)
+            counting = self._counting_stream
+
+            if self._iter_buffer:
+                chunk = self._iter_buffer
+                self._iter_buffer = ""
+                yield chunk
+
+            if progress is None:
+                if is_text:
+                    yield from fh
+                else:
+                    for line in fh:
+                        yield line.decode('utf-8') if isinstance(line, bytes) else line
+                return
+
+            update = progress.update
+            if counting is not None:
+                pending = self._progress_pending
+                raw_bytes = self._progress_raw_bytes
+                if is_text:
+                    for line in fh:
+                        delta = counting.bytes_read - raw_bytes
+                        if delta > 0:
+                            raw_bytes += delta
+                            pending += delta
+                            if pending >= 65536:
+                                update(pending)
+                                pending = 0
+                            self._progress_raw_bytes = raw_bytes
+                            self._progress_pending = pending
+                        yield line
+                else:
+                    for line in fh:
+                        if isinstance(line, bytes):
+                            line = line.decode('utf-8')
+                        delta = counting.bytes_read - raw_bytes
+                        if delta > 0:
+                            raw_bytes += delta
+                            pending += delta
+                            if pending >= 65536:
+                                update(pending)
+                                pending = 0
+                            self._progress_raw_bytes = raw_bytes
+                            self._progress_pending = pending
+                        yield line
+            elif is_text:
+                line_len = len
+                pending = self._progress_pending
+                for line in fh:
+                    pending += line_len(line)
+                    if pending >= 65536:
+                        update(pending)
+                        pending = 0
+                    self._progress_pending = pending
+                    yield line
+            else:
+                line_len = len
+                pending = self._progress_pending
+                for line in fh:
+                    if isinstance(line, bytes):
+                        line = line.decode('utf-8')
+                    pending += line_len(line)
+                    if pending >= 65536:
+                        update(pending)
+                        pending = 0
+                    self._progress_pending = pending
+                    yield line
+        finally:
+            self._flush_progress()
 
     def readline(self, size: int = -1) -> str:
         """Read and return one line from the stream, or up to size characters."""
@@ -453,6 +578,16 @@ class PolyReader:
         StopIteration
             When the end of the file is reached.
         """
+        self._ensure_open()
+        if self._request_iterator:
+            if self._iter_buffer:
+                line = self._iter_buffer
+                self._iter_buffer = ""
+                return line
+            raw = next(self._fh)
+            line = raw.decode('utf-8') if isinstance(raw, bytes) else raw
+            self._update_progress(line)
+            return line
         line = self.readline()
         if not line:
             raise StopIteration
@@ -478,7 +613,7 @@ class PolyReader:
             parsed.username,
             parsed.password,
             port=port,
-            session_factory=FTPSessionWrapper,
+            session_factory=_ftp_session_wrapper_class(),
         )
         self._ftp_path = parsed.path
         raw_fh = self._ftp.open(parsed.path, 'rb')
@@ -494,10 +629,13 @@ class PolyReader:
                 encoding='utf-8',
             )
         elif norm.endswith('.bz2'):
+            import bz2
             self._fh = bz2.open(stream, 'rt', encoding='utf-8')
         elif norm.endswith('.xz'):
+            import lzma
             self._fh = lzma.open(stream, 'rt', encoding='utf-8')
         elif norm.endswith('.gz'):
+            import gzip
             self._fh = gzip.open(stream, 'rt', encoding='utf-8')
         else:
             self._fh = io.TextIOWrapper(stream, encoding='utf-8')
@@ -548,10 +686,13 @@ class PolyReader:
                 encoding='utf-8',
             )
         elif norm.endswith('.bz2'):
+            import bz2
             self._fh = bz2.open(stream, 'rt', encoding='utf-8')
         elif norm.endswith('.xz'):
+            import lzma
             self._fh = lzma.open(stream, 'rt', encoding='utf-8')
         elif norm.endswith('.gz'):
+            import gzip
             self._fh = gzip.open(stream, 'rt', encoding='utf-8')
         else:
             self._fh = io.TextIOWrapper(stream, encoding='utf-8')
@@ -575,6 +716,7 @@ class PolyReader:
         """
         import requests
         if parsed is None:
+            from urllib.parse import urlparse
             parsed = urlparse(self.filename)
         response = requests.get(self.filename, stream=True)
         self._response = response
@@ -600,12 +742,15 @@ class PolyReader:
                 encoding='utf-8',
             )
         elif norm.endswith('.bz2'):
+            import bz2
             stream = self._make_counted_stream(response.raw)
             self._fh = bz2.open(stream, 'rt', encoding='utf-8')
         elif norm.endswith('.xz'):
+            import lzma
             stream = self._make_counted_stream(response.raw)
             self._fh = lzma.open(stream, 'rt', encoding='utf-8')
         elif norm.endswith('.gz'):
+            import gzip
             stream = self._make_counted_stream(response.raw)
             self._fh = gzip.open(stream, 'rt', encoding='utf-8')
         else:
@@ -622,14 +767,12 @@ class PolyReader:
         Parameters
         ----------
         parsed : ParseResult or None, optional
-            The parsed path/URL (parsed from self.filename if omitted).
+            The parsed path/URL (optional; omitted for plain local paths).
 
         Returns
         -------
         None
         """
-        if parsed is None:
-            parsed = urlparse(self.filename)
         norm = _normalized_path(self.filename, parsed)
         if norm.endswith('.zst'):
             import zstandard as zstd
@@ -641,29 +784,28 @@ class PolyReader:
                 encoding='utf-8',
             )
         elif norm.endswith('.bz2'):
+            import bz2
             if self.show_progress:
                 self._raw_fh = open(self.filename, 'rb')
                 self._fh = bz2.open(self._make_counted_stream(self._raw_fh), 'rt', encoding='utf-8')
             else:
                 self._fh = bz2.open(self.filename, 'rt', encoding='utf-8')
         elif norm.endswith('.xz'):
+            import lzma
             if self.show_progress:
                 self._raw_fh = open(self.filename, 'rb')
                 self._fh = lzma.open(self._make_counted_stream(self._raw_fh), 'rt', encoding='utf-8')
             else:
                 self._fh = lzma.open(self.filename, 'rt', encoding='utf-8')
         elif norm.endswith('.gz'):
+            import gzip
             if self.show_progress:
                 self._raw_fh = open(self.filename, 'rb')
                 self._fh = gzip.open(self._make_counted_stream(self._raw_fh), 'rt', encoding='utf-8')
             else:
                 self._fh = gzip.open(self.filename, 'rt', encoding='utf-8')
         else:
-            if self.show_progress:
-                self._raw_fh = open(self.filename, 'rb')
-                self._fh = io.TextIOWrapper(self._make_counted_stream(self._raw_fh), encoding='utf-8')
-            else:
-                self._fh = open(self.filename, 'r', encoding='utf-8')
+            self._fh = open(self.filename, 'r', encoding='utf-8')
 
     def open(self) -> 'PolyReader':
         """
@@ -680,11 +822,17 @@ class PolyReader:
         if self._fh is not None:
             return self
 
-        parsed = urlparse(self.filename)
-        if parsed.scheme == 'file':
-            from urllib.request import url2pathname
-            self.filename = url2pathname(parsed.path)
+        if ':' in self.filename:
+            from urllib.parse import urlparse
             parsed = urlparse(self.filename)
+            if parsed.scheme == 'file':
+                from urllib.request import url2pathname
+                self.filename = url2pathname(parsed.path)
+                parsed = urlparse(self.filename)
+            scheme = parsed.scheme.lower()
+        else:
+            parsed = None
+            scheme = ''
 
         if _normalized_path(self.filename, parsed).endswith(UNSUPPORTED_ARCHIVES):
             raise UnsupportedArchiveError(
@@ -693,7 +841,6 @@ class PolyReader:
             )
 
         try:
-            scheme = parsed.scheme.lower()
             if scheme == 'ftp':
                 self._wrap_ftp(parsed)
             elif scheme in ('sftp', 'ssh'):
@@ -713,6 +860,7 @@ class PolyReader:
                 file_size = self._get_file_size()
                 initial_bytes = self._counting_stream.bytes_read if self._counting_stream is not None else 0
                 self._progress_raw_bytes = initial_bytes
+                self._progress_pending = 0
                 total = file_size if (file_size is not None and file_size > 0) else None
                 self._progress = tqdm(total=total, initial=initial_bytes, unit='B', unit_scale=True)
         except Exception:
@@ -751,6 +899,7 @@ class PolyReader:
         -------
         None
         """
+        self._flush_progress()
         fh = self._fh
         raw_fh = self._raw_fh
         sftp_file = self._sftp_file
@@ -772,6 +921,7 @@ class PolyReader:
         self._progress = None
         self._counting_stream = None
         self._progress_raw_bytes = 0
+        self._progress_pending = 0
         self._request_iterator = False
         self._iter_buffer = ""
 
@@ -882,7 +1032,7 @@ class PolyWriter:
             parsed.username,
             parsed.password,
             port=port,
-            session_factory=FTPSessionWrapper,
+            session_factory=_ftp_session_wrapper_class(),
         )
         self.remote_filename = parsed.path
 
@@ -914,10 +1064,13 @@ class PolyWriter:
             dctx = zstd.ZstdCompressor(level=22)
             self._fh = io.TextIOWrapper(dctx.stream_writer(self._raw_fh), encoding='utf-8')
         elif norm.endswith('.bz2'):
+            import bz2
             self._fh = bz2.open(self._raw_fh, compresslevel=9, mode='at' if append else 'wt', encoding='utf-8')
         elif norm.endswith('.xz'):
+            import lzma
             self._fh = lzma.open(self._raw_fh, preset=9, mode='at' if append else 'wt', encoding='utf-8')
         elif norm.endswith('.gz'):
+            import gzip
             self._fh = gzip.open(self._raw_fh, compresslevel=9, mode='at' if append else 'wt', encoding='utf-8')
         else:
             self._fh = io.TextIOWrapper(self._raw_fh, encoding='utf-8')
@@ -1023,10 +1176,13 @@ class PolyWriter:
             dctx = zstd.ZstdCompressor(level=22)
             self._fh = io.TextIOWrapper(dctx.stream_writer(self._sftp_file), encoding='utf-8')
         elif norm.endswith('.bz2'):
+            import bz2
             self._fh = bz2.open(self._sftp_file, compresslevel=9, mode='at' if append else 'wt', encoding='utf-8')
         elif norm.endswith('.xz'):
+            import lzma
             self._fh = lzma.open(self._sftp_file, preset=9, mode='at' if append else 'wt', encoding='utf-8')
         elif norm.endswith('.gz'):
+            import gzip
             self._fh = gzip.open(self._sftp_file, compresslevel=9, mode='at' if append else 'wt', encoding='utf-8')
 
     def _backup_local_file(self):
@@ -1100,8 +1256,6 @@ class PolyWriter:
         if backup:
             self._backup_local_file()
 
-        if parsed is None:
-            parsed = urlparse(self.filename)
         norm = _normalized_path(self.filename, parsed)
         mode = 'ab' if append else 'wb'
         if norm.endswith('.zst'):
@@ -1110,10 +1264,13 @@ class PolyWriter:
             self._raw_fh = open(self.filename, mode)
             self._fh = io.TextIOWrapper(cctx.stream_writer(self._raw_fh), encoding='utf-8')
         elif norm.endswith('.bz2'):
+            import bz2
             self._fh = bz2.open(self.filename, 'at' if append else 'wt', encoding='utf-8')
         elif norm.endswith('.xz'):
+            import lzma
             self._fh = lzma.open(self.filename, 'at' if append else 'wt', encoding='utf-8')
         elif norm.endswith('.gz'):
+            import gzip
             self._fh = gzip.open(self.filename, 'at' if append else 'wt', encoding='utf-8')
         else:
             self._fh = open(self.filename, 'a' if append else 'w', encoding='utf-8')
@@ -1145,11 +1302,17 @@ class PolyWriter:
         if self._fh is not None:
             return self
 
-        parsed = urlparse(self.filename)
-        if parsed.scheme == 'file':
-            from urllib.request import url2pathname
-            self.filename = url2pathname(parsed.path)
+        if ':' in self.filename:
+            from urllib.parse import urlparse
             parsed = urlparse(self.filename)
+            if parsed.scheme == 'file':
+                from urllib.request import url2pathname
+                self.filename = url2pathname(parsed.path)
+                parsed = urlparse(self.filename)
+            scheme = parsed.scheme.lower()
+        else:
+            parsed = None
+            scheme = ''
 
         if _normalized_path(self.filename, parsed).endswith(UNSUPPORTED_ARCHIVES):
             raise UnsupportedArchiveError(
@@ -1160,7 +1323,6 @@ class PolyWriter:
         if append and backup:
             raise ValueError("Cannot have both append and backup set to True.")
 
-        scheme = parsed.scheme.lower()
         if scheme in ('http', 'https'):
             raise ReadOnlyProtocolError(f"Protocol '{parsed.scheme}' does not support write/append operations in polyopen.")
 
@@ -1181,6 +1343,9 @@ class PolyWriter:
             self.close()
             raise
 
+        if type(self).write is PolyWriter.write:
+            self.write = self._fh.write
+
         return self
 
     def write(self, data):
@@ -1194,11 +1359,18 @@ class PolyWriter:
 
         Returns
         -------
-        None
+        int
+            The number of characters written.
         """
         if self._fh is None:
             raise ValueError("I/O operation on closed file.")
-        self._fh.write(data)
+        return self._fh.write(data)
+
+    def writelines(self, lines) -> None:
+        """Write an iterable of strings to the file."""
+        if self._fh is None:
+            raise ValueError("I/O operation on closed file.")
+        self._fh.writelines(lines)
 
     def flush(self) -> None:
         """Flush buffered write data to the underlying stream."""
@@ -1217,6 +1389,7 @@ class PolyWriter:
         -------
         None
         """
+        self.__dict__.pop('write', None)
         fh = self._fh
         raw_fh = self._raw_fh
         sftp_file = self._sftp_file
@@ -1316,6 +1489,7 @@ def main():
         )
 
     # Set up argument parser for command-line interface
+    import argparse
     parser = argparse.ArgumentParser(description='Test reading of plain text, gzipped, bzip2, or zstandard compressed files locally and remotely.')
 
     # Add argument for input files to process
