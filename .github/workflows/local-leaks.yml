@@ -1,0 +1,35 @@
+name: local-leaks
+
+# Scan tracked files for maintainer/machine identifying info that must not be public
+# (home paths, usernames, hostnames, private repo names, session ids). Created by
+# agent-workflows. This class of leak is NOT caught by ordinary secret scanners.
+#
+# This installs agent-workflows from PyPI (assumes it is reachable). An air-gapped or
+# version-pinned adopter should replace the install line with a pinned/vendored install,
+# and may change the python-version below.
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  local-leaks:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install agent-workflows
+        run: pip install agent-workflows
+
+      - name: Scan tracked files for local leaks
+        run: python -m agent_workflows check-local-leaks .

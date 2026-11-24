@@ -73,6 +73,27 @@ scratch/
 dist/
 build/
 
+# Credentials and keys
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+*.keystore
+.netrc
+.npmrc
+.pypirc
+service-account*.json
+credentials*.json
+
+# OS cruft
+.DS_Store
+Thumbs.db
+
+# agent-workflows working material (local-only; do not commit)
+.aw/workflow-artifacts/
+
 # agent-workflows installer local backups
 .agent-workflows-installer-backups/
 

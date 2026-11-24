@@ -1,0 +1,13 @@
+polyopen
+Copyright 2007-2026 Gabriele Fariello
+
+This product includes software developed by Gabriele Fariello
+(https://github.com/fariello/polyopen).
+
+Citation and Credit
+-------------------
+If you use polyopen in academic work, technical reports, or other publications,
+please cite and credit this software as described in CITATION.cff:
+
+  Fariello, G. (2026). polyopen (Version 0.1.0) [Computer software].
+  https://github.com/fariello/polyopen
