@@ -16,9 +16,10 @@ python -m polyopen.polyopen [-h] (--write | --read) [--input-file INPUT_FILE] [f
 
 ## Flags & Arguments
 
-* `file ...` (Positional): The unified target file string maps. These define the external operational endpoints internally handling destination mappings identically.
-* `--read`, `-r` (Mutually Exclusive Boolean Context): Declares the execution process triggers sequence mapping strictly invoking native read logic looping constructs over all positional `file` payload arrays systematically.
-* `--write`, `-w` (Mutually Exclusive Boolean Context): Engages localized file generation logic pushing IO output natively over designated destination targets explicitly. Positionally extracts `file[0]` identically mapping towards `file[1:]`.
+* `file ...` (Positional): Target file paths or URLs. In `--read` mode, all positional files are read sequentially. In `--write` mode without `--input-file`, `file[0]` is the source and `file[1:]` are destination targets; with `--input-file`, all positional files are destination targets.
+* `--read`, `-r` (Mutually Exclusive Boolean): Reads all positional `file` arguments and reports line count, UTF-8 byte count (formatted across `B`, `KB`, `MB`, `GB`, `TB`, `PB`, `EB`, `ZB`, and `YB`), line rate, byte rate, and elapsed seconds.
+* `--write`, `-w` (Mutually Exclusive Boolean): Copies lines from the source file to each destination file and reports UTF-8 byte statistics for each output.
+* `--input-file INPUT_FILE`, `-i INPUT_FILE` (Optional String): Specifies the source file for `--write` mode so all positional `file` arguments act as destinations. Valid only with `--write` (rejected via `parser.error` if combined with `--read` or if no destination file is supplied).
 
 ## Practical Examples
 

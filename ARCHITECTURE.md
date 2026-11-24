@@ -18,12 +18,13 @@ Structurally handles contextual API injection routes explicitly evaluated alongs
 Relying intrinsically upon the standard standard library `urllib.parse` engine natively:
 - Accurately tracks explicit `://` demarcations evaluating payload destinations.
 - Strips maligned internal `file:///C:/` OS paths reverting logic successfully back onto normalized OS standard paths implicitly mapping standard local IO constraints seamlessly.
-- Explicitly delegates Cloud execution payloads mapped under `s3://`, `gs://`, and `az://` schemas safely throwing targeted `UnsupportedProtocolError` exceptions avoiding generic recursion trace failures.
+- Explicitly rejects cloud object store schemes (`s3://`, `gs://`, `az://`, `hdfs://`) by raising `UnsupportedProtocolError`.
 
 ### 3. Context De-Mux Handlers (`_wrap_*`)
-Determines exact backend communication semantics cleanly isolating payload wrappers independently avoiding complex state overlaps natively. 
-- **`_wrap_ssh` & `_wrap_ftp`**: Injects native internal dependency wrappers utilizing Python namespaces securely. Dynamically tracks trailing numeric `.001.bu` file iteration bounds natively relying explicitly upon remote `.stat()` checks natively ensuring localized network resiliency explicitly uniformly. 
-- **`_wrap_http`**: Initiates isolated `requests.get(stream=True)` block mapping execution natively caching identical response streams dynamically exposing core byte payload sequences securely iteratively.
+Determines backend communication semantics and isolates transport handle lifecycles cleanly:
+- **`_wrap_ssh` & `_wrap_ftp`**: Support both reading and writing (with default ports 22 for SSH/SFTP and 21 for FTP, forwarding custom URL ports). Backups are capped at 999 sequential `.NNN.bu` slots with nanosecond collision-safe fallback on SFTP and FTP, while local backups use atomic `os.link()` + `os.unlink()` with `os.rename()` fallback when hard links are unavailable. Missing SFTP files propagate `FileNotFoundError` cleanly without printing credentials or calling `exit(1)`.
+- **`_wrap_http`**: Streams responses via `requests.get(stream=True)`, validates status with `response.raise_for_status()` (closing the response on error), parses `Content-Length` safely to `Optional[int]`, and matches extensions case-insensitively on the URL path without query strings.
+- **Raw-Byte Progress Accounting (`_CountingByteStream`)**: When `show_progress=True`, compressed streams wrap their underlying binary handle in `_CountingByteStream` so `tqdm` tracks exact raw compressed bytes read and falls back to `total=None` when stream size is unknown.
 
 ### 4. Mathematical Chunk Boundaries & Compression (`io.TextIOWrapper`)
 Directly extracts dictionary frame sizes globally enforcing contiguous buffer extraction formats reliably:

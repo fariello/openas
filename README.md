@@ -62,7 +62,7 @@ Because `polyopen` is designed absolutely for stream-based parsing, it supports 
 ### Supported Stream Formats
 | Format / Protocol | Read? | Write? | Append? | Notes |
 | :--- | :---: | :---: | :---: | :--- |
-| Plain Text (`.txt`, `.csv`, etc.) | ✓ | ✓ | ✓ | StandardUTF-8 streams |
+| Plain Text (`.txt`, `.csv`, etc.) | ✓ | ✓ | ✓ | Standard UTF-8 streams |
 | Zstandard (`.zst`) | ✓ | ✓ | ✓ | Extremely fast, supports concatenated frames |
 | GZIP (`.gz`) | ✓ | ✓ | ✓ | Standard Python `gzip` bindings |
 | BZIP2 (`.bz2`) | ✓ | ✓ | ✓ | Standard Python `bz2` bindings |
@@ -130,7 +130,7 @@ For deep-dives into the precise mechanical routing topologies, algorithm boundar
 
 ## Acknowledgements and Limitations
 
-While the module is heavily structurally covered, developers should accurately understand exact integration constraints natively:
-- **Cloud Immutability Exclusions**: Due strictly to architectural constraints barring internal S3 file appending recursively natively, execution flows evaluating exact enterprise object strings natively (`s3://`, `gs://`, `az://`) are securely blocked. Use `smart_open` appropriately to manipulate those objects dynamically.
-- **Write Tracking Limitation (v0.1.0)**: Executing specific parameter flags injecting `show_progress=True` executes flawlessly across `PolyReader` streaming iterations, but is inherently disabled iteratively executing across `PolyWriter` pipelines natively.
-- **Infinite Blocking Risk**: Executing backup checks against SFTP topologies actively sequentially evaluates `stat(file.XXX.bu)` numbers manually. Remote nodes structurally hosting thousands of sequential `.bu` files natively will incur mathematically linear blocking overhead dynamically polling arrays gracefully before generating sequential bounds fundamentally.
+While the module covers common local and remote streaming workflows, note these explicit boundaries:
+- **Cloud Object Store Exclusions**: Cloud object schemes (`s3://`, `gs://`, `az://`, `hdfs://`) are explicitly rejected with `UnsupportedProtocolError`. Use `smart_open` or dedicated cloud SDKs for those stores.
+- **Write Tracking Limitation (v0.1.0)**: `show_progress=True` tracks raw bytes read across `PolyReader` streams (including indeterminate progress bars when size is unknown), and raises `NotImplementedError` on `PolyWriter` and write/append modes.
+- **Backup Rotation Cap and Atomicity**: Sequential backup numbering (`.001.bu` through `.999.bu`) is capped at 999 across local, SFTP, and FTP targets, falling back to collision-retried nanosecond timestamps (`time.time_ns()`) past 999. Local backups use atomic `os.link()` + `os.unlink()` (with `os.rename()` fallback only when hard links are unsupported) to prevent concurrent overwrite races.

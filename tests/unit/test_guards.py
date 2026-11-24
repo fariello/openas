@@ -32,3 +32,31 @@ def test_writer_progress_exception(tmp_path):
     # Validates explicitly the newly structured parameter guard correctly fails.
     with pytest.raises(NotImplementedError):
         polyopen(str(tmp_path / "testing.zst"), 'w', show_progress=True)
+
+
+def test_polyopen_append_backup_guard(tmp_path):
+    """BUG-04: polyopen(path, 'a', backup=True) raises ValueError; default append skips backup."""
+    target = tmp_path / "append_guard.txt"
+    with polyopen(target, "w") as w:
+        w.write("first\n")
+
+    with pytest.raises(ValueError):
+        polyopen(target, "a", backup=True)
+
+    with polyopen(target, "a") as w:
+        w.write("second\n")
+
+    assert not os.path.exists(f"{target}.001.bu")
+    with polyopen(target, "r") as r:
+        assert r.read() == "first\nsecond\n"
+
+
+def test_polywriter_show_progress_signature_guard(tmp_path):
+    """BUG-06a: PolyWriter accepts show_progress=False and rejects show_progress=True."""
+    from polyopen import PolyWriter
+
+    target = tmp_path / "writer_prog.txt"
+    with PolyWriter(target, show_progress=False) as w:
+        w.write("ok\n")
+    with pytest.raises(NotImplementedError):
+        PolyWriter(target, show_progress=True)

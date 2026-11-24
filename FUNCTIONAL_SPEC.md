@@ -36,24 +36,25 @@ Natively supported stream architectures:
 **Archival Containers (e.g., `.zip`, `.tar`, `.rar`) are explicitly rejected** during I/O instantiation because `readline()`/`write()` streams catastrophically corrupt their embedded binary file-tables.
 
 ## 4. Public API 
-### `polyopen(filename: str, mode: str = 'r', backup: bool = True, show_progress: bool = False)`
-- **`mode`**: Interrogates trailing strings (e.g., `r`, `wt`, `ab`). Determines branching into `PolyReader` or `PolyWriter`.
-- **`backup`**: Autonomously intercepts `w` directives (ignoring `a`) to preserve files sequentially (`file.001.bu`). 
-- **`show_progress`**: Injects an instantiated `tqdm` output bar tracking the binary read depth over UI consoles. **Note:** Currently only functional on `PolyReader` objects.
+### `polyopen(filename: Union[str, os.PathLike], mode: str = 'r', backup: Optional[bool] = None, show_progress: bool = False)`
+- **`filename`**: Accepts `str` or `os.PathLike` (normalized via `os.fsdecode()`). Extension matching is case-insensitive and ignores URL query strings.
+- **`mode`**: Accepts `'r'`, `'rt'`, `'rb'` (`PolyReader`), `'w'`, `'wt'`, `'wb'` (`PolyWriter(append=False)`), and `'a'`, `'at'`, `'ab'` (`PolyWriter(append=True)`). All streams decode and encode UTF-8 text explicitly.
+- **`backup`**: Defaults to `None` (`True` on write modes, `False` on append modes). Passing `backup=True` with an append mode raises `ValueError`.
+- **`show_progress`**: Injects a `tqdm` progress bar tracking exact raw bytes read (compressed bytes on compressed streams, and indeterminate `total=None` when stream size is unknown). Supported only on `PolyReader`; passing `show_progress=True` to `PolyWriter` or write/append modes raises `NotImplementedError`.
 
-*(Internal objects `PolyReader` and `PolyWriter` provide identical internal contextual mapping `__enter__` and `__exit__` execution, but are typically obfuscated behind the unified parser)*.
+`PolyReader` exposes standard `read()`, `readline()`, `readlines()`, `__iter__()`, `__next__()`, `open()`, and idempotent `close()` methods (reopening after `close()` works cleanly; calling read methods after `close()` raises `ValueError`). `PolyWriter` exposes `write()`, `flush()`, `open()`, and idempotent `close()` methods (calling `write()` or `flush()` after `close()` raises `ValueError`).
 
 ## 5. Command-Line Interface (CLI) Behavior
-The package exposes testing evaluation loops directly via standard environment execution.
-`python -m polyopen.polyopen`
-- `--read` (`-r`): Required for executing performance benchmarks across provided target `files`. Returns lines processed, exact chunk sizes, and streaming speeds natively.
-- `--write` (`-w`): Pips the binary string stream of `file[0]` dynamically into all trailing positional `files[1:]` broadcast targets inherently mirroring legacy Unix primitives perfectly.
-*Exit Semantics:* Returns `0` gracefully on correct routing, throws `parser.error` alongside `exit(1)` if arguments clash (like missing targets). 
+The package exposes a CLI via `python -m polyopen.polyopen`:
+- `--read` (`-r`): Reads all positional `files` and prints line count, UTF-8 byte size (`B` through `YB`), throughput, and elapsed time.
+- `--write` (`-w`): Streams lines from the source file to one or more destination files.
+- `--input-file` (`-i`): Optional source path for `--write` mode (all positional arguments become destinations). Rejected with `parser.error` if used with `--read` or without at least one destination file.
+*Exit Semantics:* Returns `0` on success, or exits non-zero via `parser.error` when arguments clash or required targets are missing.
 
 ## 6. Edge Cases & Boundary Conditions
-1. **Append & Backup Collision:** Passing `polyopen(file, 'a', backup=True)` inherently triggers `ValueError("Cannot have both append and backup set to True")`.
-2. **Infinite Backup Sequences:** Rotating backups rely on `os.path.exists()` or `sftp.stat()` iterating to infinity. If 999 backups exist, the system continues polling increment counters manually.
-3. **Chunk Shearing Limitations:** `zstandard` internal payloads are 128KB by default. Extremely massive line structures (e.g., lines scaling over 300,000 sequential characters) are successfully parsed due to strict delegation of string-rebuilding natively back to the Python standard `io.TextIOWrapper` boundary constraints.
+1. **Append & Backup Collision:** Passing `polyopen(file, 'a', backup=True)` or `PolyWriter(file).open(append=True, backup=True)` raises `ValueError("Cannot have both append and backup set to True.")`.
+2. **Bounded Backup Rotation and Atomic Local Moves:** Backup numbering is capped at 999 sequential `.NNN.bu` slots across local, SFTP, and FTP destinations; beyond 999 backups, `polyopen` falls back to nanosecond timestamps (`time.time_ns()`) with collision retry. Local backups use atomic `os.link()` followed by `os.unlink()` (retrying the next free slot on `FileExistsError` and falling back to `os.rename()` only when hard links are unsupported).
+3. **Chunk Shearing and Multi-Frame Zstandard:** `zstandard` internal payloads are 128KB by default. Massive lines and multi-frame concatenated `.zst` streams (`read_across_frames=True`) are parsed consistently across local, FTP, SFTP, and HTTP transports via `io.TextIOWrapper`.
 
 ## 7. Security and Safety Considerations
 1. **Remote Shell Code Execution Risk:** SSH client endpoints enforce `load_system_host_keys()`, actively refusing blind Hostkey injections by default on fresh environments to thwart Man-In-The-Middle network redirections.
