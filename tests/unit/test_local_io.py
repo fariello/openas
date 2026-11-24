@@ -1,6 +1,7 @@
 import bz2
 import errno
 import gzip
+import lzma
 import os
 import subprocess
 import sys
@@ -486,3 +487,146 @@ def test_http_uncompressed_blank_line_not_truncated(monkeypatch):
             except StopIteration:
                 break
         assert got == ["a\n", "\n", "b\n"]
+
+
+@pytest.mark.parametrize("ext", [".zst", ".gz", ".bz2", ".xz"])
+def test_local_compresslevel_default_and_explicit_roundtrip(tmp_path, ext):
+    """p1f3dc E-01: Local default (omitting None kwargs) and explicit compresslevel round-trips across all 4 formats."""
+    payload = f"local compresslevel test for {ext} café\nsecond line\n"
+    fp_default = tmp_path / f"default{ext}"
+    fp_explicit = tmp_path / f"explicit{ext}"
+    fp_shorthand = tmp_path / f"shorthand{ext}"
+
+    if ext == ".zst":
+        comp_patch = patch("zstandard.ZstdCompressor", wraps=zstd.ZstdCompressor)
+    elif ext == ".gz":
+        comp_patch = patch("gzip.open", wraps=gzip.open)
+    elif ext == ".bz2":
+        comp_patch = patch("bz2.open", wraps=bz2.open)
+    else:
+        comp_patch = patch("lzma.open", wraps=lzma.open)
+
+    with comp_patch as mock_comp:
+        with PolyWriter(fp_default).open(backup=False) as w:
+            w.write(payload)
+        call_args, call_kwargs = mock_comp.call_args
+        if ext == ".zst":
+            assert call_args == ()
+            assert call_kwargs == {}
+        elif ext in (".gz", ".bz2"):
+            assert "compresslevel" not in call_kwargs
+        else:
+            assert "preset" not in call_kwargs
+
+        mock_comp.reset_mock()
+        with PolyWriter(fp_explicit).open(backup=False, compresslevel=2) as w:
+            w.write(payload)
+        _, call_kwargs = mock_comp.call_args
+        if ext == ".zst":
+            assert call_kwargs == {"level": 2}
+        elif ext in (".gz", ".bz2"):
+            assert call_kwargs["compresslevel"] == 2
+        else:
+            assert call_kwargs["preset"] == 2
+
+        mock_comp.reset_mock()
+        with polyopen(fp_shorthand, "w", backup=False, compresslevel=1) as w:
+            w.write(payload)
+        _, call_kwargs = mock_comp.call_args
+        if ext == ".zst":
+            assert call_kwargs == {"level": 1}
+        elif ext in (".gz", ".bz2"):
+            assert call_kwargs["compresslevel"] == 1
+        else:
+            assert call_kwargs["preset"] == 1
+
+    for path in (fp_default, fp_explicit, fp_shorthand):
+        with PolyReader(path) as r:
+            assert r.read() == payload
+
+
+def test_local_backup_fast_path_including_bare_relative_filename(tmp_path, monkeypatch):
+    """p1f3dc E-01: Local .001.bu fast-path avoids os.scandir, including for bare relative filenames."""
+    monkeypatch.chdir(tmp_path)
+    bare = "bare_relative.txt"
+    with PolyWriter(bare).open(backup=True) as w:
+        w.write("v1\n")
+
+    with patch("os.scandir", wraps=os.scandir) as mock_scandir:
+        with PolyWriter(bare).open(backup=True) as w:
+            w.write("v2\n")
+        mock_scandir.assert_not_called()
+
+    assert (tmp_path / "bare_relative.txt.001.bu").read_text(encoding="utf-8") == "v1\n"
+    assert (tmp_path / bare).read_text(encoding="utf-8") == "v2\n"
+
+    # Second overwrite scans "." once and selects .002.bu
+    with patch("os.scandir", wraps=os.scandir) as mock_scandir:
+        with PolyWriter(bare).open(backup=True) as w:
+            w.write("v3\n")
+        mock_scandir.assert_called_once_with(".")
+
+    assert (tmp_path / "bare_relative.txt.002.bu").read_text(encoding="utf-8") == "v2\n"
+    assert (tmp_path / bare).read_text(encoding="utf-8") == "v3\n"
+
+
+def test_local_backup_500_single_scandir_and_exact_slot_matching(tmp_path):
+    """p1f3dc E-01: 500-backup single os.scandir slot selection (.501.bu) and exact 3-digit prefix/suffix matching."""
+    target = tmp_path / "many.txt"
+    target.write_text("current\n", encoding="utf-8")
+    for idx in range(1, 501):
+        (tmp_path / f"many.txt.{idx:03d}.bu").touch()
+
+    with patch("os.scandir", wraps=os.scandir) as mock_scandir:
+        with PolyWriter(target).open(backup=True) as w:
+            w.write("updated\n")
+        mock_scandir.assert_called_once_with(str(tmp_path))
+
+    assert (tmp_path / "many.txt.501.bu").read_text(encoding="utf-8") == "current\n"
+    assert target.read_text(encoding="utf-8") == "updated\n"
+
+    # Exact 3-digit ASCII prefix/suffix matching with regex metacharacters in filename
+    meta_dir = tmp_path / "meta"
+    meta_dir.mkdir()
+    meta_name = "data[1]+(a).txt"
+    meta_target = meta_dir / meta_name
+    meta_target.write_text("meta-v2\n", encoding="utf-8")
+    (meta_dir / f"{meta_name}.001.bu").write_text("meta-v1\n", encoding="utf-8")
+    # Decoys that must be ignored as 3-digit backup slots:
+    (meta_dir / f"{meta_name}.2.bu").touch()
+    (meta_dir / f"{meta_name}.0002.bu").touch()
+    (meta_dir / f"{meta_name}.002.bu.bak").touch()
+    (meta_dir / f"{meta_name}.1700000000000000000.bu").touch()
+    (meta_dir / f"{meta_name}.\u0660\u0660\u0662.bu").touch()  # Arabic-Indic digits
+    (meta_dir / "data1+(a).txt.002.bu").touch()
+    (meta_dir / "other.txt.002.bu").touch()
+
+    with patch("os.scandir", wraps=os.scandir) as mock_scandir:
+        with PolyWriter(meta_target).open(backup=True) as w:
+            w.write("meta-v3\n")
+        mock_scandir.assert_called_once_with(str(meta_dir))
+
+    assert (meta_dir / f"{meta_name}.002.bu").read_text(encoding="utf-8") == "meta-v2\n"
+    assert meta_target.read_text(encoding="utf-8") == "meta-v3\n"
+
+
+def test_local_backup_999_cap_single_scandir_and_collision_safe_timestamp(tmp_path):
+    """p1f3dc E-01: 999-cap local backup scans once and increments past an existing timestamp collision."""
+    cap_dir = tmp_path / "cap999"
+    cap_dir.mkdir()
+    target = cap_dir / "cap.txt"
+    target.write_text("before-cap\n", encoding="utf-8")
+    for idx in range(1, 1000):
+        (cap_dir / f"cap.txt.{idx:03d}.bu").touch()
+    preexisting_ts = cap_dir / "cap.txt.1700000000000000999.bu"
+    preexisting_ts.write_text("existing-ts\n", encoding="utf-8")
+
+    with patch("os.scandir", wraps=os.scandir) as mock_scandir:
+        with patch("time.time_ns", return_value=1700000000000000999):
+            with PolyWriter(target).open(backup=True) as w:
+                w.write("after-cap\n")
+        mock_scandir.assert_called_once_with(str(cap_dir))
+
+    assert preexisting_ts.read_text(encoding="utf-8") == "existing-ts\n"
+    assert (cap_dir / "cap.txt.1700000000000001000.bu").read_text(encoding="utf-8") == "before-cap\n"
+    assert target.read_text(encoding="utf-8") == "after-cap\n"

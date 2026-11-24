@@ -6,7 +6,7 @@ This document serves as the formal specification for developers programmatically
 
 ## The Core Wrapper
 
-### `polyopen(filename: Union[str, os.PathLike], mode: str = 'r', backup: Optional[bool] = None, show_progress: bool = False)`
+### `polyopen(filename: Union[str, os.PathLike], mode: str = 'r', backup: Optional[bool] = None, show_progress: bool = False, compresslevel: Optional[int] = None)`
 This function provides a drop-in replacement for the native Python `builtins.open()` context manager. It resolves remote protocols and stream compression formats automatically behind a uniform UTF-8 text interface.
 
 #### Parameters
@@ -15,10 +15,11 @@ This function provides a drop-in replacement for the native Python `builtins.ope
   - Reading operations (`'r'`, `'rt'`, `'rb'`) open a `PolyReader`.
   - Writing / truncating operations (`'w'`, `'wt'`, `'wb'`) open a `PolyWriter(append=False)`.
   - Appending operations (`'a'`, `'at'`, `'ab'`) open a `PolyWriter(append=True)`.
-- **`backup`** (`Optional[bool]`): Controls whether `polyopen` rotates an existing file to a numbered backup (`file.001.bu` through `file.999.bu`, then nanosecond timestamp fallback) before overwriting locally or over SSH/FTP. Defaults to `None`, which resolves to `True` in write modes and `False` in append modes.
+- **`backup`** (`Optional[bool]`): Controls whether `polyopen` rotates an existing file before overwriting locally or over SSH/FTP. Rotation checks `<path>.001.bu` first in O(1); if occupied, it runs a single directory listing (`os.scandir` locally, `listdir` on SFTP/FTP) to select the lowest free 3-digit slot (`file.001.bu` through `file.999.bu`), falling back to a collision-safe nanosecond timestamp (`time.time_ns()`) past 999. Defaults to `None`, which resolves to `True` in write modes and `False` in append modes.
   - *Guard Rails:* Explicitly passing `backup=True` with an append mode (`'a'`, `'at'`, `'ab'`) raises `ValueError`.
-- **`show_progress`** (`bool`): Enables a console `tqdm` progress bar tracking exact raw bytes read (compressed bytes on compressed streams, with indeterminate `total=None` when stream size is unknown or missing `Content-Length`).
+- **`show_progress`** (`bool`): Enables a console `tqdm` progress bar tracking exact raw bytes read (compressed bytes on compressed streams, batched in 64 KiB increments with exact flush on EOF/exit/`close()`, and indeterminate `total=None` when stream size is unknown or missing `Content-Length`).
   - *Guard Rails:* Only supported on `PolyReader`. Passing `show_progress=True` to `polyopen(..., 'w'/'a')` or `PolyWriter(..., show_progress=True)` raises `NotImplementedError`.
+- **`compresslevel`** (`Optional[int]`): Optional compression level or preset forwarded to write and append modes (ignored in read mode). When `None` (default), each compression library uses its own default: `zstd` level 3, `lzma` preset 6, `bz2` level 9, and `gzip` level 9.
 
 #### Exceptions
 All custom exceptions inherit from `PolyopenError`:
@@ -39,15 +40,19 @@ Reads local and remote (`ftp://`, `ssh://`, `sftp://`, `http://`, `https://`) UT
 
 #### Methods
 - **`__init__(self, filename: Union[str, os.PathLike], show_progress: bool = False)`**: Normalizes `PathLike` inputs via `os.fsdecode()` and configures optional raw-byte progress tracking.
-- **`open(self) -> 'PolyReader'`**: Establishes transport connections (FTP defaults to port 21; SSH/SFTP defaults to port 22 and forwards custom URL ports; HTTP validates status via `raise_for_status()` and parses `Content-Length` safely). Calling `open()` after `close()` reopens cleanly.
-- **`read(self, size: int = -1) -> str`**, **`readline(self, size: int = -1) -> str`**, **`readlines(self, hint: int = -1) -> list`**, and **`__next__(self) -> str`**: Standard file-object read methods returning UTF-8 `str` and updating raw-byte progress without double-counting. Raise `ValueError` when called on a closed reader.
-- **`close(self) -> None`**: Idempotently closes all acquired handles (stream wrappers, raw handles, SFTP file/client, SSH client, FTP host, HTTP response, and progress bar) in reverse ownership order and resets state attributes.
+- **`open(self) -> 'PolyReader'`**: Establishes transport connections:
+  - FTP defaults to port 21 and forwards custom URL ports.
+  - SSH/SFTP defaults to port 22, forwards custom URL ports, caches `stat().st_size` once for `_get_file_size()`, and calls bounded `prefetch(file_size, max_concurrent_requests=64)` when size is known (falling back to `prefetch(file_size)` on Paramiko `<3.3`).
+  - HTTP/HTTPS reuses a thread-local, cookie-free `requests.Session` (`http.cookiejar.DefaultCookiePolicy(allowed_domains=[])`), validates status via `raise_for_status()` (closing the response on error), parses `Content-Length` safely, sets `response.raw.decode_content = True` strictly on uncompressed HTTP, and streams via `io.TextIOWrapper(response.raw, encoding='utf-8')`.
+  - Calling `open()` after `close()` reopens cleanly.
+- **`read(self, size: int = -1) -> str`**, **`readline(self, size: int = -1) -> str`**, **`readlines(self, hint: int = -1) -> list`**, **`__iter__(self)`**, and **`__next__(self) -> str`**: Standard file-object read methods returning UTF-8 `str`. When `show_progress=False`, `__iter__()` returns the underlying `io.TextIOBase` C-level iterator directly. Raise `ValueError` when called on a closed reader.
+- **`close(self) -> None`**: Deterministically and idempotently closes all acquired handles (`_fh`, `_raw_fh`, `_sftp_file`, `_sftp_client`, `_ssh_client`, `_ftp`, `_response`, and `_progress`) and resets state attributes, including on early iteration exit or when an individual handle close raises.
 
 ### `class PolyWriter`
 Writes local and remote (`ftp://`, `ssh://`, `sftp://`) UTF-8 text streams with transparent `.gz`, `.bz2`, `.xz`, and `.zst` compression and collision-safe backup rotation.
 
 #### Methods
 - **`__init__(self, filename: Union[str, os.PathLike], show_progress: bool = False)`**: Normalizes `PathLike` inputs via `os.fsdecode()`; raises `NotImplementedError` if `show_progress=True`.
-- **`open(self, append: bool = False, backup: bool = True) -> 'PolyWriter'`**: Performs atomic local backup rotation (`os.link`/`os.unlink` with `FileExistsError` retry and `os.rename` fallback where hard links are unsupported) or remote SFTP/FTP backup rotation capped at 999 sequential slots with nanosecond collision-safe fallback. FTP defaults to port 21; SSH/SFTP defaults to port 22 and forwards custom URL ports.
-- **`write(self, data: str) -> None`** and **`flush(self) -> None`**: Write UTF-8 text and flush buffered output; raise `ValueError` when called on a closed writer.
-- **`close(self) -> None`**: Idempotently closes all acquired handles in reverse ownership order and resets state attributes.
+- **`open(self, append: bool = False, backup: bool = True, compresslevel: Optional[int] = None) -> 'PolyWriter'`**: Opens the target for writing or appending. Performs `.001.bu` O(1) fast-path backup rotation followed by a single directory listing (`os.scandir` locally with atomic `os.link`/`os.unlink` and `os.rename` fallback; single `listdir` on SFTP/FTP) capped at 999 sequential slots with collision-safe nanosecond timestamp fallback. Forwards optional `compresslevel` to `.zst`, `.gz`, `.bz2`, and `.xz` compressors (using library defaults when `None`: `zstd` level 3, `lzma` preset 6, `bz2` 9, `gzip` 9). FTP defaults to port 21; SSH/SFTP defaults to port 22, forwards custom URL ports, opens compressed targets in binary mode (`'wb'`/`'ab'`), and enables `set_pipelined(True)`.
+- **`write(self, data: str) -> int`**, **`writelines(self, lines) -> None`**, and **`flush(self) -> None`**: Write UTF-8 text (or an iterable of strings) and flush buffered output; raise `ValueError` when called on a closed writer. When `write` is not overridden by a subclass, `open()` binds `self.write` directly to `self._fh.write` for minimal per-call overhead.
+- **`close(self) -> None`**: Deterministically and idempotently closes all acquired handles (`_fh`, `_raw_fh`, `_sftp_file`, `_sftp_client`, `_ssh_client`, and `_ftp`) and resets state attributes, even if an individual handle fails to close.

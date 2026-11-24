@@ -1,12 +1,18 @@
 import bz2
+import functools
 import gzip
+import http.cookiejar
+import http.server
 import io
+import lzma
+import threading
 from urllib.parse import urlparse
 from unittest.mock import patch, MagicMock
 import pytest
 import requests
+import zstandard as zstd
 from polyopen import polyopen, PolyReader, PolyWriter, UnsupportedArchiveError
-from polyopen.polyopen import _normalized_path
+from polyopen.polyopen import _get_http_session, _normalized_path
 
 @patch('paramiko.SSHClient')
 def test_ssh_routing(mock_ssh):
@@ -256,3 +262,493 @@ def test_http_errors_query_extensions_unknown_size_and_file_methods(mock_get):
                 assert r.readlines() == ["ne2\n", "line3\n"]
 
     assert _normalized_path("C:/tmp/DATA.GZ", urlparse("C:/tmp/DATA.GZ")) == "c:/tmp/data.gz"
+
+
+class _InspectableBytesIO(io.BytesIO):
+    """BytesIO buffer that retains written bytes after close() for post-close decompression checks."""
+
+    def __init__(self):
+        super().__init__()
+        self.saved_bytes = b""
+        self.close_count = 0
+        self.pipelined_calls = []
+
+    def set_pipelined(self, pipelined=True):
+        self.pipelined_calls.append(pipelined)
+
+    def close(self):
+        self.close_count += 1
+        if not self.closed:
+            self.saved_bytes = self.getvalue()
+        super().close()
+
+
+def _decompress_bytes(raw: bytes, ext: str) -> str:
+    if ext == ".zst":
+        with zstd.ZstdDecompressor().stream_reader(io.BytesIO(raw), read_across_frames=True) as sr:
+            return sr.read().decode("utf-8")
+    if ext == ".gz":
+        return gzip.decompress(raw).decode("utf-8")
+    if ext == ".bz2":
+        return bz2.decompress(raw).decode("utf-8")
+    if ext == ".xz":
+        return lzma.decompress(raw).decode("utf-8")
+    raise ValueError(f"Unexpected extension: {ext}")
+
+
+@pytest.mark.parametrize("protocol", ["sftp", "ftp"])
+@pytest.mark.parametrize("ext", [".zst", ".gz", ".bz2", ".xz"])
+@pytest.mark.parametrize("compresslevel", [None, 2])
+def test_remote_compresslevel_default_and_explicit(protocol, ext, compresslevel):
+    """p1f3dc E-01(a): Default (omitting None kwargs) and explicit compresslevel forwarding on SFTP and FTP."""
+    buf = _InspectableBytesIO()
+    payload = f"remote {protocol} {ext} level={compresslevel} café\n"
+    url = f"{protocol}://user:pass@host/dir/out{ext}"
+
+    if protocol == "sftp":
+        transport_patch = patch("paramiko.SSHClient")
+    else:
+        transport_patch = patch("ftputil.FTPHost")
+
+    if ext == ".zst":
+        comp_patch = patch("zstandard.ZstdCompressor", wraps=zstd.ZstdCompressor)
+    elif ext == ".gz":
+        comp_patch = patch("gzip.open", wraps=gzip.open)
+    elif ext == ".bz2":
+        comp_patch = patch("bz2.open", wraps=bz2.open)
+    else:
+        comp_patch = patch("lzma.open", wraps=lzma.open)
+
+    with transport_patch as mock_transport, comp_patch as mock_comp:
+        if protocol == "sftp":
+            client = MagicMock()
+            sftp = MagicMock()
+            mock_transport.return_value = client
+            client.open_sftp.return_value = sftp
+            sftp.file.return_value = buf
+        else:
+            host = MagicMock()
+            mock_transport.return_value = host
+            host.open.return_value = buf
+
+        with polyopen(url, "w", backup=False, compresslevel=compresslevel) as writer:
+            writer.write(payload)
+
+        assert mock_comp.called
+        call_args, call_kwargs = mock_comp.call_args
+        if compresslevel is None:
+            if ext == ".zst":
+                assert call_args == ()
+                assert call_kwargs == {}
+            elif ext in (".gz", ".bz2"):
+                assert "compresslevel" not in call_kwargs
+            else:
+                assert "preset" not in call_kwargs
+        else:
+            if ext == ".zst":
+                assert call_kwargs == {"level": 2}
+            elif ext in (".gz", ".bz2"):
+                assert call_kwargs["compresslevel"] == 2
+            else:
+                assert call_kwargs["preset"] == 2
+
+    assert buf.closed
+    assert _decompress_bytes(buf.saved_bytes, ext) == payload
+
+
+@patch("paramiko.SSHClient")
+def test_sftp_backup_rotation_fast_path_500_posix_and_999_cap(mock_ssh):
+    """p1f3dc E-01(b): SFTP .001.bu fast-path, single listdir for 500 backups, POSIX split, and 999-cap fallback."""
+    client = MagicMock()
+    sftp = MagicMock()
+    mock_ssh.return_value = client
+    client.open_sftp.return_value = sftp
+
+    # 1. .001.bu fast-path without listdir
+    existing_fast = {"/nested/dir/file.txt"}
+
+    def stat_fast(path):
+        if path in existing_fast:
+            return MagicMock()
+        raise FileNotFoundError(path)
+
+    sftp.stat.side_effect = stat_fast
+    sftp.file.return_value = io.StringIO()
+    with PolyWriter("sftp://u:p@host/nested/dir/file.txt").open(backup=True) as w:
+        w.write("new\n")
+    sftp.listdir.assert_not_called()
+    sftp.rename.assert_called_once_with("/nested/dir/file.txt", "/nested/dir/file.txt.001.bu")
+
+    # 2. Single listdir with 500 prior backups and POSIX parent splitting (/nested/dir, /, and relative '.')
+    for remote_path, expected_parent, basename in (
+        ("/nested/dir/file.txt", "/nested/dir", "file.txt"),
+        ("/rootfile.txt", "/", "rootfile.txt"),
+        ("bare.txt", ".", "bare.txt"),
+    ):
+        sftp.reset_mock()
+        sftp.stat.side_effect = lambda p: MagicMock()
+        sftp.listdir.return_value = [basename] + [f"{basename}.{i:03d}.bu" for i in range(1, 501)]
+        writer = PolyWriter("sftp://u:p@host/placeholder")
+        writer._ssh_backup_if(sftp, remote_path)
+        sftp.listdir.assert_called_once_with(expected_parent)
+        sftp.rename.assert_called_once_with(remote_path, f"{remote_path}.501.bu")
+
+    # 3. 999-cap collision-safe timestamp fallback
+    sftp.reset_mock()
+    sftp.stat.side_effect = lambda p: MagicMock()
+    sftp.listdir.return_value = (
+        ["cap.txt"]
+        + [f"cap.txt.{i:03d}.bu" for i in range(1, 1000)]
+        + ["cap.txt.1700000000000000123.bu"]
+    )
+    sftp.file.return_value = io.StringIO()
+    with patch("time.time_ns", return_value=1700000000000000123):
+        with PolyWriter("sftp://u:p@host/sub/cap.txt").open(backup=True) as w:
+            w.write("after cap\n")
+    sftp.listdir.assert_called_once_with("/sub")
+    sftp.rename.assert_called_once_with("/sub/cap.txt", "/sub/cap.txt.1700000000000000124.bu")
+
+
+@patch("ftputil.FTPHost")
+def test_ftp_backup_rotation_fast_path_500_posix_and_999_cap(mock_host):
+    """p1f3dc E-01(b): FTP .001.bu fast-path, single listdir for 500 backups, POSIX split, and 999-cap fallback."""
+    host = MagicMock()
+    mock_host.return_value = host
+
+    # 1. .001.bu fast-path without listdir
+    host.path.exists.side_effect = lambda p: p == "/nested/dir/file.txt"
+    host.open.return_value = _InspectableBytesIO()
+    with PolyWriter("ftp://u:p@host/nested/dir/file.txt").open(backup=True) as w:
+        w.write("new\n")
+    host.listdir.assert_not_called()
+    host.rename.assert_called_once_with("/nested/dir/file.txt", "/nested/dir/file.txt.001.bu")
+
+    # 2. Single listdir with 500 prior backups and POSIX parent splitting
+    for remote_path, expected_parent, basename in (
+        ("/nested/dir/file.txt", "/nested/dir", "file.txt"),
+        ("/rootfile.txt", "/", "rootfile.txt"),
+    ):
+        host.reset_mock()
+        host.path.exists.side_effect = None
+        host.path.exists.return_value = True
+        host.listdir.return_value = [basename] + [f"{basename}.{i:03d}.bu" for i in range(1, 501)]
+        host.open.return_value = _InspectableBytesIO()
+        with PolyWriter(f"ftp://u:p@host{remote_path}").open(backup=True) as w:
+            w.write("next\n")
+        host.listdir.assert_called_once_with(expected_parent)
+        host.rename.assert_called_once_with(remote_path, f"{remote_path}.501.bu")
+
+    # 3. 999-cap collision-safe timestamp fallback (existing timestamp collides -> increments by 1)
+    host.reset_mock()
+    host.path.exists.side_effect = None
+    host.path.exists.return_value = True
+    host.listdir.return_value = (
+        ["cap.txt"]
+        + [f"cap.txt.{i:03d}.bu" for i in range(1, 1000)]
+        + ["cap.txt.1700000000000000500.bu"]
+    )
+    host.open.return_value = _InspectableBytesIO()
+    with patch("time.time_ns", return_value=1700000000000000500):
+        with PolyWriter("ftp://u:p@host/dir/cap.txt").open(backup=True) as w:
+            w.write("after cap\n")
+    host.listdir.assert_called_once_with("/dir")
+    host.rename.assert_called_once_with("/dir/cap.txt", "/dir/cap.txt.1700000000000000501.bu")
+
+
+@patch("paramiko.SSHClient")
+def test_sftp_read_prefetch_fallback_cached_size_and_idempotent_close(mock_ssh):
+    """p1f3dc E-01(c): SFTP bounded prefetch, <3.3 TypeError fallback, cached _get_file_size, and idempotent/error close."""
+    client = MagicMock()
+    sftp = MagicMock()
+    mock_ssh.return_value = client
+    client.open_sftp.return_value = sftp
+
+    class BoundedSFTPFile(io.BytesIO):
+        def __init__(self, data):
+            super().__init__(data)
+            self.stat_count = 0
+            self.prefetch_calls = []
+            self.close_count = 0
+
+        def stat(self):
+            self.stat_count += 1
+            st = MagicMock()
+            st.st_size = len(self.getvalue())
+            return st
+
+        def prefetch(self, file_size=None, max_concurrent_requests=None):
+            self.prefetch_calls.append((file_size, max_concurrent_requests))
+
+        def close(self):
+            self.close_count += 1
+            super().close()
+
+    # 1. Bounded prefetch + cached _get_file_size (no duplicate stat RTT) + idempotent close
+    f1 = BoundedSFTPFile(b"row1\nrow2\n")
+    sftp.file.return_value = f1
+    reader = PolyReader("sftp://u:p@host/data.txt", show_progress=True).open()
+    assert f1.prefetch_calls == [(10, 64)]
+    assert reader._get_file_size() == 10
+    assert f1.stat_count == 1
+    assert list(reader) == ["row1\n", "row2\n"]
+    reader.close()
+    first_close_count = f1.close_count
+    assert first_close_count >= 1
+    assert f1.closed
+    assert sftp.close.call_count == 1
+    assert client.close.call_count == 1
+    reader.close()  # idempotent: no additional close calls
+    assert f1.close_count == first_close_count
+    assert sftp.close.call_count == 1
+    assert client.close.call_count == 1
+
+    # 2. Paramiko <3.3 TypeError fallback to single-arg prefetch(file_size)
+    class LegacySFTPFile(io.BytesIO):
+        def __init__(self, data):
+            super().__init__(data)
+            self.prefetch_calls = []
+
+        def stat(self):
+            st = MagicMock()
+            st.st_size = len(self.getvalue())
+            return st
+
+        def prefetch(self, file_size=None):
+            self.prefetch_calls.append(file_size)
+
+    client.reset_mock()
+    sftp.reset_mock()
+    f_legacy = LegacySFTPFile(b"legacy\n")
+    sftp.file.return_value = f_legacy
+    with PolyReader("sftp://u:p@host/legacy.txt") as r:
+        assert r.read() == "legacy\n"
+    assert f_legacy.prefetch_calls == [7]
+
+    # 3. Close error path still closes _sftp_file, _sftp_client, and _ssh_client and remains idempotent
+    client.reset_mock()
+    sftp.reset_mock()
+    f_err = BoundedSFTPFile(b"err\n")
+    sftp.file.return_value = f_err
+    r_err = PolyReader("sftp://u:p@host/err.txt").open()
+    r_err._fh.detach()
+    failing_fh = MagicMock()
+    failing_fh.close.side_effect = OSError("fh close failed")
+    r_err._fh = failing_fh
+    with pytest.raises(OSError, match="fh close failed"):
+        r_err.close()
+    assert failing_fh.close.call_count == 1
+    assert f_err.close_count == 1
+    assert f_err.closed
+    assert sftp.close.call_count == 1
+    assert client.close.call_count == 1
+    r_err.close()  # second close is a no-op
+    assert f_err.close_count == 1
+    assert sftp.close.call_count == 1
+    assert client.close.call_count == 1
+
+
+@patch("paramiko.SSHClient")
+@pytest.mark.parametrize("ext", [".zst", ".gz", ".bz2", ".xz"])
+@pytest.mark.parametrize("append,expected_mode", [(False, "wb"), (True, "ab")])
+def test_sftp_compressed_writes_binary_mode_and_pipelined(mock_ssh, ext, append, expected_mode):
+    """p1f3dc E-01(c): Compressed SSH writes open in binary mode ('wb'/'ab') and call set_pipelined(True)."""
+    client = MagicMock()
+    sftp = MagicMock()
+    mock_ssh.return_value = client
+    client.open_sftp.return_value = sftp
+    buf = _InspectableBytesIO()
+    sftp.file.return_value = buf
+
+    with PolyWriter(f"sftp://u:p@host/dir/out{ext}").open(append=append, backup=False) as writer:
+        writer.write("pipelined line\n")
+
+    sftp.file.assert_called_once_with(f"/dir/out{ext}", expected_mode)
+    assert buf.pipelined_calls == [True]
+    assert buf.closed
+    assert sftp.close.call_count == 1
+    assert client.close.call_count == 1
+    assert _decompress_bytes(buf.saved_bytes, ext) == "pipelined line\n"
+
+
+@patch("paramiko.SSHClient")
+def test_sftp_writer_close_idempotent_and_error_paths(mock_ssh):
+    """p1f3dc E-01(c): PolyWriter.close() idempotently closes all SFTP/SSH handles including on error paths."""
+    client = MagicMock()
+    sftp = MagicMock()
+    mock_ssh.return_value = client
+    client.open_sftp.return_value = sftp
+
+    # 1. Normal idempotent close
+    sftp_file = MagicMock()
+    sftp.file.return_value = sftp_file
+    writer = PolyWriter("sftp://u:p@host/plain.txt").open(backup=False)
+    sftp.file.assert_called_once_with("/plain.txt", "w")
+    sftp_file.set_pipelined.assert_called_once_with(True)
+    writer.close()
+    writer.close()
+    assert sftp_file.close.call_count == 1
+    assert sftp.close.call_count == 1
+    assert client.close.call_count == 1
+
+    # 2. Error during _fh.close() still closes _sftp_file, _sftp_client, and _ssh_client
+    client.reset_mock()
+    sftp.reset_mock()
+    buf = _InspectableBytesIO()
+    sftp.file.return_value = buf
+    writer_err = PolyWriter("sftp://u:p@host/out.gz").open(backup=False)
+    writer_err._fh.close()  # closes gzip wrapper cleanly without closing underlying buf
+    assert buf.close_count == 0
+    failing_fh = MagicMock()
+    failing_fh.close.side_effect = OSError("writer fh boom")
+    writer_err._fh = failing_fh
+    with pytest.raises(OSError, match="writer fh boom"):
+        writer_err.close()
+    assert failing_fh.close.call_count == 1
+    assert buf.close_count == 1
+    assert buf.closed
+    assert sftp.close.call_count == 1
+    assert client.close.call_count == 1
+    writer_err.close()  # idempotent after error
+    assert buf.close_count == 1
+    assert sftp.close.call_count == 1
+    assert client.close.call_count == 1
+
+    # 3. Error during open (set_pipelined raises) cleans up acquired handles
+    client.reset_mock()
+    sftp.reset_mock()
+    bad_file = MagicMock()
+    bad_file.set_pipelined.side_effect = RuntimeError("pipeline error")
+    sftp.file.return_value = bad_file
+    with pytest.raises(RuntimeError, match="pipeline error"):
+        PolyWriter("sftp://u:p@host/bad.txt").open(backup=False)
+    assert bad_file.close.call_count == 1
+    assert sftp.close.call_count == 1
+    assert client.close.call_count == 1
+
+
+def test_http_session_thread_local_reuse_and_cookie_disabled():
+    """p1f3dc E-01(d): Per-thread _get_http_session() reuse and disabled cookie persistence."""
+    main_s1 = _get_http_session()
+    main_s2 = _get_http_session()
+    assert isinstance(main_s1, requests.Session)
+    assert main_s1 is main_s2
+
+    policy = main_s1.cookies.get_policy()
+    assert isinstance(policy, http.cookiejar.DefaultCookiePolicy)
+    assert list(policy.allowed_domains()) == []
+
+    worker_sessions = []
+
+    def worker():
+        s1 = _get_http_session()
+        s2 = _get_http_session()
+        assert s1 is s2
+        worker_sessions.append(s1)
+
+    t1 = threading.Thread(target=worker)
+    t2 = threading.Thread(target=worker)
+    t1.start()
+    t2.start()
+    t1.join()
+    t2.join()
+    assert len(worker_sessions) == 2
+    assert worker_sessions[0] is not worker_sessions[1]
+    assert worker_sessions[0] is not main_s1
+    assert worker_sessions[1] is not main_s1
+
+    # Observable cookie rejection test against a local ephemeral HTTP server
+    received_cookie_headers = []
+
+    class CookieHandler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            received_cookie_headers.append(self.headers.get("Cookie"))
+            body = b"hello cookie-free\n"
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Set-Cookie", "session_token=secret123; Path=/")
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, format, *args):  # noqa: A002
+            return
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), CookieHandler)
+    port = server.server_address[1]
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    url = f"http://127.0.0.1:{port}/data.txt"
+    try:
+        with PolyReader(url) as r1:
+            assert list(r1) == ["hello cookie-free\n"]
+        assert len(_get_http_session().cookies) == 0
+        with PolyReader(url) as r2:
+            assert list(r2) == ["hello cookie-free\n"]
+        assert len(_get_http_session().cookies) == 0
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    assert received_cookie_headers == [None, None]
+
+
+@patch("requests.Session.get")
+def test_http_early_iteration_exit_closes_response(mock_get):
+    """p1f3dc E-01(d): Early iteration exit on HTTP stream closes the response and raw handle."""
+    raw = io.BytesIO(b"line1\nline2\nline3\nline4\n")
+    mock_response = MagicMock()
+    mock_response.headers = {"Content-Length": "24"}
+    mock_response.raw = raw
+    mock_get.return_value = mock_response
+
+    seen = []
+    with PolyReader("https://example.com/early.txt") as reader:
+        for line in reader:
+            seen.append(line)
+            break
+
+    assert seen == ["line1\n"]
+    assert raw.closed
+    mock_response.close.assert_called_once()
+
+
+class _TrackedHttpRaw(io.BytesIO):
+    """BytesIO with a writable decode_content attribute mimicking urllib3 HTTPResponse."""
+
+    def __init__(self, data: bytes):
+        super().__init__(data)
+        self.decode_content = False
+
+
+@patch("requests.Session.get")
+@pytest.mark.parametrize("ext", ["", ".gz", ".bz2", ".xz", ".zst"])
+def test_http_decode_content_only_on_uncompressed(mock_get, ext):
+    """p1f3dc E-01(d): decode_content = True is set strictly on uncompressed HTTP responses."""
+    text = "http stream line 1\nhttp stream line 2\n"
+    raw_bytes = text.encode("utf-8")
+    if ext == ".gz":
+        payload = gzip.compress(raw_bytes)
+    elif ext == ".bz2":
+        payload = bz2.compress(raw_bytes)
+    elif ext == ".xz":
+        payload = lzma.compress(raw_bytes)
+    elif ext == ".zst":
+        payload = zstd.ZstdCompressor().compress(raw_bytes)
+    else:
+        payload = raw_bytes
+
+    tracked_raw = _TrackedHttpRaw(payload)
+    mock_response = MagicMock()
+    mock_response.headers = {"Content-Length": str(len(payload))}
+    mock_response.raw = tracked_raw
+    mock_get.return_value = mock_response
+
+    with PolyReader(f"https://example.com/file{ext or '.txt'}") as reader:
+        assert list(reader) == ["http stream line 1\n", "http stream line 2\n"]
+
+    if ext == "":
+        assert tracked_raw.decode_content is True
+    else:
+        assert tracked_raw.decode_content is False
+    mock_response.close.assert_called_once()
