@@ -394,3 +394,32 @@ def test_cli_redacts_url_credentials_and_format_bytes_negative(monkeypatch, caps
     assert "supersecret" not in out
     assert "abc123" not in out
     assert "alice:***@example.com/log.txt?<redacted>" in out
+
+
+def test_cli_empty_file_zero_rate_includes_byte_unit(tmp_path):
+    """iev841 E-05: CLI --read and --write format zero byte-rate as (0.0B/s) instead of (0/s)."""
+    empty_src = tmp_path / "empty.txt"
+    empty_src.write_text("", encoding="utf-8")
+    empty_dst = tmp_path / "empty_out.txt"
+
+    res_read = subprocess.run(
+        [sys.executable, "-m", "polyopen", "--read", str(empty_src)],
+        capture_output=True,
+        text=True,
+        env=_cli_env(),
+    )
+    assert res_read.returncode == 0, res_read.stderr
+    assert "(0.0B/s)" in res_read.stdout
+    assert "(0/s)" not in res_read.stdout
+
+    res_write = subprocess.run(
+        [sys.executable, "-m", "polyopen", "--write", str(empty_src), str(empty_dst)],
+        capture_output=True,
+        text=True,
+        env=_cli_env(),
+    )
+    assert res_write.returncode == 0, res_write.stderr
+    assert "(0.0B/s)" in res_write.stdout
+    assert "(0/s)" not in res_write.stdout
+    assert empty_dst.exists()
+    assert empty_dst.read_text(encoding="utf-8") == ""

@@ -1096,3 +1096,87 @@ def test_remote_binary_mode_http_ftp_and_sftp(ext):
             assert r.encoding is None
             assert list(r) == part1 + [part2]
         assert r_proxy.closed
+
+
+def test_percent_encoded_remote_gz_uses_gzip_codec():
+    """iev841 E-01: Percent-encoded .gz in SFTP and HTTPS URLs selects gzip codec and identity Accept-Encoding."""
+    payload = "percent-encoded gzip line 1\nline 2\n"
+
+    with patch("paramiko.SSHClient") as mock_ssh:
+        client = MagicMock()
+        sftp = MagicMock()
+        mock_ssh.return_value = client
+        client.open_sftp.return_value = sftp
+
+        write_buf = _InspectableBytesIO()
+        sftp.file.return_value = write_buf
+        with polyopen("sftp://u@h/dir/data%2Egz", "w", backup=False) as w:
+            w.write(payload)
+        sftp.file.assert_called_once_with("/dir/data.gz", "wb")
+        assert write_buf.closed
+        assert gzip.decompress(write_buf.saved_bytes).decode("utf-8") == payload
+
+        sftp.reset_mock()
+        read_buf = io.BytesIO(write_buf.saved_bytes)
+        sftp.file.return_value = read_buf
+        with polyopen("sftp://u@h/dir/data%2Egz", "r") as r:
+            assert r.read() == payload
+        sftp.file.assert_called_once_with("/dir/data.gz", "rb")
+
+    gz_wire = gzip.compress(payload.encode("utf-8"))
+    with patch("requests.Session.get") as mock_get:
+        resp = MagicMock()
+        resp.headers = {"Content-Length": str(len(gz_wire))}
+        resp.raw = io.BytesIO(gz_wire)
+        mock_get.return_value = resp
+        with polyopen("https://h/dir/data%2Egz", "r") as r:
+            assert r.read() == payload
+        assert mock_get.call_args.kwargs["headers"] == {"Accept-Encoding": "identity"}
+        assert resp.close.called
+
+
+@patch("paramiko.SSHClient")
+def test_sftp_backup_rejects_remote_directory_and_closes_handles(mock_ssh):
+    """iev841 E-02: SFTP backup=True raises IsADirectoryError on existing remote directories without renaming."""
+    import stat
+
+    for opener in (
+        lambda url: polyopen(url, "w", backup=True),
+        lambda url: PolyWriter(url).open(backup=True),
+    ):
+        client = MagicMock()
+        sftp = MagicMock()
+        mock_ssh.return_value = client
+        client.open_sftp.return_value = sftp
+
+        dir_stat = MagicMock()
+        dir_stat.st_mode = stat.S_IFDIR | 0o755
+        sftp.stat.return_value = dir_stat
+
+        with pytest.raises(IsADirectoryError):
+            opener("sftp://u:p@host/dir/existing_dir")
+
+        sftp.rename.assert_not_called()
+        sftp.file.assert_not_called()
+        assert sftp.close.call_count == 1
+        assert client.close.call_count == 1
+
+
+@patch("ftputil.FTPHost")
+def test_ftp_backup_rejects_remote_directory_and_closes_handles(mock_host):
+    """iev841 E-02: FTP backup=True raises IsADirectoryError on existing remote directories without renaming."""
+    for opener in (
+        lambda url: polyopen(url, "w", backup=True),
+        lambda url: PolyWriter(url).open(backup=True),
+    ):
+        host = MagicMock()
+        mock_host.return_value = host
+        host.path.exists.return_value = True
+        host.path.isdir.return_value = True
+
+        with pytest.raises(IsADirectoryError):
+            opener("ftp://u:p@host/dir/existing_dir")
+
+        host.rename.assert_not_called()
+        host.open.assert_not_called()
+        assert host.close.call_count == 1

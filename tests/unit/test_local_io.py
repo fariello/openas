@@ -848,3 +848,116 @@ def test_local_binary_mode_all_formats_roundtrip_append_iter_and_progress(tmp_pa
         streamed = list(r)
     assert streamed == big_lines
     assert pbar.n == raw_size
+
+
+def test_local_crlf_and_mixed_newline_progress_reconciliation(tmp_path):
+    """iev841 E-03: Plain local text progress reconciles CRLF/CR at natural EOF without jumping early."""
+    crlf_fp = tmp_path / "crlf.txt"
+    crlf_raw = b"alpha\r\nbeta\r\ngamma\r\n"
+    crlf_fp.write_bytes(crlf_raw)
+    crlf_size = len(crlf_raw)
+
+    # 1. Full iteration reaches pbar.n == pbar.total
+    with PolyReader(crlf_fp, show_progress=True) as r:
+        pbar = r._progress
+        assert pbar is not None
+        assert pbar.total == crlf_size
+        assert list(r) == ["alpha\n", "beta\n", "gamma\n"]
+        assert pbar.n == crlf_size
+    assert pbar.n == crlf_size
+
+    # 2. Full read() reaches pbar.n == pbar.total
+    with PolyReader(crlf_fp, show_progress=True) as r:
+        pbar = r._progress
+        assert pbar is not None
+        assert r.read() == "alpha\nbeta\ngamma\n"
+        assert pbar.n == crlf_size
+
+    # 3. readline() loop reaches pbar.n == pbar.total at natural EOF, while readline(0) mid-file does not jump
+    with PolyReader(crlf_fp, show_progress=True) as r:
+        pbar = r._progress
+        assert pbar is not None
+        first = r.readline()
+        assert first == "alpha\n"
+        mid_n = pbar.n
+        assert mid_n == len(first.encode("utf-8"))
+        assert r.readline(0) == ""
+        assert pbar.n == mid_n
+        assert r.read(0) == ""
+        assert pbar.n == mid_n
+        assert r.readline() == "beta\n"
+        assert r.readline() == "gamma\n"
+        assert pbar.n < crlf_size
+        assert r.readline() == ""
+        assert pbar.n == crlf_size
+
+    # 4. Early break on CRLF does not jump pbar.n to pbar.total
+    with PolyReader(crlf_fp, show_progress=True) as r:
+        pbar = r._progress
+        assert pbar is not None
+        seen = []
+        for line in r:
+            seen.append(line)
+            break
+    assert seen == ["alpha\n"]
+    assert pbar.n == len("alpha\n".encode("utf-8"))
+    assert pbar.n < crlf_size
+
+    # 5. Plain local file with no newlines (newlines is None) reads cleanly without TypeError
+    no_nl_fp = tmp_path / "no_newlines.txt"
+    no_nl_raw = b"single line without newline"
+    no_nl_fp.write_bytes(no_nl_raw)
+    with PolyReader(no_nl_fp, show_progress=True) as r:
+        pbar = r._progress
+        assert pbar is not None
+        assert r.read() == "single line without newline"
+        assert pbar.n == len(no_nl_raw)
+
+    # 6. Mixed LF and CRLF file (newlines as tuple) reconciles cleanly to pbar.total
+    mixed_fp = tmp_path / "mixed_newlines.txt"
+    mixed_raw = b"line1\nline2\r\nline3\n"
+    mixed_fp.write_bytes(mixed_raw)
+    with PolyReader(mixed_fp, show_progress=True) as r:
+        pbar = r._progress
+        assert pbar is not None
+        assert list(r) == ["line1\n", "line2\n", "line3\n"]
+        assert pbar.n == len(mixed_raw)
+
+    # 7. CR-only file reads cleanly to pbar.total
+    cr_fp = tmp_path / "cr_only.txt"
+    cr_raw = b"one\rtwo\r"
+    cr_fp.write_bytes(cr_raw)
+    with PolyReader(cr_fp, show_progress=True) as r:
+        pbar = r._progress
+        assert pbar is not None
+        assert list(r) == ["one\n", "two\n"]
+        assert pbar.n == len(cr_raw)
+
+
+@pytest.mark.parametrize(
+    "bad_url,secret,expected_fragment",
+    [
+        (
+            "http://user:secret@[bad/a.txt?token=1",
+            "secret",
+            "http://user:***@[bad/a.txt?<redacted>",
+        ),
+        (
+            "http://user:secret@[bad?token=1",
+            "secret",
+            "http://user:***@[bad?<redacted>",
+        ),
+        (
+            "http://user:p@ss@[bad/a.txt?token=1#frag",
+            "p@ss",
+            "http://user:***@[bad/a.txt?<redacted>#frag",
+        ),
+    ],
+)
+def test_repr_redacts_malformed_ipv6_urls_without_raising(bad_url, secret, expected_fragment):
+    """iev841 E-04: repr(PolyReader) and repr(PolyWriter) redact malformed URLs without raising ValueError."""
+    for obj in (PolyReader(bad_url), PolyWriter(bad_url)):
+        rep = repr(obj)
+        assert secret not in rep
+        assert "token=1" not in rep
+        assert expected_fragment in rep

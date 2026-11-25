@@ -175,3 +175,54 @@ def test_binary_modes_are_raw_bytes_and_reject_str(tmp_path):
         content = r.read()
         assert isinstance(content, bytes)
         assert content == raw1 + raw2
+
+
+def test_single_colon_local_paths_and_file_uris(tmp_path, monkeypatch):
+    """iev841 E-01: Single-colon local filenames stay local while file:/// and file://localhost/ URIs resolve locally."""
+    monkeypatch.chdir(tmp_path)
+
+    # Create a distinct plain report.txt to verify file:report.txt does not strip the file: prefix.
+    (tmp_path / "report.txt").write_text("plain report\n", encoding="utf-8")
+
+    for name in ("file:report.txt", "http:2026.log", "sftp:notes.txt", "s3:dump.txt"):
+        payload = f"content for {name}\n"
+        with polyopen(name, "w", backup=False) as w:
+            w.write(payload)
+        assert (tmp_path / name).read_text(encoding="utf-8") == payload
+        with polyopen(name, "r") as r:
+            assert r.read() == payload
+
+    assert (tmp_path / "report.txt").read_text(encoding="utf-8") == "plain report\n"
+
+    # A path containing '://' later in the path without starting with scheme:// stays local.
+    (tmp_path / "http:foo:").mkdir()
+    with polyopen("http:foo://bar.txt", "w", backup=False) as w:
+        w.write("nested colon slash\n")
+    assert (tmp_path / "http:foo:" / "bar.txt").read_text(encoding="utf-8") == "nested colon slash\n"
+    with polyopen("http:foo://bar.txt", "r") as r:
+        assert r.read() == "nested colon slash\n"
+
+    # Valid local file:/// and file://localhost/ URIs continue to resolve to local paths.
+    uri_target = tmp_path / "uri_ok.txt"
+    with polyopen(uri_target.as_uri(), "w", backup=False) as w:
+        w.write("via file:/// uri\n")
+    with polyopen(uri_target.as_uri(), "r") as r:
+        assert r.read() == "via file:/// uri\n"
+
+    localhost_uri = f"file://localhost{uri_target.as_posix()}"
+    with polyopen(localhost_uri, "r") as r:
+        assert r.read() == "via file:/// uri\n"
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "sftp://u@h/dir/archive%2Ezip",
+        "https://h/dir/archive.tar%2egz",
+    ],
+)
+@pytest.mark.parametrize("mode", ["r", "w", "a"])
+def test_percent_encoded_remote_archives_rejected(url, mode):
+    """iev841 E-01: Percent-encoded archive extensions in network URLs raise UnsupportedArchiveError."""
+    with pytest.raises(UnsupportedArchiveError):
+        polyopen(url, mode)
