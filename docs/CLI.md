@@ -25,8 +25,8 @@ Prefer `polyopen` or `python -m polyopen` to avoid Python's `runpy` `RuntimeWarn
   - With `--read`: one or more files to read sequentially. Passing zero files exits non-zero via `parser.error`.
   - With `--write` (without `--input-file`): `file[0]` is the source and `file[1:]` are destinations (at least two paths required).
   - With `--write --input-file SRC`: all positional arguments are destinations (at least one destination required).
-- `--read`, `-r` (Mutually Exclusive): Reads every positional file and reports line count, UTF-8 byte size (`B` through `YB`), line rate, byte rate, and elapsed seconds.
-- `--write`, `-w` (Mutually Exclusive): Pre-validates destination protocol and archive guards, opens the source and all destinations in UTF-8 text mode inside a single `contextlib.ExitStack`, reads the source once, writes every line synchronously to each destination (moving existing destinations to sequential `.bu` backups), and closes all handles on error.
+- `--read`, `-r` (Mutually Exclusive): Reads every positional file in 64 KiB binary chunks and reports `b'\n'`-delimited line count (empty files report 0 lines; non-empty files without a trailing newline count the final line), exact byte size (`B` through `YB`), line rate, byte rate, and elapsed seconds.
+- `--write`, `-w` (Mutually Exclusive): Pre-validates destination protocol and archive guards, opens the source and all destinations in binary mode inside a single `contextlib.ExitStack`, reads the source once in 64 KiB chunks, writes exact bytes (preserving CRLF and arbitrary non-UTF-8 binary payloads) synchronously to each destination (moving existing destinations to sequential `.bu` backups), and closes all handles on error.
 - `--input-file INPUT_FILE`, `-i INPUT_FILE`: Explicit source path or URL for `--write` mode. Rejected via `parser.error` if combined with `--read` or if no destination is given.
 - `--version`: Prints `polyopen <version>` and exits 0.
 
@@ -73,4 +73,4 @@ FINISHED Writing. sftp://user@node/dump.zst. 238,901 lines / 48.2MB at 41,200.5/
 
 ## Known Limitations
 
-- **Synchronous fan-out:** `--write` reads the source once and writes each line synchronously to all destinations in sequence. Use the Python `polyopen()` API with threads or processes if you need concurrent remote uploads.
+- **Synchronous fan-out:** `--write` reads the source once in 64 KiB binary chunks and writes each chunk synchronously to all destinations in sequence. Use the Python `polyopen()` API with threads or processes if you need concurrent remote uploads.

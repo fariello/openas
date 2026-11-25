@@ -86,6 +86,11 @@ _LINK_FALLBACK_ERRNOS = frozenset(
     for code in (getattr(errno, name, None),)
     if code is not None
 )
+_SFTP_PREFETCH_WINDOW_BYTES = 4 * 1024 * 1024
+_BINARY_BUFFER_SIZE = 65536
+_ZST_BUFFER_SIZE = 131072
+_PROGRESS_BATCH_BYTES = 65536
+_CLI_CHUNK_SIZE = 65536
 
 
 class _BinaryStreamAdapter(io.BufferedIOBase):
@@ -206,17 +211,216 @@ class _HttpRawStream(io.BufferedIOBase):
                 close_fn()
 
 
-class _CountingByteStream:
-    """Lightweight binary stream proxy that counts exact raw bytes read."""
+class _BoundedSFTPReadStream(io.BufferedIOBase):
+    """Bounded-memory sliding-window SFTP read stream backed by 4 MiB readv() windows."""
 
-    def __init__(self, stream):
+    def __init__(
+        self,
+        sftp_file,
+        file_size: int,
+        window_size: int = _SFTP_PREFETCH_WINDOW_BYTES,
+    ):
+        self._sftp_file = sftp_file
+        self._file_size = file_size
+        self._window_size = window_size
+        self._offset = 0
+        self._eof = False
+        self._closed = False
+        self._raw_close_attempted = False
+        self._gen = None
+        self._buf = b""
+        self._buf_pos = 0
+
+    @property
+    def closed(self) -> bool:
+        return self._closed
+
+    def readable(self) -> bool:
+        return True
+
+    def writable(self) -> bool:
+        return False
+
+    def seekable(self) -> bool:
+        return False
+
+    def _close_gen(self) -> None:
+        gen = self._gen
+        self._gen = None
+        if gen is not None:
+            close_fn = getattr(gen, 'close', None)
+            if close_fn is not None:
+                try:
+                    close_fn()
+                except Exception:
+                    pass
+
+    def _next_chunk(self) -> bool:
+        while self._buf_pos >= len(self._buf):
+            if self._gen is not None:
+                try:
+                    chunk = next(self._gen)
+                except StopIteration:
+                    self._gen = None
+                    continue
+                if not chunk:
+                    self._eof = True
+                    self._close_gen()
+                    self._buf = b""
+                    self._buf_pos = 0
+                    return False
+                self._buf = chunk if isinstance(chunk, bytes) else bytes(chunk)
+                self._buf_pos = 0
+                return True
+
+            if self._eof or self._offset >= self._file_size:
+                self._eof = True
+                return False
+
+            window = min(self._window_size, self._file_size - self._offset)
+            chunk_size = getattr(self._sftp_file, 'MAX_REQUEST_SIZE', 32768)
+            if not isinstance(chunk_size, int) or isinstance(chunk_size, bool) or chunk_size <= 0:
+                chunk_size = 32768
+
+            sub_chunks = []
+            pos = self._offset
+            end = pos + window
+            while pos < end:
+                step = min(chunk_size, end - pos)
+                sub_chunks.append((pos, step))
+                pos += step
+
+            try:
+                it = self._sftp_file.readv(sub_chunks, max_concurrent_prefetch_requests=64)
+            except TypeError:
+                it = self._sftp_file.readv(sub_chunks)
+            self._gen = iter(it)
+            self._offset = end
+        return True
+
+    def read(self, size: int = -1) -> bytes:
+        if self._closed:
+            raise ValueError("I/O operation on closed file.")
+        if size == 0:
+            return b""
+        if size is None or size < 0:
+            chunks = []
+            while self._next_chunk():
+                chunks.append(self._buf[self._buf_pos:] if self._buf_pos else self._buf)
+                self._buf = b""
+                self._buf_pos = 0
+            return b"".join(chunks)
+
+        if not self._next_chunk():
+            return b""
+        avail = len(self._buf) - self._buf_pos
+        if avail >= size:
+            end = self._buf_pos + size
+            out = self._buf[self._buf_pos:end]
+            if end >= len(self._buf):
+                self._buf = b""
+                self._buf_pos = 0
+            else:
+                self._buf_pos = end
+            return out
+
+        parts = [self._buf[self._buf_pos:] if self._buf_pos else self._buf]
+        remaining = size - avail
+        self._buf = b""
+        self._buf_pos = 0
+        while remaining > 0 and self._next_chunk():
+            avail = len(self._buf) - self._buf_pos
+            if avail <= remaining:
+                parts.append(self._buf[self._buf_pos:] if self._buf_pos else self._buf)
+                remaining -= avail
+                self._buf = b""
+                self._buf_pos = 0
+            else:
+                end = self._buf_pos + remaining
+                parts.append(self._buf[self._buf_pos:end])
+                self._buf_pos = end
+                remaining = 0
+        return b"".join(parts)
+
+    def read1(self, size: int = -1) -> bytes:
+        if self._closed:
+            raise ValueError("I/O operation on closed file.")
+        if size == 0:
+            return b""
+        if not self._next_chunk():
+            return b""
+        avail = len(self._buf) - self._buf_pos
+        if size is None or size < 0 or size >= avail:
+            out = self._buf[self._buf_pos:] if self._buf_pos else self._buf
+            self._buf = b""
+            self._buf_pos = 0
+            return out
+        end = self._buf_pos + size
+        out = self._buf[self._buf_pos:end]
+        self._buf_pos = end
+        return out
+
+    def readinto(self, b) -> int:
+        if self._closed:
+            raise ValueError("I/O operation on closed file.")
+        mv = memoryview(b).cast('B')
+        if not mv:
+            return 0
+        data = self.read(len(mv))
+        n = len(data)
+        mv[:n] = data
+        return n
+
+    def close(self):
+        if not self._closed:
+            self._closed = True
+            self._close_gen()
+            self._buf = b""
+            self._buf_pos = 0
+            self._raw_close_attempted = True
+            close_fn = getattr(self._sftp_file, 'close', None)
+            if close_fn is not None:
+                close_fn()
+
+
+class _CountingByteStream:
+    """Lightweight binary stream proxy that counts exact raw bytes read and batches progress updates."""
+
+    def __init__(self, stream, on_progress=None, batch_size: int = _PROGRESS_BATCH_BYTES):
         self._stream = stream
         self.bytes_read = 0
+        self._on_progress = on_progress
+        self._batch_size = batch_size
+        self._pending = 0
+
+    def set_progress_callback(self, callback) -> None:
+        self._on_progress = callback
+        self._pending = 0
+
+    def flush_progress(self) -> None:
+        pending = self._pending
+        if pending > 0:
+            self._pending = 0
+            if self._on_progress is not None:
+                self._on_progress(pending)
+
+    def _account(self, n: int) -> None:
+        self.bytes_read += n
+        if self._on_progress is not None:
+            self._pending += n
+            if self._pending >= self._batch_size:
+                pending = self._pending
+                self._pending = 0
+                self._on_progress(pending)
 
     def read(self, size: int = -1):
         data = self._stream.read(size)
         if data:
-            self.bytes_read += len(data)
+            self._account(len(data))
+            if size is None or size < 0:
+                self.flush_progress()
+        elif size is None or size != 0:
+            self.flush_progress()
         return data
 
     def read1(self, size: int = -1):
@@ -226,7 +430,9 @@ class _CountingByteStream:
         else:
             data = self._stream.read(size)
         if data:
-            self.bytes_read += len(data)
+            self._account(len(data))
+        elif size is None or size != 0:
+            self.flush_progress()
         return data
 
     def readinto(self, b):
@@ -234,12 +440,17 @@ class _CountingByteStream:
         if readinto_fn is not None:
             n = readinto_fn(b)
             if n:
-                self.bytes_read += n
+                self._account(n)
+            elif len(b) > 0:
+                self.flush_progress()
             return n
         data = self._stream.read(len(b))
         n = len(data)
-        b[:n] = data
-        self.bytes_read += n
+        if n:
+            b[:n] = data
+            self._account(n)
+        elif len(b) > 0:
+            self.flush_progress()
         return n
 
     def readable(self) -> bool:
@@ -393,6 +604,33 @@ def _normalized_path(filename: str, parsed: Optional[ParseResult] = None) -> str
     return filename.lower()
 
 
+def _record_raw_close_attempted(obj, seen: set) -> None:
+    """Mark underlying raw handles as already closed when an adapter closed them."""
+    cur = obj
+    visited = set()
+    for _ in range(8):
+        if cur is None or id(cur) in visited:
+            break
+        visited.add(id(cur))
+        if isinstance(cur, _BinaryStreamAdapter):
+            if cur._raw_close_attempted:
+                seen.add(id(cur._raw))
+            break
+        if isinstance(cur, _BoundedSFTPReadStream):
+            if cur._raw_close_attempted:
+                seen.add(id(cur._sftp_file))
+            break
+        if isinstance(cur, _CountingByteStream):
+            cur = cur._stream
+        elif isinstance(cur, io.IOBase):
+            nxt = getattr(cur, 'buffer', None)
+            if nxt is None:
+                nxt = getattr(cur, 'raw', None)
+            cur = nxt
+        else:
+            break
+
+
 def _close_handles(*handles):
     """Close each distinct non-None handle in order, propagating the first error after closing all."""
     first_err = None
@@ -402,6 +640,7 @@ def _close_handles(*handles):
             continue
         seen.add(id(handle))
         if getattr(handle, 'closed', False) is True:
+            _record_raw_close_attempted(handle, seen)
             continue
         close_fn = getattr(handle, 'close', None)
         if close_fn is None:
@@ -411,13 +650,7 @@ def _close_handles(*handles):
         except Exception as err:
             if first_err is None:
                 first_err = err
-        inner = getattr(handle, 'buffer', None) or getattr(handle, 'raw', None)
-        if isinstance(inner, _CountingByteStream):
-            inner = inner._stream
-        if isinstance(inner, _BinaryStreamAdapter) and inner._raw_close_attempted:
-            seen.add(id(inner._raw))
-        elif isinstance(handle, _BinaryStreamAdapter) and handle._raw_close_attempted:
-            seen.add(id(handle._raw))
+        _record_raw_close_attempted(handle, seen)
     if first_err is not None:
         raise first_err
 
@@ -688,7 +921,6 @@ class PolyReader:
         self._response = None
         self._progress = None
         self._counting_stream = None
-        self._progress_raw_bytes = 0
         self._progress_pending = 0
         self._http_file_size = None
 
@@ -705,30 +937,28 @@ class PolyReader:
 
     def _flush_progress(self) -> None:
         """Apply any buffered progress delta to the progress bar once."""
+        if self._counting_stream is not None:
+            self._counting_stream.flush_progress()
+            self._progress_pending = 0
+            return
         progress = self._progress
         if progress is None:
             self._progress_pending = 0
             return
-        if self._counting_stream is not None:
-            delta = self._counting_stream.bytes_read - self._progress_raw_bytes
-            if delta > 0:
-                self._progress_raw_bytes += delta
-                self._progress_pending += delta
         if self._progress_pending > 0:
-            progress.update(self._progress_pending)
+            pending = self._progress_pending
             self._progress_pending = 0
+            progress.update(pending)
 
     def _update_progress(self, data: Union[str, bytes] = ""):
         if not (self.show_progress and self._progress is not None):
             return
+        if self._counting_stream is not None:
+            self._counting_stream.flush_progress()
+            return
         if self._progress_pending > 0:
             self._flush_progress()
-        if self._counting_stream is not None:
-            delta = self._counting_stream.bytes_read - self._progress_raw_bytes
-            if delta > 0:
-                self._progress.update(delta)
-                self._progress_raw_bytes += delta
-        elif data:
+        if data:
             self._progress.update(
                 len(data) if isinstance(data, (bytes, bytearray)) else len(data.encode('utf-8'))
             )
@@ -795,12 +1025,15 @@ class PolyReader:
         """
         Return an iterator over lines in the stream.
 
-        When progress tracking is disabled and the underlying handle is already in
-        the target mode (`io.TextIOBase` for text or any binary stream when `binary=True`),
-        this returns the handle's own C-level iterator directly.
+        Returns the underlying handle's C-level iterator directly whenever the handle is
+        already in the target mode (`io.TextIOBase` for text or any binary stream when
+        `binary=True`) and either progress tracking is disabled or `_CountingByteStream`
+        owns batched raw-byte progress updates.
         """
         self._ensure_open()
         if self.show_progress:
+            if self._counting_stream is not None and (self.binary or isinstance(self._fh, io.TextIOBase)):
+                return iter(self._fh)
             return self._iter_progress()
         if self.binary or isinstance(self._fh, io.TextIOBase):
             return iter(self._fh)
@@ -831,43 +1064,30 @@ class PolyReader:
                         yield line.decode('utf-8') if isinstance(line, bytes) else line
                 return
 
-            update = progress.update
             if counting is not None:
                 if binary or is_text:
-                    for line in fh:
-                        delta = counting.bytes_read - self._progress_raw_bytes
-                        if delta > 0:
-                            self._progress_raw_bytes += delta
-                            self._progress_pending += delta
-                            if self._progress_pending >= 65536:
-                                update(self._progress_pending)
-                                self._progress_pending = 0
-                        yield line
+                    yield from fh
                 else:
                     for line in fh:
-                        if isinstance(line, bytes):
-                            line = line.decode('utf-8')
-                        delta = counting.bytes_read - self._progress_raw_bytes
-                        if delta > 0:
-                            self._progress_raw_bytes += delta
-                            self._progress_pending += delta
-                            if self._progress_pending >= 65536:
-                                update(self._progress_pending)
-                                self._progress_pending = 0
-                        yield line
-            elif binary:
+                        yield line.decode('utf-8') if isinstance(line, bytes) else line
+                return
+
+            update = progress.update
+            if binary:
                 for line in fh:
                     self._progress_pending += len(line)
-                    if self._progress_pending >= 65536:
-                        update(self._progress_pending)
+                    if self._progress_pending >= _PROGRESS_BATCH_BYTES:
+                        pending = self._progress_pending
                         self._progress_pending = 0
+                        update(pending)
                     yield line
             elif is_text:
                 for line in fh:
                     self._progress_pending += len(line.encode('utf-8'))
-                    if self._progress_pending >= 65536:
-                        update(self._progress_pending)
+                    if self._progress_pending >= _PROGRESS_BATCH_BYTES:
+                        pending = self._progress_pending
                         self._progress_pending = 0
+                        update(pending)
                     yield line
                 self._reconcile_crlf_eof_progress()
             else:
@@ -878,9 +1098,10 @@ class PolyReader:
                     else:
                         line_bytes = len(line.encode('utf-8'))
                     self._progress_pending += line_bytes
-                    if self._progress_pending >= 65536:
-                        update(self._progress_pending)
+                    if self._progress_pending >= _PROGRESS_BATCH_BYTES:
+                        pending = self._progress_pending
                         self._progress_pending = 0
+                        update(pending)
                     yield line
                 self._reconcile_crlf_eof_progress()
         finally:
@@ -911,6 +1132,16 @@ class PolyReader:
     def readlines(self, hint: int = -1) -> list:
         """Read and return a list of lines from the stream."""
         self._ensure_open()
+        unbounded = hint is None or hint <= 0
+        if (self.binary or isinstance(self._fh, io.TextIOBase)) and (
+            not self.show_progress or self._counting_stream is not None
+        ):
+            lines = self._fh.readlines() if unbounded else self._fh.readlines(hint)
+            if self._counting_stream is not None:
+                self._flush_progress()
+            return lines
+        if self.show_progress and self._counting_stream is None and unbounded:
+            return list(self._iter_progress())
         lines = []
         total = 0
         while True:
@@ -919,7 +1150,7 @@ class PolyReader:
                 break
             lines.append(line)
             total += len(line)
-            if hint is not None and hint > 0 and total >= hint:
+            if not unbounded and total >= hint:
                 break
         return lines
 
@@ -983,26 +1214,44 @@ class PolyReader:
         if norm.endswith('.zst'):
             import zstandard as zstd
             dctx = zstd.ZstdDecompressor(max_window_size=2**31)
-            sr = dctx.stream_reader(stream, read_across_frames=True)
-            self._fh = io.BufferedReader(sr) if self.binary else io.TextIOWrapper(sr, encoding='utf-8')
+            sr = dctx.stream_reader(stream, read_across_frames=True, read_size=_ZST_BUFFER_SIZE)
+            buffered = io.BufferedReader(sr, buffer_size=_ZST_BUFFER_SIZE)
+            self._fh = buffered if self.binary else io.TextIOWrapper(buffered, encoding='utf-8')
         elif norm.endswith('.bz2'):
             import bz2
-            self._fh = bz2.open(stream, 'rb') if self.binary else bz2.open(stream, 'rt', encoding='utf-8')
+            self._fh = (
+                io.BufferedReader(bz2.open(stream, 'rb'), buffer_size=_BINARY_BUFFER_SIZE)
+                if self.binary
+                else bz2.open(stream, 'rt', encoding='utf-8')
+            )
         elif norm.endswith('.xz'):
             import lzma
-            self._fh = lzma.open(stream, 'rb') if self.binary else lzma.open(stream, 'rt', encoding='utf-8')
+            self._fh = (
+                io.BufferedReader(lzma.open(stream, 'rb'), buffer_size=_BINARY_BUFFER_SIZE)
+                if self.binary
+                else lzma.open(stream, 'rt', encoding='utf-8')
+            )
         elif norm.endswith('.gz'):
             import gzip
-            self._fh = gzip.open(stream, 'rb') if self.binary else gzip.open(stream, 'rt', encoding='utf-8')
+            self._fh = (
+                io.BufferedReader(gzip.open(stream, 'rb'), buffer_size=_BINARY_BUFFER_SIZE)
+                if self.binary
+                else gzip.open(stream, 'rt', encoding='utf-8')
+            )
         else:
-            self._fh = io.BufferedReader(stream) if self.binary else io.TextIOWrapper(stream, encoding='utf-8')
+            self._fh = (
+                io.BufferedReader(stream, buffer_size=_BINARY_BUFFER_SIZE)
+                if self.binary
+                else io.TextIOWrapper(stream, encoding='utf-8')
+            )
 
     def _wrap_ssh(self, parsed: ParseResult):
         """
         Wrap self._fh to handle SSH/SFTP connections and file operations.
 
         This method establishes an SSH connection using paramiko, opens the specified file via SFTP,
-        and wraps it with appropriate decompression handlers based on the file extension.
+        and wraps it with bounded 4 MiB sliding-window readv() streaming (when supported and size
+        is positive) and appropriate decompression handlers based on the file extension.
 
         Parameters
         ----------
@@ -1048,12 +1297,11 @@ class PolyReader:
                     file_size = None
             self._sftp_file_size = file_size
 
-            prefetch_fn = getattr(sftp_file, 'prefetch', None)
-            if prefetch_fn is not None and file_size is not None:
-                try:
-                    prefetch_fn(file_size, max_concurrent_requests=64)
-                except TypeError:
-                    prefetch_fn(file_size)
+            if file_size is not None and file_size > 0 and getattr(sftp_file, 'readv', None) is not None:
+                raw_stream = _BoundedSFTPReadStream(sftp_file, file_size)
+                self._raw_fh = raw_stream
+            else:
+                raw_stream = sftp_file
         except BaseException:
             self.close()
             raise
@@ -1061,29 +1309,45 @@ class PolyReader:
         norm = _normalized_path(self.filename, parsed)
         if norm.endswith('.zst'):
             import zstandard as zstd
-            stream = self._make_counted_stream(self._sftp_file)
+            stream = self._make_counted_stream(raw_stream)
             dctx = zstd.ZstdDecompressor(max_window_size=2**31)
-            sr = dctx.stream_reader(stream, read_across_frames=True)
-            self._fh = io.BufferedReader(sr) if self.binary else io.TextIOWrapper(sr, encoding='utf-8')
+            sr = dctx.stream_reader(stream, read_across_frames=True, read_size=_ZST_BUFFER_SIZE)
+            buffered = io.BufferedReader(sr, buffer_size=_ZST_BUFFER_SIZE)
+            self._fh = buffered if self.binary else io.TextIOWrapper(buffered, encoding='utf-8')
         elif norm.endswith('.bz2'):
             import bz2
-            stream = self._make_counted_stream(self._sftp_file)
-            self._fh = bz2.open(stream, 'rb') if self.binary else bz2.open(stream, 'rt', encoding='utf-8')
+            stream = self._make_counted_stream(raw_stream)
+            self._fh = (
+                io.BufferedReader(bz2.open(stream, 'rb'), buffer_size=_BINARY_BUFFER_SIZE)
+                if self.binary
+                else bz2.open(stream, 'rt', encoding='utf-8')
+            )
         elif norm.endswith('.xz'):
             import lzma
-            stream = self._make_counted_stream(self._sftp_file)
-            self._fh = lzma.open(stream, 'rb') if self.binary else lzma.open(stream, 'rt', encoding='utf-8')
+            stream = self._make_counted_stream(raw_stream)
+            self._fh = (
+                io.BufferedReader(lzma.open(stream, 'rb'), buffer_size=_BINARY_BUFFER_SIZE)
+                if self.binary
+                else lzma.open(stream, 'rt', encoding='utf-8')
+            )
         elif norm.endswith('.gz'):
             import gzip
-            stream = self._make_counted_stream(self._sftp_file)
-            self._fh = gzip.open(stream, 'rb') if self.binary else gzip.open(stream, 'rt', encoding='utf-8')
+            stream = self._make_counted_stream(raw_stream)
+            self._fh = (
+                io.BufferedReader(gzip.open(stream, 'rb'), buffer_size=_BINARY_BUFFER_SIZE)
+                if self.binary
+                else gzip.open(stream, 'rt', encoding='utf-8')
+            )
         else:
             if self.binary:
-                adapted = _BinaryStreamAdapter(self._sftp_file, readable=True, writable=False)
-                stream = self._make_counted_stream(adapted)
-                self._fh = io.BufferedReader(stream)
+                if isinstance(raw_stream, _BoundedSFTPReadStream):
+                    stream = self._make_counted_stream(raw_stream)
+                else:
+                    adapted = _BinaryStreamAdapter(raw_stream, readable=True, writable=False)
+                    stream = self._make_counted_stream(adapted)
+                self._fh = io.BufferedReader(stream, buffer_size=_BINARY_BUFFER_SIZE)
             else:
-                stream = self._make_counted_stream(self._sftp_file)
+                stream = self._make_counted_stream(raw_stream)
                 self._fh = io.TextIOWrapper(stream, encoding='utf-8')
 
     def _wrap_http(self, parsed: Optional[ParseResult] = None):
@@ -1131,20 +1395,33 @@ class PolyReader:
             import zstandard as zstd
             stream = self._make_counted_stream(response.raw)
             dctx = zstd.ZstdDecompressor(max_window_size=2**31)
-            sr = dctx.stream_reader(stream, read_across_frames=True)
-            self._fh = io.BufferedReader(sr) if self.binary else io.TextIOWrapper(sr, encoding='utf-8')
+            sr = dctx.stream_reader(stream, read_across_frames=True, read_size=_ZST_BUFFER_SIZE)
+            buffered = io.BufferedReader(sr, buffer_size=_ZST_BUFFER_SIZE)
+            self._fh = buffered if self.binary else io.TextIOWrapper(buffered, encoding='utf-8')
         elif norm.endswith('.bz2'):
             import bz2
             stream = self._make_counted_stream(response.raw)
-            self._fh = bz2.open(stream, 'rb') if self.binary else bz2.open(stream, 'rt', encoding='utf-8')
+            self._fh = (
+                io.BufferedReader(bz2.open(stream, 'rb'), buffer_size=_BINARY_BUFFER_SIZE)
+                if self.binary
+                else bz2.open(stream, 'rt', encoding='utf-8')
+            )
         elif norm.endswith('.xz'):
             import lzma
             stream = self._make_counted_stream(response.raw)
-            self._fh = lzma.open(stream, 'rb') if self.binary else lzma.open(stream, 'rt', encoding='utf-8')
+            self._fh = (
+                io.BufferedReader(lzma.open(stream, 'rb'), buffer_size=_BINARY_BUFFER_SIZE)
+                if self.binary
+                else lzma.open(stream, 'rt', encoding='utf-8')
+            )
         elif norm.endswith('.gz'):
             import gzip
             stream = self._make_counted_stream(response.raw)
-            self._fh = gzip.open(stream, 'rb') if self.binary else gzip.open(stream, 'rt', encoding='utf-8')
+            self._fh = (
+                io.BufferedReader(gzip.open(stream, 'rb'), buffer_size=_BINARY_BUFFER_SIZE)
+                if self.binary
+                else gzip.open(stream, 'rt', encoding='utf-8')
+            )
         else:
             content_encoding = response.headers.get('Content-Encoding')
             if isinstance(content_encoding, str) and content_encoding.strip().lower() not in ('', 'identity'):
@@ -1154,7 +1431,11 @@ class PolyReader:
             except AttributeError:
                 pass
             stream = self._make_counted_stream(_HttpRawStream(response.raw))
-            self._fh = io.BufferedReader(stream) if self.binary else io.TextIOWrapper(stream, encoding='utf-8')
+            self._fh = (
+                io.BufferedReader(stream, buffer_size=_BINARY_BUFFER_SIZE)
+                if self.binary
+                else io.TextIOWrapper(stream, encoding='utf-8')
+            )
 
     def _wrap_local(self, parsed: Optional[ParseResult] = None):
         """
@@ -1178,32 +1459,36 @@ class PolyReader:
             dctx = zstd.ZstdDecompressor(max_window_size=2**31)
             self._raw_fh = open(self.filename, 'rb')
             stream = self._make_counted_stream(self._raw_fh)
-            sr = dctx.stream_reader(stream, read_across_frames=True)
-            self._fh = io.BufferedReader(sr) if self.binary else io.TextIOWrapper(sr, encoding='utf-8')
+            sr = dctx.stream_reader(stream, read_across_frames=True, read_size=_ZST_BUFFER_SIZE)
+            buffered = io.BufferedReader(sr, buffer_size=_ZST_BUFFER_SIZE)
+            self._fh = buffered if self.binary else io.TextIOWrapper(buffered, encoding='utf-8')
         elif norm.endswith('.bz2'):
             import bz2
             open_kwargs = {'mode': 'rb'} if self.binary else {'mode': 'rt', 'encoding': 'utf-8'}
             if self.show_progress:
                 self._raw_fh = open(self.filename, 'rb')
-                self._fh = bz2.open(self._make_counted_stream(self._raw_fh), **open_kwargs)
+                fh = bz2.open(self._make_counted_stream(self._raw_fh), **open_kwargs)
             else:
-                self._fh = bz2.open(self.filename, **open_kwargs)
+                fh = bz2.open(self.filename, **open_kwargs)
+            self._fh = io.BufferedReader(fh, buffer_size=_BINARY_BUFFER_SIZE) if self.binary else fh
         elif norm.endswith('.xz'):
             import lzma
             open_kwargs = {'mode': 'rb'} if self.binary else {'mode': 'rt', 'encoding': 'utf-8'}
             if self.show_progress:
                 self._raw_fh = open(self.filename, 'rb')
-                self._fh = lzma.open(self._make_counted_stream(self._raw_fh), **open_kwargs)
+                fh = lzma.open(self._make_counted_stream(self._raw_fh), **open_kwargs)
             else:
-                self._fh = lzma.open(self.filename, **open_kwargs)
+                fh = lzma.open(self.filename, **open_kwargs)
+            self._fh = io.BufferedReader(fh, buffer_size=_BINARY_BUFFER_SIZE) if self.binary else fh
         elif norm.endswith('.gz'):
             import gzip
             open_kwargs = {'mode': 'rb'} if self.binary else {'mode': 'rt', 'encoding': 'utf-8'}
             if self.show_progress:
                 self._raw_fh = open(self.filename, 'rb')
-                self._fh = gzip.open(self._make_counted_stream(self._raw_fh), **open_kwargs)
+                fh = gzip.open(self._make_counted_stream(self._raw_fh), **open_kwargs)
             else:
-                self._fh = gzip.open(self.filename, **open_kwargs)
+                fh = gzip.open(self.filename, **open_kwargs)
+            self._fh = io.BufferedReader(fh, buffer_size=_BINARY_BUFFER_SIZE) if self.binary else fh
         else:
             self._fh = open(self.filename, 'rb') if self.binary else open(self.filename, 'r', encoding='utf-8')
 
@@ -1244,10 +1529,11 @@ class PolyReader:
                 from tqdm import tqdm
                 file_size = self._get_file_size()
                 initial_bytes = self._counting_stream.bytes_read if self._counting_stream is not None else 0
-                self._progress_raw_bytes = initial_bytes
                 self._progress_pending = 0
                 total = file_size if (file_size is not None and file_size > 0) else None
                 self._progress = tqdm(total=total, initial=initial_bytes, unit='B', unit_scale=True)
+                if self._counting_stream is not None:
+                    self._counting_stream.set_progress_callback(self._progress.update)
         except BaseException:
             self.close()
             raise
@@ -1304,6 +1590,8 @@ class PolyReader:
         except Exception as err:
             flush_err = err
         finally:
+            if self._counting_stream is not None:
+                self._counting_stream.set_progress_callback(None)
             fh = self._fh
             raw_fh = self._raw_fh
             sftp_file = self._sftp_file
@@ -1326,7 +1614,6 @@ class PolyReader:
             self._http_file_size = None
             self._progress = None
             self._counting_stream = None
-            self._progress_raw_bytes = 0
             self._progress_pending = 0
 
         try:
@@ -2068,9 +2355,9 @@ def main():
     """
     CLI entry point for `polyopen` (`python -m polyopen` or `polyopen`).
 
-    Supports streaming reads (`--read`) with line/byte throughput reporting and single-pass
-    multi-target writes (`--write`) across plain text, `.gz`, `.bz2`, `.xz`, and `.zst`
-    files over local paths, HTTP/HTTPS, FTP, and SSH/SFTP.
+    Streams 64 KiB binary chunks for `--read` (with newline-delimited line and byte
+    throughput reporting) and single-pass multi-target `--write` across plain, `.gz`,
+    `.bz2`, `.xz`, and `.zst` files over local paths, HTTP/HTTPS, FTP, and SSH/SFTP.
     """
     def format_rate(rate: float, unit: str = "") -> str:
         """Format rate with standard units."""
@@ -2094,7 +2381,7 @@ def main():
         prog="polyopen",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         description=(
-            "Read or broadcast UTF-8 text streams across plain, .gz, .bz2, .xz, and .zst files "
+            "Read or broadcast binary and text streams across plain, .gz, .bz2, .xz, and .zst files "
             "over local paths, HTTP/HTTPS, FTP, and SSH/SFTP."
         ),
         epilog=(
@@ -2134,13 +2421,13 @@ def main():
         '--write',
         '-w',
         action='store_true',
-        help='Read one source stream and broadcast every line to one or more destinations.',
+        help='Read one source stream in 64 KiB binary chunks and broadcast exact bytes to one or more destinations.',
     )
     group.add_argument(
         '--read',
         '-r',
         action='store_true',
-        help='Read one or more files sequentially and report line/byte throughput.',
+        help='Read one or more files sequentially in 64 KiB binary chunks and report line/byte throughput.',
     )
 
     args = parser.parse_args()
@@ -2152,13 +2439,21 @@ def main():
             parser.error("Read mode requires at least one file (e.g., 'python -m polyopen -r path/to/file.gz')")
         for input_file in args.files:
             print(f"TESTING reading {_redact_url(input_file)}")
-            with PolyReader(input_file) as reader:
+            with PolyReader(input_file, binary=True) as reader:
                 line_count = 0
-                t0 = time.monotonic()
                 bytes_count = 0
-                for line in reader:
+                last_byte = None
+                t0 = time.monotonic()
+                read_fn = reader.read
+                while True:
+                    chunk = read_fn(_CLI_CHUNK_SIZE)
+                    if not chunk:
+                        break
+                    bytes_count += len(chunk)
+                    line_count += chunk.count(b'\n')
+                    last_byte = chunk[-1]
+                if bytes_count > 0 and last_byte != 10:
                     line_count += 1
-                    bytes_count += len(line.encode('utf-8'))
                 pinfo("FINISHED Reading.", _redact_url(reader.filename), line_count, bytes_count, time.monotonic() - t0)
     else:
         if args.input_file is not None:
@@ -2187,22 +2482,30 @@ def main():
         print(f"Will Read from {_redact_url(source_file)}")
         line_count = 0
         bytes_count = 0
+        last_byte = None
         dest_names = []
         t0 = time.monotonic()
         with contextlib.ExitStack() as stack:
-            reader = stack.enter_context(PolyReader(source_file))
+            reader = stack.enter_context(PolyReader(source_file, binary=True))
             writers = []
             for output_file in output_files:
-                writer = stack.enter_context(PolyWriter(output_file))
+                writer = stack.enter_context(PolyWriter(output_file, binary=True))
                 print(f"Writing {_redact_url(writer.filename)}")
                 writers.append(writer)
                 dest_names.append(_redact_url(writer.filename))
+            read_fn = reader.read
             write_fns = [w.write for w in writers]
-            for line in reader:
-                line_count += 1
-                bytes_count += len(line.encode('utf-8'))
+            while True:
+                chunk = read_fn(_CLI_CHUNK_SIZE)
+                if not chunk:
+                    break
+                bytes_count += len(chunk)
+                line_count += chunk.count(b'\n')
+                last_byte = chunk[-1]
                 for write_fn in write_fns:
-                    write_fn(line)
+                    write_fn(chunk)
+            if bytes_count > 0 and last_byte != 10:
+                line_count += 1
         elapsed = time.monotonic() - t0
         for filename in dest_names:
             pinfo("FINISHED Writing.", filename, line_count, bytes_count, elapsed)

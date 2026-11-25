@@ -11,7 +11,7 @@ A lightweight Python library and CLI for streaming plain and compressed files (`
 
 - **Unified line-by-line compressed streaming across local and POSIX/network transports:** Reads and writes plain, `.gz`, `.bz2`, `.xz`, and multi-frame `.zst` streams line-by-line in both UTF-8 text (`str`) and raw binary (`bytes`) modes, without requiring manual `io.TextIOWrapper` or `io.BufferedReader` glue (including for `zstandard`, whose raw `stream_reader` does not support `readline()` directly).
 - **No cloud SDKs and fast startup:** Explicitly excludes cloud object stores (`s3://`, `gs://`, `az://`, `hdfs://`) so it never pulls in cloud SDKs (`boto3`, GCS, Azure). Optional standard-library codecs (`gzip`, `bz2`, `lzma`, `ftplib`, `argparse`, `urllib.parse`) and runtime transport libraries (`paramiko`, `ftputil`, `requests`, `zstandard`, `tqdm`) are imported lazily on first use, while all five runtime dependencies install by default so every documented protocol and codec works immediately.
-- **Built-in transfer tuning, progress, and overwrite safety:** Includes bounded SFTP read prefetch and write pipelining, thread-local cookie-free HTTP session reuse, raw-byte `tqdm` progress bars (`show_progress=True`), optional sequential `.NNN.bu` backups on overwrite, and a single-pass multi-destination CLI (`--read` / `--write`).
+- **Built-in transfer tuning, progress, and overwrite safety:** Includes bounded 4 MiB sliding-window SFTP read streaming and write pipelining, thread-local cookie-free HTTP session reuse, raw-byte `tqdm` progress bars (`show_progress=True`), optional sequential `.NNN.bu` backups on overwrite, and a single-pass 64 KiB binary-chunk multi-destination CLI (`--read` / `--write`).
 
 See [GUIDING_PRINCIPLES.md](GUIDING_PRINCIPLES.md) and [DECISIONS.md](DECISIONS.md) for design boundaries and architectural trade-offs.
 
@@ -19,7 +19,7 @@ See [GUIDING_PRINCIPLES.md](GUIDING_PRINCIPLES.md) and [DECISIONS.md](DECISIONS.
 
 - **Line-by-Line Streaming and Transparent Compression:** Streams plain, `.gz`, `.bz2`, `.xz`, and multi-frame `.zst` files on the fly in UTF-8 text (`'r'`/`'rt'`, `'w'`/`'wt'`, `'a'`/`'at'`) or raw binary (`'rb'`, `'wb'`, `'ab'`) mode. Accepts optional `compresslevel: Optional[int] = None` (defaulting to each library's own setting: `zstd` level 3, `lzma` preset 6, `bz2` level 9, `gzip` level 9).
 - **Local and Remote Protocols:** Reads and writes over local files (`file://` or plain paths), `ssh://`/`sftp://` (read, write, and append), and `ftp://` (read and write), and streams read-only `http://`/`https://` responses via thread-local, cookie-free `requests.Session` reuse. Supports an optional `timeout` parameter across all network transports.
-- **SFTP Pipelining, Progress Bars, and Clean Shutdown:** Uses bounded SFTP read prefetch (`max_concurrent_requests=64`), SFTP write pipelining (`set_pipelined(True)`), optional `tqdm` progress bars tracking exact raw bytes read (`show_progress=True`), and deterministic, idempotent handle closure across all transports.
+- **SFTP Pipelining, Progress Bars, and Clean Shutdown:** Uses bounded 4 MiB sliding-window SFTP `readv()` streaming (`max_concurrent_prefetch_requests=64`, O(1) memory on multi-GB files), SFTP write pipelining (`set_pipelined(True)`), optional `tqdm` progress bars tracking exact raw bytes read (`show_progress=True`), and deterministic, idempotent handle closure across all transports.
 - **Standard File-Like Interface:** Supports `with` context management, `read()`, `readline()`, `readlines()`, line iteration (`for line in f:`), `write()`, `writelines()`, `flush()`, `closed`, `readable()`, `writable()`, `seekable()`, and `encoding` (`'utf-8'` in text mode, `None` in binary mode).
 - **Optional Sequential `.bu` Overwrite Backups:** When overwriting an existing file (`backup=True`, default for write modes; pass `backup=False` to disable), moves the existing file to `<path>.001.bu` (checking `.001.bu` first in O(1), then scanning once up to `.999.bu` with a nanosecond timestamp fallback). Local backups use atomic `os.link`/`os.unlink` and reject directories (`IsADirectoryError`).
 
@@ -78,7 +78,7 @@ with polyopen("payload.bin.gz", "rb") as f:
 | BZIP2 (`.bz2`) | Yes | Yes | Yes | Standard Python `bz2`; default write level 9 (tunable via `compresslevel`) |
 | LZMA (`.xz`) | Yes | Yes | Yes | Standard Python `lzma`; default write preset 6 (tunable via `compresslevel`) |
 | Local File (`file://` or implicit) | Yes | Yes | Yes | Atomic `os.link`/`os.unlink` sequential `.bu` backups with `.001.bu` fast-path |
-| SSH / SFTP (`ssh://`, `sftp://`) | Yes | Yes | Yes | System host-key verification, SFTP prefetch/pipelining, sequential `.bu` backups |
+| SSH / SFTP (`ssh://`, `sftp://`) | Yes | Yes | Yes | System host-key verification, bounded 4 MiB SFTP `readv()` streaming, write pipelining, sequential `.bu` backups |
 | FTP (`ftp://`) | Yes | Yes | No | Read and write with sequential `.bu` backups; append raises `UnsupportedProtocolError` |
 | HTTP / HTTPS (`http://`, `https://`) | Yes | No | No | Thread-local cookie-free session reuse; write/append raises `ReadOnlyProtocolError` |
 
@@ -161,8 +161,7 @@ python benchmarks/bench_polyopen.py
 - **Cloud Object Store Exclusions:** Cloud schemes (`s3://`, `gs://`, `az://`, `hdfs://`) raise `UnsupportedProtocolError`. Use `smart_open`, `fsspec`, or dedicated cloud SDKs instead.
 - **Write Progress Tracking (v0.1.0):** `show_progress=True` is implemented for `PolyReader` only; passing `show_progress=True` to `PolyWriter` or write/append modes raises `NotImplementedError`.
 - **FTP Append Not Supported:** `ftp://` supports read and write only; append mode raises `UnsupportedProtocolError` because `ftputil` does not support FTP append.
-- **SFTP Read Prefetch Memory:** When file size is known, `PolyReader` calls Paramiko's `prefetch(file_size, max_concurrent_requests=64)`. Paramiko buffers prefetched chunks in RAM until consumed, so slow consumers or early-exit reads on multi-GB SFTP files can accumulate memory.
-- **Synchronous CLI Fan-Out:** Multi-target `--write` reads the source once in UTF-8 text mode via `contextlib.ExitStack` and writes synchronously to each destination. Use the Python API with threads or processes for concurrent remote uploads.
+- **Synchronous CLI Fan-Out:** Multi-target `--write` reads the source once in 64 KiB binary chunks via `contextlib.ExitStack` and writes exact bytes synchronously to each destination. Use the Python API with threads or processes for concurrent remote uploads.
 
 ## License and Citation
 

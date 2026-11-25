@@ -180,50 +180,84 @@ def test_sftp_read_port_stat_and_utf8_decompression(mock_ssh):
 
 @patch('paramiko.SSHClient')
 def test_sftp_prefetch_guard_when_stat_fails_or_size_none(mock_ssh):
-    """E-03: Skip SFTP prefetch when stat() raises OSError or st_size is None instead of crashing."""
+    """a224p3 E-01: Never call unbounded prefetch(); fall back to sequential read() on stat error, None, <=0, or no readv."""
     client = MagicMock()
     sftp = MagicMock()
     mock_ssh.return_value = client
     client.open_sftp.return_value = sftp
 
     class ParamikoLikeSFTPFile(io.BytesIO):
-        def __init__(self, data, *, stat_raises=False, st_size_none=False):
+        MAX_REQUEST_SIZE = 32768
+
+        def __init__(self, data, *, stat_raises=False, st_size_override="auto", has_readv=True):
             super().__init__(data)
             self.stat_raises = stat_raises
-            self.st_size_none = st_size_none
+            self.st_size_override = st_size_override
             self.prefetch_calls = []
+            self.readv_calls = []
+            if not has_readv:
+                self.readv = None
 
         def stat(self):
             if self.stat_raises:
                 raise OSError("FSTAT denied")
             st = MagicMock()
-            st.st_size = None if self.st_size_none else len(self.getvalue())
+            if self.st_size_override == "auto":
+                st.st_size = len(self.getvalue())
+            else:
+                st.st_size = self.st_size_override
             return st
 
         def prefetch(self, file_size=None, max_concurrent_requests=None):
-            if file_size is None:
-                file_size = self.stat().st_size
-            if file_size is None:
-                raise TypeError("'<' not supported between instances of 'int' and 'NoneType'")
             self.prefetch_calls.append((file_size, max_concurrent_requests))
+            raise AssertionError("unbounded prefetch() must not be called")
+
+        def readv(self, chunks, max_concurrent_prefetch_requests=None):
+            self.readv_calls.append((list(chunks), max_concurrent_prefetch_requests))
+            buf = self.getvalue()
+            for offset, length in chunks:
+                yield buf[offset:offset + length]
 
     f_err = ParamikoLikeSFTPFile(b"ok\n", stat_raises=True)
     sftp.file.return_value = f_err
     with PolyReader("sftp://u:p@host/a.txt") as r:
         assert r.read() == "ok\n"
     assert f_err.prefetch_calls == []
+    assert f_err.readv_calls == []
 
-    f_none = ParamikoLikeSFTPFile(b"ok\n", st_size_none=True)
+    f_none = ParamikoLikeSFTPFile(b"ok\n", st_size_override=None)
     sftp.file.return_value = f_none
     with PolyReader("sftp://u:p@host/a.txt") as r:
         assert r.read() == "ok\n"
     assert f_none.prefetch_calls == []
+    assert f_none.readv_calls == []
+
+    f_zero = ParamikoLikeSFTPFile(b"", st_size_override=0)
+    sftp.file.return_value = f_zero
+    with PolyReader("sftp://u:p@host/empty.txt") as r:
+        assert r.read() == ""
+    assert f_zero.prefetch_calls == []
+    assert f_zero.readv_calls == []
+
+    f_neg = ParamikoLikeSFTPFile(b"neg\n", st_size_override=-1)
+    sftp.file.return_value = f_neg
+    with PolyReader("sftp://u:p@host/neg.txt") as r:
+        assert r.read() == "neg\n"
+    assert f_neg.prefetch_calls == []
+    assert f_neg.readv_calls == []
+
+    f_no_readv = ParamikoLikeSFTPFile(b"seq\n", has_readv=False)
+    sftp.file.return_value = f_no_readv
+    with PolyReader("sftp://u:p@host/seq.txt") as r:
+        assert r.read() == "seq\n"
+    assert f_no_readv.prefetch_calls == []
 
     f_ok = ParamikoLikeSFTPFile(b"ok\n")
     sftp.file.return_value = f_ok
     with PolyReader("sftp://u:p@host/a.txt") as r:
         assert r.read() == "ok\n"
-    assert f_ok.prefetch_calls == [(3, 64)]
+    assert f_ok.prefetch_calls == []
+    assert f_ok.readv_calls == [([(0, 3)], 64)]
 
 
 @patch('requests.Session.get')
@@ -457,17 +491,20 @@ def test_ftp_backup_rotation_fast_path_500_posix_and_999_cap(mock_host):
 
 @patch("paramiko.SSHClient")
 def test_sftp_read_prefetch_fallback_cached_size_and_idempotent_close(mock_ssh):
-    """p1f3dc E-01(c): SFTP bounded prefetch, <3.3 TypeError fallback, cached _get_file_size, and idempotent/error close."""
+    """a224p3 E-01: Bounded SFTP readv(), <3.3 TypeError fallback, cached _get_file_size, and idempotent/error close."""
     client = MagicMock()
     sftp = MagicMock()
     mock_ssh.return_value = client
     client.open_sftp.return_value = sftp
 
     class BoundedSFTPFile(io.BytesIO):
+        MAX_REQUEST_SIZE = 32768
+
         def __init__(self, data):
             super().__init__(data)
             self.stat_count = 0
             self.prefetch_calls = []
+            self.readv_calls = []
             self.close_count = 0
 
         def stat(self):
@@ -478,43 +515,57 @@ def test_sftp_read_prefetch_fallback_cached_size_and_idempotent_close(mock_ssh):
 
         def prefetch(self, file_size=None, max_concurrent_requests=None):
             self.prefetch_calls.append((file_size, max_concurrent_requests))
+            raise AssertionError("unbounded prefetch() must not be called")
+
+        def readv(self, chunks, max_concurrent_prefetch_requests=None):
+            self.readv_calls.append((list(chunks), max_concurrent_prefetch_requests))
+            buf = self.getvalue()
+            for offset, length in chunks:
+                yield buf[offset:offset + length]
 
         def close(self):
             self.close_count += 1
             super().close()
 
-    # 1. Bounded prefetch + cached _get_file_size (no duplicate stat RTT) + idempotent close
+    # 1. Bounded readv() + cached _get_file_size (no duplicate stat RTT) + idempotent close
     f1 = BoundedSFTPFile(b"row1\nrow2\n")
     sftp.file.return_value = f1
     reader = PolyReader("sftp://u:p@host/data.txt", show_progress=True).open()
-    assert f1.prefetch_calls == [(10, 64)]
+    assert f1.prefetch_calls == []
     assert reader._get_file_size() == 10
     assert f1.stat_count == 1
     assert list(reader) == ["row1\n", "row2\n"]
+    assert f1.readv_calls == [([(0, 10)], 64)]
+    assert reader._progress is not None
+    assert reader._progress.n == 10
     reader.close()
-    first_close_count = f1.close_count
-    assert first_close_count >= 1
+    assert f1.close_count == 1
     assert f1.closed
     assert sftp.close.call_count == 1
     assert client.close.call_count == 1
     reader.close()  # idempotent: no additional close calls
-    assert f1.close_count == first_close_count
+    assert f1.close_count == 1
     assert sftp.close.call_count == 1
     assert client.close.call_count == 1
 
-    # 2. Paramiko <3.3 TypeError fallback to single-arg prefetch(file_size)
+    # 2. Paramiko <3.3 TypeError fallback to single-arg readv(chunks)
     class LegacySFTPFile(io.BytesIO):
+        MAX_REQUEST_SIZE = 32768
+
         def __init__(self, data):
             super().__init__(data)
-            self.prefetch_calls = []
+            self.readv_calls = []
 
         def stat(self):
             st = MagicMock()
             st.st_size = len(self.getvalue())
             return st
 
-        def prefetch(self, file_size=None):
-            self.prefetch_calls.append(file_size)
+        def readv(self, chunks):
+            self.readv_calls.append(list(chunks))
+            buf = self.getvalue()
+            for offset, length in chunks:
+                yield buf[offset:offset + length]
 
     client.reset_mock()
     sftp.reset_mock()
@@ -522,9 +573,9 @@ def test_sftp_read_prefetch_fallback_cached_size_and_idempotent_close(mock_ssh):
     sftp.file.return_value = f_legacy
     with PolyReader("sftp://u:p@host/legacy.txt") as r:
         assert r.read() == "legacy\n"
-    assert f_legacy.prefetch_calls == [7]
+    assert f_legacy.readv_calls == [[(0, 7)]]
 
-    # 3. Close error path still closes _sftp_file, _sftp_client, and _ssh_client and remains idempotent
+    # 3. Close error path still closes _raw_fh, _sftp_file, _sftp_client, and _ssh_client and remains idempotent
     client.reset_mock()
     sftp.reset_mock()
     f_err = BoundedSFTPFile(b"err\n")
@@ -1180,3 +1231,156 @@ def test_ftp_backup_rejects_remote_directory_and_closes_handles(mock_host):
         host.rename.assert_not_called()
         host.open.assert_not_called()
         assert host.close.call_count == 1
+
+
+@patch("paramiko.SSHClient")
+def test_sftp_bounded_readv_multi_window_early_break_truncation_and_compressed_teardown(mock_ssh):
+    """a224p3 E-01: Bounded 4 MiB readv windows, sub-chunking, early break, truncation, and compressed close."""
+    from polyopen.polyopen import _BoundedSFTPReadStream
+
+    window_bytes = 4 * 1024 * 1024
+    max_req = 32768
+
+    class WindowedSFTPFile:
+        MAX_REQUEST_SIZE = max_req
+
+        def __init__(self, payload: bytes, reported_size=None):
+            self._payload = payload
+            self._reported_size = len(payload) if reported_size is None else reported_size
+            self.closed = False
+            self.close_count = 0
+            self.prefetch_calls = 0
+            self.readv_windows = []
+            self.gen_closed_count = 0
+
+        def stat(self):
+            st = MagicMock()
+            st.st_size = self._reported_size
+            return st
+
+        def prefetch(self, *args, **kwargs):
+            self.prefetch_calls += 1
+            raise AssertionError("unbounded prefetch() must not be called")
+
+        def readv(self, chunks, max_concurrent_prefetch_requests=None):
+            chunk_list = list(chunks)
+            self.readv_windows.append((chunk_list, max_concurrent_prefetch_requests))
+
+            def _gen():
+                try:
+                    for offset, length in chunk_list:
+                        yield self._payload[offset:offset + length]
+                finally:
+                    self.gen_closed_count += 1
+
+            return _gen()
+
+        def close(self):
+            self.close_count += 1
+            self.closed = True
+
+    client = MagicMock()
+    sftp = MagicMock()
+    mock_ssh.return_value = client
+    client.open_sftp.return_value = sftp
+
+    # 1. Multi-window (>4 MiB) SFTP file: bounded 4 MiB windows split into <= MAX_REQUEST_SIZE sub-chunks
+    line = (b"A" * 63) + b"\n"
+    total_lines = (window_bytes // len(line)) + 1024  # ~4.06 MiB across 2 windows
+    payload = line * total_lines
+    assert len(payload) > window_bytes
+
+    f_multi = WindowedSFTPFile(payload)
+    sftp.file.return_value = f_multi
+    with PolyReader("sftp://u:p@host/multi.bin", binary=True, show_progress=True) as r:
+        pbar = r._progress
+        assert pbar is not None
+        assert pbar.total == len(payload)
+        got = b"".join(r)
+        assert pbar.n == len(payload)
+    assert got == payload
+    assert f_multi.prefetch_calls == 0
+    assert len(f_multi.readv_windows) == 2
+    for chunks, conc in f_multi.readv_windows:
+        assert conc == 64
+        assert sum(length for _, length in chunks) <= window_bytes
+        assert all(0 < length <= max_req for _, length in chunks)
+    assert f_multi.readv_windows[0][0][0] == (0, max_req)
+    assert f_multi.readv_windows[1][0][0][0] == window_bytes
+    assert f_multi.closed and f_multi.close_count == 1
+    assert sftp.close.call_count == 1
+    assert client.close.call_count == 1
+
+    # 2. Early break after reading 1 line inside window 1 never requests window 2 and closes generator + handles
+    client.reset_mock()
+    sftp.reset_mock()
+    f_early = WindowedSFTPFile(payload)
+    sftp.file.return_value = f_early
+    seen = []
+    with PolyReader("sftp://u:p@host/multi.txt") as r:
+        for row in r:
+            seen.append(row)
+            break
+    assert seen == [("A" * 63) + "\n"]
+    assert len(f_early.readv_windows) == 1
+    assert f_early.gen_closed_count == 1
+    assert f_early.closed and f_early.close_count == 1
+    assert sftp.close.call_count == 1
+    assert client.close.call_count == 1
+
+    # 3. Truncated remote file stops cleanly at early EOF without requesting window 2
+    client.reset_mock()
+    sftp.reset_mock()
+    truncated_payload = b"short-line-1\nshort-line-2\n"
+    f_trunc = WindowedSFTPFile(truncated_payload, reported_size=window_bytes * 2)
+    sftp.file.return_value = f_trunc
+    with PolyReader("sftp://u:p@host/trunc.txt") as r:
+        assert list(r) == ["short-line-1\n", "short-line-2\n"]
+    assert len(f_trunc.readv_windows) == 1
+    assert f_trunc.closed and f_trunc.close_count == 1
+
+    # 4. Compressed SFTP streams (.gz, .bz2, .xz, .zst) deterministically close _BoundedSFTPReadStream and sftp_file
+    sample_text = "sftp compressed line 1\nsftp café line 2\n"
+    sample_bytes = sample_text.encode("utf-8")
+    compressed_cases = [
+        (".gz", gzip.compress(sample_bytes)),
+        (".bz2", bz2.compress(sample_bytes)),
+        (".xz", lzma.compress(sample_bytes)),
+        (".zst", zstd.ZstdCompressor().compress(sample_bytes)),
+    ]
+    for ext, wire in compressed_cases:
+        for binary in (False, True):
+            client.reset_mock()
+            sftp.reset_mock()
+            f_comp = WindowedSFTPFile(wire)
+            sftp.file.return_value = f_comp
+            with PolyReader(f"sftp://u:p@host/data{ext}", binary=binary, show_progress=True) as r:
+                raw_stream = r._raw_fh
+                assert isinstance(raw_stream, _BoundedSFTPReadStream)
+                pbar = r._progress
+                assert pbar is not None and pbar.total == len(wire)
+                got_data = list(r)
+                assert pbar.n == len(wire)
+            expected = [b"sftp compressed line 1\n", "sftp café line 2\n".encode("utf-8")] if binary else [
+                "sftp compressed line 1\n",
+                "sftp café line 2\n",
+            ]
+            assert got_data == expected
+            assert raw_stream.closed
+            assert f_comp.closed and f_comp.close_count == 1
+            assert sftp.close.call_count == 1
+            assert client.close.call_count == 1
+
+    # 5. Closed _BoundedSFTPReadStream raises ValueError on read/read1/readinto
+    f_closed = WindowedSFTPFile(b"abcdef")
+    stream = _BoundedSFTPReadStream(f_closed, 6)
+    assert stream.read1(2) == b"ab"
+    buf = bytearray(2)
+    assert stream.readinto(buf) == 2
+    assert bytes(buf) == b"cd"
+    stream.close()
+    assert stream.closed
+    assert f_closed.close_count == 1
+    for op in (lambda: stream.read(), lambda: stream.read1(), lambda: stream.readinto(bytearray(1))):
+        with pytest.raises(ValueError):
+            op()

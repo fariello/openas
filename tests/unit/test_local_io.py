@@ -961,3 +961,149 @@ def test_repr_redacts_malformed_ipv6_urls_without_raising(bad_url, secret, expec
         assert secret not in rep
         assert "token=1" not in rep
         assert expected_fragment in rep
+
+
+@pytest.mark.parametrize("ext", [".gz", ".bz2", ".xz", ".zst"])
+@pytest.mark.parametrize("binary", [False, True])
+def test_compressed_progress_eof_before_close_early_break_and_mixed_reads(tmp_path, ext, binary):
+    """a224p3 E-02/E-03: _CountingByteStream flushes exact raw_size at EOF before close, on early break, and on mixed reads."""
+    text_lines = [f"row-{i:05d}-café-" + ("0123456789abcdef" * 4) + "\n" for i in range(1500)]
+    payload_text = "".join(text_lines)
+    expected_lines = [line.encode("utf-8") for line in text_lines] if binary else text_lines
+    fp = tmp_path / f"counted_prog{ext}"
+    with PolyWriter(fp).open(backup=False) as w:
+        w.write(payload_text)
+    raw_size = fp.stat().st_size
+
+    # 1. Full iteration hits exact raw_size AT EOF BEFORE close() and stays exact after close()
+    reader = PolyReader(fp, show_progress=True, binary=binary).open()
+    try:
+        pbar = reader._progress
+        assert pbar is not None
+        assert pbar.total == raw_size
+        seen = list(reader)
+        assert seen == expected_lines
+        assert pbar.n == raw_size
+    finally:
+        reader.close()
+    assert pbar.n == raw_size
+
+    # 2. Early break flushes pending bytes cleanly on close() without exceeding raw_size
+    reader_early = PolyReader(fp, show_progress=True, binary=binary).open()
+    pbar_early = reader_early._progress
+    assert pbar_early is not None
+    partial = []
+    for line in reader_early:
+        partial.append(line)
+        if len(partial) == 3:
+            break
+    reader_early.close()
+    assert len(partial) == 3
+    assert 0 < pbar_early.n <= raw_size
+
+    # 3. Mixed readline() + read(10) + iteration never double-counts
+    reader_mix = PolyReader(fp, show_progress=True, binary=binary).open()
+    try:
+        pbar_mix = reader_mix._progress
+        assert pbar_mix is not None
+        first_line = reader_mix.readline()
+        head = reader_mix.read(10)
+        rest = list(reader_mix)
+        if binary:
+            assert first_line + head + b"".join(rest) == payload_text.encode("utf-8")
+        else:
+            assert first_line + head + "".join(rest) == payload_text
+        assert pbar_mix.n == raw_size
+    finally:
+        reader_mix.close()
+    assert pbar_mix.n == raw_size
+
+
+def test_counted_stream_open_header_bytes_not_double_counted(tmp_path):
+    """a224p3 E-03: Header bytes read during open() initialize tqdm once and are never double-counted."""
+    import io as _io
+
+    raw_payload = b"HDR!line1\nline2\nline3\n"
+    raw_size = len(raw_payload)
+
+    class HeaderReadingReader(PolyReader):
+        def _wrap_local(self, parsed=None):
+            self._raw_fh = _io.BytesIO(raw_payload)
+            stream = self._make_counted_stream(self._raw_fh)
+            header = stream.read(4)
+            assert header == b"HDR!"
+            self._fh = _io.TextIOWrapper(stream, encoding="utf-8")
+
+        def _get_file_size(self):
+            return raw_size
+
+    reader = HeaderReadingReader(tmp_path / "virtual_header.txt", show_progress=True).open()
+    try:
+        pbar = reader._progress
+        assert pbar is not None
+        assert pbar.total == raw_size
+        assert pbar.n == 4
+        assert list(reader) == ["line1\n", "line2\n", "line3\n"]
+        assert pbar.n == raw_size
+    finally:
+        reader.close()
+    assert pbar.n == raw_size
+
+
+@pytest.mark.parametrize("ext", [".txt", ".gz", ".bz2", ".xz", ".zst"])
+@pytest.mark.parametrize("binary", [False, True])
+def test_polyreader_readlines_hints_binary_and_progress(tmp_path, ext, binary):
+    """a224p3 E-05: readlines() handles hint=-1/0/None/positive, binary mode, and show_progress=True without double-counting."""
+    lines = [f"line-{i:03d}-café-payload\n" for i in range(40)]
+    expected = [line.encode("utf-8") for line in lines] if binary else lines
+    fp = tmp_path / f"readlines_sample{ext}"
+    with PolyWriter(fp).open(backup=False) as w:
+        w.writelines(lines)
+    raw_size = fp.stat().st_size
+
+    # Unbounded hints (-1, 0, None) with show_progress=False and show_progress=True
+    for show_progress in (False, True):
+        for hint in (-1, 0, None):
+            with PolyReader(fp, show_progress=show_progress, binary=binary) as r:
+                pbar = r._progress
+                got = r.readlines() if hint == -1 else r.readlines(hint)
+                assert got == expected
+                if show_progress:
+                    assert pbar is not None
+                    assert pbar.n == raw_size
+            if show_progress:
+                assert pbar.n == raw_size
+
+    # Positive hint followed by remaining readlines()
+    for show_progress in (False, True):
+        with PolyReader(fp, show_progress=show_progress, binary=binary) as r:
+            pbar = r._progress
+            first_batch = r.readlines(50)
+            assert 0 < len(first_batch) < len(expected)
+            rest_batch = r.readlines()
+            assert first_batch + rest_batch == expected
+            if show_progress:
+                assert pbar is not None
+                assert pbar.n == raw_size
+        if show_progress:
+            assert pbar.n == raw_size
+
+    # Plain local CRLF readlines() with show_progress=True reconciles to raw_size at EOF and not early on positive hint
+    if ext == ".txt" and not binary:
+        crlf_fp = tmp_path / "readlines_crlf.txt"
+        crlf_raw = b"alpha\r\nbeta\r\ngamma\r\n"
+        crlf_fp.write_bytes(crlf_raw)
+        with PolyReader(crlf_fp, show_progress=True) as r:
+            pbar = r._progress
+            assert pbar is not None
+            assert r.readlines() == ["alpha\n", "beta\n", "gamma\n"]
+            assert pbar.n == len(crlf_raw)
+        with PolyReader(crlf_fp, show_progress=True) as r:
+            pbar = r._progress
+            assert pbar is not None
+            head = r.readlines(2)
+            assert head == ["alpha\n"]
+            assert pbar.n < len(crlf_raw)
+            tail = r.readlines()
+            assert tail == ["beta\n", "gamma\n"]
+            assert pbar.n == len(crlf_raw)

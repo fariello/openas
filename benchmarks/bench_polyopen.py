@@ -1,16 +1,18 @@
 #!/usr/bin/env python3
 """Reproducible performance benchmark suite for polyopen.
 
-Measures seven workloads using only the Python standard library and polyopen
+Measures nine workloads using only the Python standard library and polyopen
 dependencies:
   1. Subprocess import latency (`import polyopen`)
-  2. 200,000-line read throughput across .txt, .gz, .bz2, .xz, .zst
+  2. 200,000-line text read throughput across .txt, .gz, .bz2, .xz, .zst
      (show_progress=False and show_progress=True vs native iteration)
   3. 200,000-line local write throughput (PolyWriter vs native fh.write)
   4. Compression time and peak RSS for .zst and .xz writes vs idle child
   5. HTTP read throughput from a local 127.0.0.1 ephemeral-port server
   6. Local backup rotation latency with 500 existing .bu files
   7. CLI 3-target broadcast time via `python3 -m polyopen.polyopen -w`
+  8. 200,000-line binary ('rb') read throughput across .txt, .gz, .bz2, .xz, .zst
+  9. 200,000-line PolyReader.readlines() throughput vs native fh.readlines()
 
 Every generated file lives inside a `tempfile.TemporaryDirectory()`.
 Run via:
@@ -105,7 +107,7 @@ def bench_import_time(env: dict) -> dict:
     med_import_ms = _median(import_ms_samples)
     med_wall_ms = _median(wall_ms_samples)
     print(
-        f"[1/7] import_polyopen: median={med_import_ms:.2f} ms "
+        f"[1/9] import_polyopen: median={med_import_ms:.2f} ms "
         f"(subprocess_wall={med_wall_ms:.2f} ms, reps={IMPORT_REPS})"
     )
     return {"import_ms": med_import_ms, "wall_ms": med_wall_ms}
@@ -143,15 +145,14 @@ def _iter_native(path: str, ext: str) -> int:
     return count
 
 
-def bench_read_throughput(tmpdir: Path) -> None:
-    """Workload 2: 200,000-line read throughput across 5 formats."""
+def _build_read_fixtures(tmpdir: Path) -> dict:
+    """Create shared 200,000-line fixtures across .txt, .gz, .bz2, .xz, and .zst."""
     lines = [
         f"2026-11-21T00:00:00Z INFO benchmark record {i:06d} "
         f"payload=0123456789abcdef0123456789abcdef\n"
         for i in range(READ_LINES)
     ]
-    payload = "".join(lines)
-    payload_bytes = payload.encode("utf-8")
+    payload_bytes = "".join(lines).encode("utf-8")
 
     files = {}
     txt_path = tmpdir / "read_200k.txt"
@@ -177,7 +178,11 @@ def bench_read_throughput(tmpdir: Path) -> None:
     cctx = zstd.ZstdCompressor()
     zst_path.write_bytes(cctx.compress(payload_bytes))
     files[".zst"] = str(zst_path)
+    return files
 
+
+def bench_read_throughput(files: dict) -> None:
+    """Workload 2: 200,000-line text read throughput across 5 formats."""
     for ext in (".txt", ".gz", ".bz2", ".xz", ".zst"):
         path = files[ext]
 
@@ -221,12 +226,12 @@ def bench_read_throughput(tmpdir: Path) -> None:
         ratio_plain = med_plain / med_native if med_native > 0 else float("inf")
         ratio_prog = med_prog / med_native if med_native > 0 else float("inf")
         print(
-            f"[2/7] read_200k {ext:4s} (progress=False): "
+            f"[2/9] read_200k {ext:4s} (progress=False): "
             f"polyopen={med_plain:.4f}s native={med_native:.4f}s "
             f"ratio={ratio_plain:.2f}x (reps={REPS})"
         )
         print(
-            f"[2/7] read_200k {ext:4s} (progress=True ): "
+            f"[2/9] read_200k {ext:4s} (progress=True ): "
             f"polyopen={med_prog:.4f}s native={med_native:.4f}s "
             f"ratio={ratio_prog:.2f}x (reps={REPS})"
         )
@@ -258,7 +263,7 @@ def bench_write_throughput(tmpdir: Path) -> None:
     med_poly = _median(poly_times)
     ratio = med_poly / med_native if med_native > 0 else float("inf")
     print(
-        f"[3/7] write_200k .txt: polyopen={med_poly:.4f}s native={med_native:.4f}s "
+        f"[3/9] write_200k .txt: polyopen={med_poly:.4f}s native={med_native:.4f}s "
         f"ratio={ratio:.2f}x (reps={REPS})"
     )
 
@@ -304,7 +309,7 @@ def bench_compression_rss(tmpdir: Path, env: dict) -> None:
         idle_rss_samples.append(rss_kib)
     idle_rss = int(_median(idle_rss_samples))
     print(
-        f"[4/7] compress_rss idle_child: median_time={_median(idle_times):.4f}s "
+        f"[4/9] compress_rss idle_child: median_time={_median(idle_times):.4f}s "
         f"peak_rss={idle_rss} KiB (reps={REPS})"
     )
 
@@ -330,7 +335,7 @@ def bench_compression_rss(tmpdir: Path, env: dict) -> None:
         med_rss = int(_median(rss_samples))
         delta_rss = med_rss - idle_rss
         print(
-            f"[4/7] compress_write {ext:4s}: median_time={med_time:.4f}s "
+            f"[4/9] compress_write {ext:4s}: median_time={med_time:.4f}s "
             f"peak_rss={med_rss} KiB (delta_vs_idle={delta_rss:+d} KiB, reps={REPS})"
         )
 
@@ -377,7 +382,7 @@ def bench_http_read(tmpdir: Path) -> None:
     med_time = _median(times)
     mib_s = (len(data_bytes) / (1024 * 1024)) / med_time if med_time > 0 else 0.0
     print(
-        f"[5/7] http_read_{HTTP_LINES}: median={med_time:.4f}s "
+        f"[5/9] http_read_{HTTP_LINES}: median={med_time:.4f}s "
         f"({mib_s:.1f} MiB/s, reps={REPS})"
     )
 
@@ -405,7 +410,7 @@ def bench_backup_rotation(tmpdir: Path) -> None:
 
     med_ms = _median(times_ms)
     print(
-        f"[6/7] backup_rotation_500: median={med_ms:.3f} ms "
+        f"[6/9] backup_rotation_500: median={med_ms:.3f} ms "
         f"(existing={BACKUP_EXISTING}, reps={REPS})"
     )
 
@@ -449,7 +454,110 @@ def bench_cli_broadcast(tmpdir: Path, env: dict) -> None:
                 raise RuntimeError(f"CLI broadcast did not create {dst}")
 
     med_time = _median(times)
-    print(f"[7/7] cli_broadcast_3_targets: median={med_time:.4f}s (reps={REPS})")
+    print(f"[7/9] cli_broadcast_3_targets: median={med_time:.4f}s (reps={REPS})")
+
+
+def _iter_native_binary(path: str, ext: str) -> int:
+    count = 0
+    if ext == ".txt":
+        with open(path, "rb") as fh:
+            for _ in fh:
+                count += 1
+    elif ext == ".gz":
+        with gzip.open(path, "rb") as fh:
+            for _ in fh:
+                count += 1
+    elif ext == ".bz2":
+        with bz2.open(path, "rb") as fh:
+            for _ in fh:
+                count += 1
+    elif ext == ".xz":
+        with lzma.open(path, "rb") as fh:
+            for _ in fh:
+                count += 1
+    elif ext == ".zst":
+        dctx = zstd.ZstdDecompressor(max_window_size=2**31)
+        with open(path, "rb") as raw:
+            with io.BufferedReader(
+                dctx.stream_reader(raw, read_across_frames=True)
+            ) as fh:
+                for _ in fh:
+                    count += 1
+    else:
+        raise ValueError(f"Unsupported extension: {ext}")
+    return count
+
+
+def bench_binary_read_throughput(files: dict) -> None:
+    """Workload 8: 200,000-line binary ('rb') read throughput across 5 formats."""
+    for ext in (".txt", ".gz", ".bz2", ".xz", ".zst"):
+        path = files[ext]
+
+        native_times = []
+        for _ in range(REPS):
+            t0 = time.perf_counter()
+            n = _iter_native_binary(path, ext)
+            native_times.append(time.perf_counter() - t0)
+            if n != READ_LINES:
+                raise RuntimeError(f"Native rb {ext} line mismatch: {n} != {READ_LINES}")
+
+        poly_times = []
+        for _ in range(REPS):
+            t0 = time.perf_counter()
+            n = 0
+            with PolyReader(path, binary=True) as reader:
+                for _ in reader:
+                    n += 1
+            poly_times.append(time.perf_counter() - t0)
+            if n != READ_LINES:
+                raise RuntimeError(f"PolyReader rb {ext} line mismatch: {n} != {READ_LINES}")
+
+        med_native = _median(native_times)
+        med_poly = _median(poly_times)
+        ratio = med_poly / med_native if med_native > 0 else float("inf")
+        speedup = med_native / med_poly if med_poly > 0 else float("inf")
+        print(
+            f"[8/9] read_200k_rb {ext:4s}: "
+            f"polyopen={med_poly:.4f}s native={med_native:.4f}s "
+            f"ratio={ratio:.2f}x (speedup={speedup:.2f}x, reps={REPS})"
+        )
+
+
+def bench_readlines_throughput(files: dict) -> None:
+    """Workload 9: 200,000-line PolyReader.readlines() vs native fh.readlines()."""
+    for ext in (".txt", ".gz"):
+        path = files[ext]
+
+        native_times = []
+        for _ in range(REPS):
+            t0 = time.perf_counter()
+            if ext == ".txt":
+                with open(path, "r", encoding="utf-8") as fh:
+                    lines = fh.readlines()
+            else:
+                with gzip.open(path, "rt", encoding="utf-8") as fh:
+                    lines = fh.readlines()
+            native_times.append(time.perf_counter() - t0)
+            if len(lines) != READ_LINES:
+                raise RuntimeError(f"Native readlines {ext} mismatch: {len(lines)} != {READ_LINES}")
+
+        poly_times = []
+        for _ in range(REPS):
+            t0 = time.perf_counter()
+            with PolyReader(path) as reader:
+                lines = reader.readlines()
+            poly_times.append(time.perf_counter() - t0)
+            if len(lines) != READ_LINES:
+                raise RuntimeError(f"PolyReader readlines {ext} mismatch: {len(lines)} != {READ_LINES}")
+
+        med_native = _median(native_times)
+        med_poly = _median(poly_times)
+        ratio = med_poly / med_native if med_native > 0 else float("inf")
+        print(
+            f"[9/9] readlines_200k {ext:4s}: "
+            f"polyopen={med_poly:.4f}s native={med_native:.4f}s "
+            f"ratio={ratio:.2f}x (reps={REPS})"
+        )
 
 
 def main() -> int:
@@ -458,12 +566,15 @@ def main() -> int:
     with tempfile.TemporaryDirectory(prefix="polyopen-bench-") as raw_dir:
         tmpdir = Path(raw_dir)
         bench_import_time(env)
-        bench_read_throughput(tmpdir)
+        read_files = _build_read_fixtures(tmpdir)
+        bench_read_throughput(read_files)
         bench_write_throughput(tmpdir)
         bench_compression_rss(tmpdir, env)
         bench_http_read(tmpdir)
         bench_backup_rotation(tmpdir)
         bench_cli_broadcast(tmpdir, env)
+        bench_binary_read_throughput(read_files)
+        bench_readlines_throughput(read_files)
     return 0
 
 

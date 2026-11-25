@@ -22,7 +22,7 @@
 ## 2. Core Concepts
 
 - **Unified Streaming Wrapper:** `polyopen()` routes text and binary read, write, and append modes to `PolyReader` or `PolyWriter`. Optional standard library and third-party modules are imported lazily on first use.
-- **Line-by-Line Transparent Compression:** Uses Python's `gzip`, `bz2`, `lzma`, `zstandard`, `io.TextIOWrapper` (text mode), and `io.BufferedReader` (binary `.zst` and network reads) to stream decompressed and compressed data across chunk boundaries without buffering entire files in memory.
+- **Line-by-Line Transparent Compression:** Uses Python's `gzip`, `bz2`, `lzma`, `zstandard`, `io.TextIOWrapper` (text mode), and `io.BufferedReader` (`64 KiB` buffers for binary `.gz`, `.bz2`, `.xz`, and plain binary network streams; `128 KiB` `read_size` and `io.BufferedReader` for `.zst` text and binary streams) to stream decompressed and compressed data across chunk boundaries in O(1) memory without buffering entire files.
 - **Sequential `.bu` Overwrite Backups:** On overwrite (`backup=True`, default for write modes), `polyopen` validates `compresslevel` and imports required codecs first, then checks `<path>.001.bu` in O(1); if occupied, it lists the parent directory once (`os.scandir` locally, single `listdir` on SFTP/FTP) to select the lowest free 3-digit slot up to `.999.bu`, falling back to nanosecond timestamps (`time.time_ns()`) past 999. Existing `.bu` files are never deleted or pruned automatically.
 
 ## 3. Supported Protocols and Codecs
@@ -31,7 +31,7 @@
 
 - **Local (`file://` or plain path):** Read, write, and append in text and binary modes. `file://` URIs require an empty host or `localhost` (remote `file://` hosts raise `UnsupportedProtocolError`) and decode percent-encoded paths via `url2pathname`.
 - **FTP (`ftp://`):** Read and write in text and binary modes via `ftputil` (`FTPSessionWrapper`, default port 21, custom ports and optional `timeout` forwarded, credentials and paths percent-decoded). Append mode (`'a'`, `'at'`, `'ab'`) raises `UnsupportedProtocolError` before connecting.
-- **SSH / SFTP (`ssh://`, `sftp://`):** Read, write, and append in text and binary modes via `paramiko` (`load_system_host_keys()`, default `RejectPolicy`, default port 22, custom ports and optional `timeout` forwarded, credentials and paths percent-decoded). Reads cache `stat().st_size` once and call `prefetch(file_size, max_concurrent_requests=64)` when size is known (falling back to `prefetch(file_size)` on Paramiko `<3.3`). Writes open binary SFTP handles with `set_pipelined(True)` and wrap uncompressed streams in `_BinaryStreamAdapter` (plus `io.TextIOWrapper` in text mode).
+- **SSH / SFTP (`ssh://`, `sftp://`):** Read, write, and append in text and binary modes via `paramiko` (`load_system_host_keys()`, default `RejectPolicy`, default port 22, custom ports and optional `timeout` forwarded, credentials and paths percent-decoded). Reads cache `stat().st_size` once and, when `file_size > 0` and `readv` is available, stream through `_BoundedSFTPReadStream` in bounded 4 MiB sliding `readv()` windows split into `MAX_REQUEST_SIZE` sub-chunks with `max_concurrent_prefetch_requests=64` (falling back to single-argument `readv(sub_chunks)` on Paramiko `<3.3`, and falling back to sequential `sftp_file.read()` when `readv` is absent or `file_size` is unknown or `<= 0`). Writes open binary SFTP handles with `set_pipelined(True)` and wrap uncompressed streams in `_BinaryStreamAdapter` (plus `io.TextIOWrapper` in text mode).
 - **HTTP / HTTPS (`http://`, `https://`):** Read-only streaming in text and binary modes via lock-initialized, thread-local, cookie-free `requests.Session` reuse (`DefaultCookiePolicy(allowed_domains=[])`) with optional `timeout` forwarding. Compressed extensions send `Accept-Encoding: identity`; uncompressed responses set `response.raw.decode_content = True`. Write/append raises `ReadOnlyProtocolError`.
 - **Rejected schemes:** Cloud schemes (`s3://`, `gs://`, `az://`, `hdfs://`) and unrecognized multi-letter `scheme://` URLs raise `UnsupportedProtocolError`.
 
@@ -68,10 +68,10 @@ Both `PolyReader` and `PolyWriter` expose `binary`, `closed`, `readable()`, `wri
 
 ## 5. Command-Line Interface
 
-Available via `polyopen`, `python -m polyopen`, and `python -m polyopen.polyopen` (operates in UTF-8 text mode):
+Available via `polyopen`, `python -m polyopen`, and `python -m polyopen.polyopen` (streams 64 KiB binary chunks, preserving exact bytes including CRLF and non-UTF-8 payloads, and counts `b'\n'`-delimited lines, including a final non-empty line without a trailing newline):
 
-- `--read` (`-r`): Requires at least one positional file; reads sequentially and prints line count, UTF-8 byte size (`B` through `YB`), throughput, and elapsed time.
-- `--write` (`-w`): Pre-validates destination guards, reads source once inside `contextlib.ExitStack`, broadcasts lines synchronously to all destinations (moving existing destinations to sequential `.bu` backups), prints redacted status/summary lines, and closes all handles on error.
+- `--read` (`-r`): Requires at least one positional file; reads sequentially in 64 KiB binary chunks and prints line count, exact byte size (`B` through `YB`), throughput, and elapsed time.
+- `--write` (`-w`): Pre-validates destination guards, opens the source and all destinations in binary mode inside `contextlib.ExitStack`, reads the source once in 64 KiB chunks, broadcasts exact bytes synchronously to all destinations (moving existing destinations to sequential `.bu` backups), prints redacted status/summary lines, and closes all handles on error.
 - `--input-file` (`-i`): Source file for `--write` mode (all positional arguments become destinations). Rejected via `parser.error` if combined with `--read` or without at least one destination.
 - `--version`: Prints `polyopen <version>` and exits 0.
 
@@ -88,8 +88,8 @@ Available via `polyopen`, `python -m polyopen`, and `python -m polyopen.polyopen
 1. **SSH Host-Key Verification:** `paramiko.SSHClient()` calls `load_system_host_keys()` and preserves Paramiko's default `RejectPolicy` (unknown host keys are rejected rather than auto-accepted to prevent Man-in-the-Middle attacks).
 2. **Credential Redaction:** URL passwords and query parameters are masked by `_redact_url()` in CLI stdout, `__repr__()`, and `UnsupportedArchiveError` messages. Inline URL passwords in shell commands remain visible to OS process tables; prefer SSH keys (`sftp://user@host/path`).
 3. **Archive Corruption Prevention:** Container archive extensions fail fast before opening streams for reading or writing.
-4. **Unbounded SFTP Prefetch and Zstandard Window Caveats (v0.1.0):**
-   - When SFTP file size is known, `PolyReader` calls `prefetch(file_size, max_concurrent_requests=64)`. Paramiko stores completed chunks in RAM until consumed, so slow consumers or early-exit reads on multi-GB SFTP files can buffer significant memory.
+4. **Bounded SFTP Prefetch and Zstandard Window Boundaries (v0.1.0):**
+   - SFTP reads stream in bounded 4 MiB sliding `readv()` windows (`<= 4 MiB` active prefetch buffer per stream, O(1) memory on multi-gigabyte files, early exit stops requesting further windows).
    - `ZstdDecompressor` uses `max_window_size=2**31` (2 GiB) to support `--long=31` archives. Treat untrusted `.zst` inputs with caution because a crafted header can request a large decompression window.
 5. **Cleartext FTP:** `ftp://` uses standard `ftplib.FTP` (no TLS); use `sftp://` or `https://` for encrypted transfers.
 6. **Network Timeouts:** `timeout` defaults to `None` for compatibility with slow bulk transfers; pass an explicit `timeout` in automated services to bound stalled connections.

@@ -168,20 +168,20 @@ def test_cli_write_broadcast_single_read_identical_outputs_and_messages(tmp_path
     dst_gz = tmp_path / "out2.txt.gz"
     dst_zst = tmp_path / "out3.txt.zst"
 
-    stats = {"opens": 0, "iters": 0}
+    stats = {"opens": 0, "reads": 0}
     orig_open = PolyReader.open
-    orig_iter = PolyReader.__iter__
+    orig_read = PolyReader.read
 
     def spy_open(self):
         stats["opens"] += 1
         return orig_open(self)
 
-    def spy_iter(self):
-        stats["iters"] += 1
-        return orig_iter(self)
+    def spy_read(self, size=-1):
+        stats["reads"] += 1
+        return orig_read(self, size)
 
     monkeypatch.setattr(PolyReader, "open", spy_open)
-    monkeypatch.setattr(PolyReader, "__iter__", spy_iter)
+    monkeypatch.setattr(PolyReader, "read", spy_read)
     monkeypatch.setattr(
         sys,
         "argv",
@@ -190,14 +190,15 @@ def test_cli_write_broadcast_single_read_identical_outputs_and_messages(tmp_path
     cli_main()
 
     out = capsys.readouterr().out
-    assert stats == {"opens": 1, "iters": 1}
+    assert stats["opens"] == 1
+    assert stats["reads"] >= 1
     assert f"Will Read from {src}" in out
     for dst in (dst_txt, dst_gz, dst_zst):
         assert f"Writing {dst}" in out
         assert f"FINISHED Writing. {dst}. 3 lines / {expected_bytes:.1f}B" in out
 
     monkeypatch.setattr(PolyReader, "open", orig_open)
-    monkeypatch.setattr(PolyReader, "__iter__", orig_iter)
+    monkeypatch.setattr(PolyReader, "read", orig_read)
     for dst in (dst_txt, dst_gz, dst_zst):
         with PolyReader(dst) as r:
             assert r.read() == payload
@@ -231,7 +232,8 @@ def test_cli_write_broadcast_closes_handles_on_writer_error(tmp_path, monkeypatc
     from polyopen.polyopen import main as cli_main
 
     src = tmp_path / "src.txt"
-    src.write_text("line1\nline2\nline3\n", encoding="utf-8")
+    # Exceed the 64 KiB CLI chunk size so a second chunk triggers the simulated writer failure.
+    src.write_text("line1\nline2\nline3\n" * 4000, encoding="utf-8")
     dst1 = tmp_path / "dst1.txt"
     dst2 = tmp_path / "dst2.txt"
 
@@ -423,3 +425,74 @@ def test_cli_empty_file_zero_rate_includes_byte_unit(tmp_path):
     assert "(0/s)" not in res_write.stdout
     assert empty_dst.exists()
     assert empty_dst.read_text(encoding="utf-8") == ""
+    assert "0 lines / 0.0B" in res_read.stdout
+    assert "0 lines / 0.0B" in res_write.stdout
+
+
+def test_cli_binary_crlf_no_trailing_newline_and_help(tmp_path):
+    """a224p3 E-04: CLI preserves non-UTF-8 binary and CRLF bytes, counts lines accurately, and documents chunked binary mode."""
+    import gzip
+
+    # 1. --help reflects binary and text 64 KiB chunked streaming
+    res_help = subprocess.run(
+        [sys.executable, "-m", "polyopen", "--help"],
+        capture_output=True,
+        text=True,
+        env=_cli_env(),
+    )
+    assert res_help.returncode == 0
+    assert "binary and text streams" in res_help.stdout
+    assert "64 KiB binary chunks" in res_help.stdout
+
+    # 2. Arbitrary non-UTF-8 binary payload (>64 KiB) across compressed .gz -> plain and .zst
+    raw_bin = (b"\x00\xff\xfe\x80record\n\xde\xad\xbe\xef" * 4500) + b"\x89PNG"
+    expected_bin_lines = raw_bin.count(b"\n") + 1  # ends without trailing newline
+    bin_src = tmp_path / "payload.bin.gz"
+    with gzip.open(bin_src, "wb") as fh:
+        fh.write(raw_bin)
+    bin_dst_plain = tmp_path / "payload_out.bin"
+    bin_dst_zst = tmp_path / "payload_out.bin.zst"
+
+    res_bin_read = run_cli("--read", str(bin_src))
+    assert res_bin_read.returncode == 0, res_bin_read.stderr
+    assert f"{expected_bin_lines:,d} lines" in res_bin_read.stdout
+
+    res_bin_write = run_cli("--write", str(bin_src), str(bin_dst_plain), str(bin_dst_zst))
+    assert res_bin_write.returncode == 0, res_bin_write.stderr
+    assert f"{expected_bin_lines:,d} lines" in res_bin_write.stdout
+    assert bin_dst_plain.read_bytes() == raw_bin
+    from polyopen import PolyReader
+
+    with PolyReader(bin_dst_zst, binary=True) as r:
+        assert r.read() == raw_bin
+
+    # 3. CRLF byte preservation
+    crlf_src = tmp_path / "crlf_in.txt"
+    crlf_dst = tmp_path / "crlf_out.txt"
+    crlf_bytes = b"alpha\r\nbeta\r\n"
+    crlf_src.write_bytes(crlf_bytes)
+
+    res_crlf_read = run_cli("--read", str(crlf_src))
+    assert res_crlf_read.returncode == 0, res_crlf_read.stderr
+    assert f"2 lines / {len(crlf_bytes):.1f}B" in res_crlf_read.stdout
+
+    res_crlf_write = run_cli("--write", str(crlf_src), str(crlf_dst))
+    assert res_crlf_write.returncode == 0, res_crlf_write.stderr
+    assert f"2 lines / {len(crlf_bytes):.1f}B" in res_crlf_write.stdout
+    assert crlf_dst.read_bytes() == crlf_bytes
+
+    # 4. Non-empty files without trailing newline
+    for name, content, expected_lines in (
+        ("single_no_nl.txt", b"single line", 1),
+        ("two_no_nl.txt", b"first\nsecond", 2),
+    ):
+        src = tmp_path / name
+        dst = tmp_path / f"copy_{name}"
+        src.write_bytes(content)
+        res_r = run_cli("--read", str(src))
+        assert res_r.returncode == 0, res_r.stderr
+        assert f"{expected_lines} lines / {len(content):.1f}B" in res_r.stdout
+        res_w = run_cli("--write", str(src), str(dst))
+        assert res_w.returncode == 0, res_w.stderr
+        assert f"{expected_lines} lines / {len(content):.1f}B" in res_w.stdout
+        assert dst.read_bytes() == content
