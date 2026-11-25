@@ -26,7 +26,7 @@ Prefer `polyopen` or `python -m polyopen` to avoid Python's `runpy` `RuntimeWarn
   - With `--write` (without `--input-file`): `file[0]` is the source and `file[1:]` are destinations (at least two paths required).
   - With `--write --input-file SRC`: all positional arguments are destinations (at least one destination required).
 - `--read`, `-r` (Mutually Exclusive): Reads every positional file and reports line count, UTF-8 byte size (`B` through `YB`), line rate, byte rate, and elapsed seconds.
-- `--write`, `-w` (Mutually Exclusive): Pre-validates destination protocol and archive guards, opens the source and all destinations inside a single `contextlib.ExitStack`, reads the source once, writes every line synchronously to each destination (rotating existing destinations to `.bu` backups), and closes all handles on error.
+- `--write`, `-w` (Mutually Exclusive): Pre-validates destination protocol and archive guards, opens the source and all destinations in UTF-8 text mode inside a single `contextlib.ExitStack`, reads the source once, writes every line synchronously to each destination (moving existing destinations to sequential `.bu` backups), and closes all handles on error.
 - `--input-file INPUT_FILE`, `-i INPUT_FILE`: Explicit source path or URL for `--write` mode. Rejected via `parser.error` if combined with `--read` or if no destination is given.
 - `--version`: Prints `polyopen <version>` and exits 0.
 

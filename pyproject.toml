@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "polyopen"
 version = "0.1.0"
-description = "Unified UTF-8 stream-level file handling across local files, remote protocols (HTTP/HTTPS, FTP, SSH/SFTP), and transparent compression (.gz, .bz2, .xz, .zst)."
+description = "Line-by-line and chunked streaming I/O for plain and compressed files (.gz, .bz2, .xz, .zst) in text or binary mode across local paths, HTTP/HTTPS, FTP, and SSH/SFTP."
 readme = "README.md"
 requires-python = ">=3.9"
 license = "Apache-2.0"

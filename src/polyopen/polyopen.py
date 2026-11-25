@@ -30,7 +30,7 @@ Read over SSH/SFTP using SSH keys (preferred over inline passwords):
     >>> with polyopen("sftp://user@hostname/path/to/remote.zst", "r") as reader:
     ...     content = reader.read()
 
-Write a compressed file with automatic backup rotation:
+Write a compressed file with optional sequential .bu backup on overwrite:
     >>> with polyopen("path/to/output.bz2", "w", compresslevel=6) as writer:
     ...     writer.write("Hello, world!\\n")
 
@@ -301,7 +301,7 @@ def _validate_timeout(timeout: Optional[float]) -> Optional[float]:
 
 
 def _validate_write_options(norm: str, compresslevel: Optional[int]) -> None:
-    """Validate compresslevel and import optional codecs before rotating backups or opening files."""
+    """Validate compresslevel and import optional codecs before creating .bu backups or opening files."""
     if compresslevel is not None:
         if isinstance(compresslevel, bool) or not isinstance(compresslevel, int):
             raise TypeError(f"compresslevel must be an int or None, got {type(compresslevel).__name__}.")
@@ -1659,7 +1659,7 @@ class PolyWriter:
             self._fh = adapted if self.binary else io.TextIOWrapper(adapted, encoding='utf-8')
 
     def _backup_local_file(self):
-        """Atomically rotate an existing local file to the next free .bu slot."""
+        """Atomically move an existing local file to the next free sequential .bu slot."""
         src = self.filename
         if not os.path.lexists(src):
             return
@@ -2114,7 +2114,7 @@ def main():
             source_file = args.files[0]
             output_files = args.files[1:]
 
-        # Pre-validate destination schemes and archive guards before rotating/truncating earlier outputs.
+        # Pre-validate destination schemes and archive guards before backing up or truncating earlier outputs.
         for output_file in output_files:
             resolved_out, parsed_out, scheme_out = _resolve_target(output_file)
             if _normalized_path(resolved_out, parsed_out).endswith(UNSUPPORTED_ARCHIVES):

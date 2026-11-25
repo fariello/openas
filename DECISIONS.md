@@ -4,11 +4,11 @@
 
 This document records the rationale and trade-offs behind load-bearing design choices in `polyopen` so contributors and reviewers can understand why current invariants exist before changing them.
 
-## ADR-001: UTF-8 text-only interface with `'rb'`/`'wb'`/`'ab'` aliases (2026-11-21, reaffirmed 2026-11-25)
+## ADR-001: Distinct UTF-8 text and binary `bytes` modes (2026-11-25)
 
-- **Context:** `polyopen` was built for line-oriented text stream processing (`.txt`, `.csv`, logs) across compressed and remote transports. Historical callers sometimes passed `'rb'`, `'wb'`, or `'ab'` expecting `polyopen` to handle binary codec framing transparently while still iterating strings.
-- **Decision:** All modes operate strictly on UTF-8 `str` through `io.TextIOWrapper`. In v0.1.0, `'rb'`, `'wb'`, and `'ab'` remain accepted aliases for UTF-8 text modes rather than switching to `bytes` or raising `ValueError`.
-- **Consequences:** Preserves compatibility for v0.1.0 callers, but differs from `builtins.open()` binary semantics. Docs and docstrings warn about this explicitly. True raw `bytes` mode or rejecting binary mode strings is deferred to v0.2.
+- **Context:** `polyopen` was built primarily to stream compressed files (logs, CSV, JSONL, and binary records) line-by-line or in chunks across local and remote locations. Earlier versions accepted `'rb'`, `'wb'`, and `'ab'` as aliases for UTF-8 text mode, which contradicted Python's `builtins.open()` semantics and prevented handling non-UTF-8 binary streams.
+- **Decision:** Match standard Python mode semantics before the initial v0.1.0 release: `'r'`/`'rt'`, `'w'`/`'wt'`, and `'a'`/`'at'` (and `binary=False` on `PolyReader`/`PolyWriter`) operate on UTF-8 `str` (`encoding == 'utf-8'`), while `'rb'`, `'wb'`, and `'ab'` (and `binary=True`) operate on raw `bytes` (`encoding is None`). Wrap binary `.zst` (`ZstdDecompressionReader`, whose `readline()` raises `io.UnsupportedOperation`) and plain binary network streams in `io.BufferedReader` so line-by-line iteration works uniformly across every codec and transport. Implement binary `PolyWriter.writelines()` by calling `write()` per item so `ZstdCompressionWriter` matches stdlib binary writers.
+- **Consequences:** Callers get predictable `builtins.open()` behavior in both text and binary modes without breaking default text usage (`'r'`, `'w'`, `'a'`).
 
 ## ADR-002: Reject cloud object stores and container archives explicitly (2026-11-21)
 
@@ -25,19 +25,19 @@ This document records the rationale and trade-offs behind load-bearing design ch
 ## ADR-004: Codec defaults via `compresslevel=None` (2026-11-21)
 
 - **Context:** Earlier code hardcoded extreme compression levels (`zstd` level 22, `lzma` preset 9), which consumed high memory and CPU on writes.
-- **Decision:** Accept `compresslevel: Optional[int] = None` and omit the keyword argument when `None` so each library uses its own balanced default (`zstd` 3, `lzma` 6, `bz2` 9, `gzip` 9). Validate `compresslevel` type/range and import codecs before backup rotation so invalid inputs never displace existing files.
+- **Decision:** Accept `compresslevel: Optional[int] = None` and omit the keyword argument when `None` so each library uses its own balanced default (`zstd` 3, `lzma` 6, `bz2` 9, `gzip` 9). Validate `compresslevel` type/range and import codecs before creating any `.bu` backup so invalid inputs never displace existing files.
 - **Consequences:** Fast, low-memory default writes with explicit caller tuning when higher compression is needed.
 
-## ADR-005: Fast-path, bounded, atomic local backup rotation (2026-11-21, hardened 2026-11-25)
+## ADR-005: Fast-path, bounded, atomic local sequential `.bu` backups (2026-11-21, hardened 2026-11-25)
 
 - **Context:** Probing `.001.bu`, `.002.bu`, ... sequentially becomes O(N) on directories with hundreds of backups and causes high RTT overhead over SFTP/FTP. Naive `os.rename` can silently overwrite existing backups or rename an existing directory on Linux `EPERM`.
-- **Decision:** Check `<path>.001.bu` first in O(1); if occupied, scan the parent directory once (`os.scandir` locally, `listdir` remotely), select the lowest free 3-digit ASCII slot up to `.999.bu`, and fall back to nanosecond timestamps (`time.time_ns()`). Locally, reject existing directories (`IsADirectoryError`), use `os.link()` + `os.unlink()`, and check `os.path.lexists` before any rename fallback. Remotely, SFTP retries `rename()` collisions across free slots.
-- **Consequences:** O(1) common case and single-scan scaling up to 999 backups without risking directory renames or broken-symlink overwrites. Local rotation remains designed for non-concurrent writers; FTP rename atomicity depends on the remote server.
+- **Decision:** Check `<path>.001.bu` first in O(1); if occupied, scan the parent directory once (`os.scandir` locally, `listdir` remotely), select the lowest free 3-digit ASCII slot up to `.999.bu`, and fall back to nanosecond timestamps (`time.time_ns()`). Locally, reject existing directories (`IsADirectoryError`), use `os.link()` + `os.unlink()`, and check `os.path.lexists` before any rename fallback. Remotely, SFTP retries `rename()` collisions across free slots. Existing `.bu` files are never pruned or rotated out.
+- **Consequences:** O(1) common case and single-scan scaling up to 999 backups without risking directory renames or broken-symlink overwrites. Local sequential backups remain designed for non-concurrent writers; FTP rename atomicity depends on the remote server.
 
 ## ADR-006: SSH host-key verification and SFTP prefetch/pipelining (2026-11-21, documented 2026-11-25)
 
 - **Context:** Remote SFTP throughput degrades without pipelining and prefetch, while `AutoAddPolicy()` would expose SSH connections to Man-in-the-Middle attacks.
-- **Decision:** Always call `client.load_system_host_keys()` and preserve Paramiko's default `RejectPolicy`. Enable `set_pipelined(True)` on SFTP writes (always binary mode wrapped in UTF-8 `io.TextIOWrapper`), cache `stat().st_size` once, and call `prefetch(file_size, max_concurrent_requests=64)` when file size is known (Paramiko `<3.3` falls back to `prefetch(file_size)`).
+- **Decision:** Always call `client.load_system_host_keys()` and preserve Paramiko's default `RejectPolicy`. Enable `set_pipelined(True)` on SFTP writes (always binary SFTP handles wrapped in `_BinaryStreamAdapter`, plus `io.TextIOWrapper` in text mode), cache `stat().st_size` once, and call `prefetch(file_size, max_concurrent_requests=64)` when file size is known (Paramiko `<3.3` falls back to `prefetch(file_size)`).
 - **Consequences:** High SFTP throughput with strict host-key verification. Known trade-off: Paramiko stores prefetched chunks in RAM until consumed; an opt-in/bounded prefetch parameter is deferred to v0.2.
 
 ## ADR-007: Thread-local cookie-free HTTP session and `Accept-Encoding` handling (2026-11-21, hardened 2026-11-25)
