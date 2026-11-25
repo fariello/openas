@@ -14,25 +14,91 @@ import zstandard as zstd
 from polyopen import polyopen, PolyReader, PolyWriter, UnsupportedArchiveError
 from polyopen.polyopen import _get_http_session, _normalized_path
 
-@patch('paramiko.SSHClient')
-def test_ssh_routing(mock_ssh):
+def test_ssh_routing():
     """
-    Assert polyopen intercepts ssh:// streams and spins up the paramount infrastructure
-    without triggering local file bindings.
+    was3ig E-02: Enforce Paramiko RejectPolicy contract for both PolyReader and PolyWriter
+    (load_system_host_keys called, set_missing_host_key_policy never called) and verify real
+    paramiko.SSHClient defaults to RejectPolicy.
     """
-    mock_instance = MagicMock()
-    mock_ssh.return_value = mock_instance
-    
-    # We mock open_sftp to intercept and succeed
-    mock_sftp = MagicMock()
-    mock_instance.open_sftp.return_value = mock_sftp
+    import paramiko
 
-    with polyopen("ssh://user:pass@host/file.txt", 'w', backup=False) as writer:
-        writer.write("stub")
-        
-    assert mock_ssh.called
-    assert mock_instance.connect.called
-    assert mock_instance.open_sftp.called
+    real_client = paramiko.SSHClient()
+    try:
+        assert isinstance(real_client._policy, paramiko.RejectPolicy)
+    finally:
+        real_client.close()
+
+    with patch('paramiko.SSHClient') as mock_ssh:
+        # 1. PolyReader._wrap_ssh
+        reader_client = MagicMock()
+        reader_sftp = MagicMock()
+        reader_client.open_sftp.return_value = reader_sftp
+        reader_sftp.file.return_value = io.BytesIO(b"hello ssh\n")
+        mock_ssh.return_value = reader_client
+
+        with polyopen("ssh://user:pass@host/file.txt", 'r') as reader:
+            assert reader.read() == "hello ssh\n"
+
+        reader_client.load_system_host_keys.assert_called_once()
+        reader_client.set_missing_host_key_policy.assert_not_called()
+        reader_client.connect.assert_called_once()
+        reader_client.open_sftp.assert_called_once()
+        reader_sftp.close.assert_called_once()
+        reader_client.close.assert_called_once()
+
+        # 2. PolyWriter._wrap_ssh
+        writer_client = MagicMock()
+        writer_sftp = MagicMock()
+        writer_buf = _InspectableBytesIO()
+        writer_client.open_sftp.return_value = writer_sftp
+        writer_sftp.file.return_value = writer_buf
+        mock_ssh.return_value = writer_client
+
+        with polyopen("ssh://user:pass@host/file.txt", 'w', backup=False) as writer:
+            writer.write("stub\n")
+
+        writer_client.load_system_host_keys.assert_called_once()
+        writer_client.set_missing_host_key_policy.assert_not_called()
+        writer_client.connect.assert_called_once()
+        writer_client.open_sftp.assert_called_once()
+        assert writer_buf.saved_bytes == b"stub\n"
+        assert writer_buf.closed
+        writer_sftp.close.assert_called_once()
+        writer_client.close.assert_called_once()
+
+
+@patch('paramiko.SSHClient')
+def test_sftp_backup_five_collision_retry_exhaustion_closes_handles(mock_ssh):
+    """was3ig E-02: Exhausting the 5-retry SFTP backup collision loop propagates OSError and closes handles."""
+    import stat
+
+    client = MagicMock()
+    sftp = MagicMock()
+    mock_ssh.return_value = client
+    client.open_sftp.return_value = sftp
+
+    file_stat = MagicMock()
+    file_stat.st_mode = stat.S_IFREG | 0o644
+    sftp.stat.side_effect = lambda p: file_stat
+    sftp.listdir.return_value = ["file.txt", "file.txt.001.bu"]
+
+    rename_targets = []
+
+    def collide_always(src, dst):
+        rename_targets.append(dst)
+        raise OSError(f"collision #{len(rename_targets)} on {dst}")
+
+    sftp.rename.side_effect = collide_always
+
+    writer = PolyWriter("sftp://u:p@host/dir/file.txt")
+    with pytest.raises(OSError, match=r"collision #5 on /dir/file\.txt\.006\.bu"):
+        writer.open(backup=True)
+
+    assert rename_targets == [f"/dir/file.txt.{i:03d}.bu" for i in range(2, 7)]
+    sftp.file.assert_not_called()
+    assert writer.closed is True
+    assert sftp.close.call_count == 1
+    assert client.close.call_count == 1
 
 @patch('requests.Session.get')
 def test_http_routing(mock_get):
@@ -1384,3 +1450,304 @@ def test_sftp_bounded_readv_multi_window_early_break_truncation_and_compressed_t
     for op in (lambda: stream.read(), lambda: stream.read1(), lambda: stream.readinto(bytearray(1))):
         with pytest.raises(ValueError):
             op()
+
+
+def test_http_real_server_all_formats_text_and_binary():
+    """was3ig E-01: Real loopback ThreadingHTTPServer verifies all 5 formats in 'r' and 'rb' modes."""
+    text_payload = "server line 1 café\nserver line 2 日本語\n"
+    text_bytes = text_payload.encode("utf-8")
+    bin_payload = b"\x00\xff\xfe\x80bin-line-1\n\xde\xad\xbe\xefbin-line-2\n"
+
+    def _encode(raw: bytes, ext: str) -> bytes:
+        if ext == ".gz":
+            return gzip.compress(raw)
+        if ext == ".bz2":
+            return bz2.compress(raw)
+        if ext == ".xz":
+            return lzma.compress(raw)
+        if ext == ".zst":
+            return zstd.ZstdCompressor().compress(raw)
+        return raw
+
+    routes = {}
+    for ext in (".txt", ".gz", ".bz2", ".xz", ".zst"):
+        routes[f"/text{ext}"] = _encode(text_bytes, ext)
+        routes[f"/bin{ext}"] = _encode(bin_payload, ext)
+
+    seen_accept = {}
+
+    class MultiFormatHandler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            seen_accept[self.path] = self.headers.get("Accept-Encoding")
+            body = routes[self.path]
+            self.send_response(200)
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, format, *args):  # noqa: A002
+            return
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), MultiFormatHandler)
+    port = server.server_address[1]
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        for ext in (".txt", ".gz", ".bz2", ".xz", ".zst"):
+            text_url = f"http://127.0.0.1:{port}/text{ext}"
+            with polyopen(text_url, "r", show_progress=True, timeout=5.0) as r:
+                pbar = r._progress
+                assert pbar is not None
+                assert pbar.total == len(routes[f"/text{ext}"])
+                assert r.read() == text_payload
+            assert r.closed is True
+            assert r._response is None
+            assert pbar.n == len(routes[f"/text{ext}"])
+
+            bin_url = f"http://127.0.0.1:{port}/bin{ext}"
+            with polyopen(bin_url, "rb", show_progress=True, timeout=5.0) as r:
+                pbar = r._progress
+                assert pbar is not None
+                assert pbar.total == len(routes[f"/bin{ext}"])
+                assert r.read() == bin_payload
+            assert r.closed is True
+            assert r._response is None
+            assert pbar.n == len(routes[f"/bin{ext}"])
+
+            if ext == ".txt":
+                assert seen_accept[f"/text{ext}"] != "identity"
+            else:
+                assert seen_accept[f"/text{ext}"] == "identity"
+                assert seen_accept[f"/bin{ext}"] == "identity"
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+def test_http_real_server_http11_chunked_gzip_encoding_and_404():
+    """was3ig E-01: HTTP/1.1 handler tests chunked transfer, Content-Encoding: gzip, and 404 cleanup."""
+    chunked_parts = ["chunk-one café\n".encode("utf-8"), b"chunk-two\n", b"chunk-three\n"]
+    chunked_full = b"".join(chunked_parts)
+    encoded_plain = "gzip-encoded line 1 café\ngzip-encoded line 2\n"
+    encoded_gz = gzip.compress(encoded_plain.encode("utf-8"))
+
+    class Http11Handler(http.server.BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def do_GET(self):
+            if self.path == "/chunked.txt":
+                self.send_response(200)
+                self.send_header("Content-Type", "text/plain; charset=utf-8")
+                self.send_header("Transfer-Encoding", "chunked")
+                self.send_header("Connection", "close")
+                self.end_headers()
+                for part in chunked_parts:
+                    self.wfile.write(f"{len(part):x}\r\n".encode("ascii") + part + b"\r\n")
+                self.wfile.write(b"0\r\n\r\n")
+                self.close_connection = True
+            elif self.path == "/encoded.txt":
+                self.send_response(200)
+                self.send_header("Content-Type", "text/plain; charset=utf-8")
+                self.send_header("Content-Encoding", "gzip")
+                self.send_header("Content-Length", str(len(encoded_gz)))
+                self.send_header("Connection", "close")
+                self.end_headers()
+                self.wfile.write(encoded_gz)
+                self.close_connection = True
+            else:
+                body = b"not found"
+                self.send_response(404)
+                self.send_header("Content-Type", "text/plain")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Connection", "close")
+                self.end_headers()
+                self.wfile.write(body)
+                self.close_connection = True
+
+        def log_message(self, format, *args):  # noqa: A002
+            return
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Http11Handler)
+    port = server.server_address[1]
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        # 1. Transfer-Encoding: chunked (total=None) in both 'r' and 'rb'
+        for mode, expected in (("r", chunked_full.decode("utf-8")), ("rb", chunked_full)):
+            with polyopen(f"http://127.0.0.1:{port}/chunked.txt", mode, show_progress=True, timeout=5.0) as r:
+                pbar = r._progress
+                assert pbar is not None
+                assert pbar.total is None
+                assert r.read() == expected
+            assert r.closed is True
+            assert r._response is None
+            assert pbar.n == len(chunked_full)
+
+        # 2. Content-Encoding: gzip on plain .txt (decode_content=True, total=None) in 'r' and 'rb'
+        for mode, expected in (("r", encoded_plain), ("rb", encoded_plain.encode("utf-8"))):
+            with polyopen(f"http://127.0.0.1:{port}/encoded.txt", mode, show_progress=True, timeout=5.0) as r:
+                pbar = r._progress
+                assert r._response is not None
+                assert r._response.raw.decode_content is True
+                assert pbar is not None
+                assert pbar.total is None
+                assert r.read() == expected
+            assert r.closed is True
+            assert r._response is None
+
+        # 3. HTTP 404 cleanup: HTTPError raised, reader closed, _response None, response.close() called
+        closed_statuses = []
+        orig_resp_close = requests.Response.close
+
+        def spy_resp_close(self):
+            closed_statuses.append(self.status_code)
+            return orig_resp_close(self)
+
+        with patch.object(requests.Response, "close", spy_resp_close):
+            reader_404 = PolyReader(f"http://127.0.0.1:{port}/missing.txt", timeout=5.0)
+            with pytest.raises(requests.HTTPError):
+                reader_404.open()
+            assert reader_404.closed is True
+            assert reader_404._response is None
+            assert 404 in closed_statuses
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+def test_close_registered_http_sessions_isolated_and_exception_safe(monkeypatch):
+    """was3ig E-01: _close_registered_http_sessions closes all registered sessions despite close() errors without touching live session."""
+    import sys
+
+    poly_mod = sys.modules["polyopen.polyopen"]
+
+    live_session = poly_mod._get_http_session()
+
+    class FakeSession:
+        def __init__(self, *, should_raise: bool = False):
+            self.should_raise = should_raise
+            self.close_calls = 0
+            self.closed = False
+
+        def close(self):
+            self.close_calls += 1
+            if self.should_raise:
+                raise RuntimeError("session close failure")
+            self.closed = True
+
+    s1 = FakeSession()
+    s2 = FakeSession(should_raise=True)
+    s3 = FakeSession()
+
+    monkeypatch.setattr(poly_mod, "_http_sessions_registry", [s1, s2, s3])
+    poly_mod._close_registered_http_sessions()
+
+    assert s1.closed is True and s1.close_calls == 1
+    assert s2.close_calls == 1 and s2.closed is False
+    assert s3.closed is True and s3.close_calls == 1
+    assert poly_mod._http_sessions_registry == []
+    assert poly_mod._get_http_session() is live_session
+
+
+def test_keyboard_interrupt_mid_open_cleans_up_remote_handles():
+    """was3ig E-03: KeyboardInterrupt (BaseException) mid-open closes acquired HTTP, FTP, and SFTP handles."""
+    # 1. PolyReader HTTP: KeyboardInterrupt in raise_for_status() and in post-wrap _get_file_size()
+    with patch("requests.Session.get") as mock_get:
+        resp1 = MagicMock()
+        resp1.raise_for_status.side_effect = KeyboardInterrupt("ctrl-c status")
+        mock_get.return_value = resp1
+        r_http1 = PolyReader("https://example.com/a.txt")
+        with pytest.raises(KeyboardInterrupt, match="ctrl-c status"):
+            r_http1.open()
+        assert resp1.close.call_count == 1
+        assert r_http1.closed is True
+        assert r_http1._response is None
+
+        resp2 = MagicMock()
+        resp2.headers = {"Content-Length": "5"}
+        resp2.raw = io.BytesIO(b"data\n")
+        mock_get.return_value = resp2
+        r_http2 = PolyReader("https://example.com/b.txt", show_progress=True)
+        with patch.object(r_http2, "_get_file_size", side_effect=KeyboardInterrupt("ctrl-c progress")):
+            with pytest.raises(KeyboardInterrupt, match="ctrl-c progress"):
+                r_http2.open()
+        assert resp2.raw.closed
+        assert resp2.close.call_count == 1
+        assert r_http2.closed is True
+        assert r_http2._response is None
+
+    # 2. PolyReader FTP: KeyboardInterrupt after FTPHost and FTPFile are acquired
+    with patch("ftputil.FTPHost") as mock_ftp:
+        host = MagicMock()
+        raw_ftp = _StrictFTPFileProxy(b"ftp-data\n")
+        host.open.return_value = raw_ftp
+        mock_ftp.return_value = host
+        r_ftp = PolyReader("ftp://u:p@host/dir/file.txt", show_progress=True)
+        with patch.object(r_ftp, "_get_file_size", side_effect=KeyboardInterrupt("ctrl-c ftp reader")):
+            with pytest.raises(KeyboardInterrupt, match="ctrl-c ftp reader"):
+                r_ftp.open()
+        assert raw_ftp.closed is True
+        assert host.close.call_count == 1
+        assert r_ftp.closed is True
+        assert r_ftp._ftp is None
+        assert r_ftp._raw_fh is None
+
+    # 3. PolyReader SFTP: KeyboardInterrupt after client, sftp, and sftp_file are acquired
+    with patch("paramiko.SSHClient") as mock_ssh:
+        client = MagicMock()
+        sftp = MagicMock()
+        sftp_file = MagicMock()
+        sftp_file.stat.side_effect = KeyboardInterrupt("ctrl-c sftp reader")
+        mock_ssh.return_value = client
+        client.open_sftp.return_value = sftp
+        sftp.file.return_value = sftp_file
+        r_sftp = PolyReader("sftp://u:p@host/dir/file.txt")
+        with pytest.raises(KeyboardInterrupt, match="ctrl-c sftp reader"):
+            r_sftp.open()
+        assert sftp_file.close.call_count == 1
+        assert sftp.close.call_count == 1
+        assert client.close.call_count == 1
+        assert r_sftp.closed is True
+        assert r_sftp._sftp_file is None
+        assert r_sftp._sftp_client is None
+        assert r_sftp._ssh_client is None
+
+    # 4. PolyWriter FTP: KeyboardInterrupt after FTPHost and FTPFile are acquired
+    with patch("ftputil.FTPHost") as mock_ftp:
+        host = MagicMock()
+        raw_ftp = _StrictFTPFileProxy()
+        host.open.return_value = raw_ftp
+        mock_ftp.return_value = host
+        w_ftp = PolyWriter("ftp://u:p@host/dir/out.gz")
+        with patch("gzip.open", side_effect=KeyboardInterrupt("ctrl-c ftp writer")):
+            with pytest.raises(KeyboardInterrupt, match="ctrl-c ftp writer"):
+                w_ftp.open(backup=False)
+        assert raw_ftp.closed is True
+        assert host.close.call_count == 1
+        assert w_ftp.closed is True
+        assert w_ftp._ftp is None
+        assert w_ftp._raw_fh is None
+
+    # 5. PolyWriter SFTP: KeyboardInterrupt after client, sftp, and sftp_file are acquired
+    with patch("paramiko.SSHClient") as mock_ssh:
+        client = MagicMock()
+        sftp = MagicMock()
+        sftp_file = MagicMock()
+        sftp_file.set_pipelined.side_effect = KeyboardInterrupt("ctrl-c sftp writer")
+        mock_ssh.return_value = client
+        client.open_sftp.return_value = sftp
+        sftp.file.return_value = sftp_file
+        w_sftp = PolyWriter("sftp://u:p@host/dir/out.txt")
+        with pytest.raises(KeyboardInterrupt, match="ctrl-c sftp writer"):
+            w_sftp.open(backup=False)
+        assert sftp_file.close.call_count == 1
+        assert sftp.close.call_count == 1
+        assert client.close.call_count == 1
+        assert w_sftp.closed is True
+        assert w_sftp._sftp_file is None
+        assert w_sftp._sftp_client is None
+        assert w_sftp._ssh_client is None

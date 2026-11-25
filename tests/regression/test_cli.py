@@ -64,7 +64,7 @@ def test_cli_illegal_modes():
 def test_cli_read_execution(tmp_path):
     # Establish a local target
     target = str(tmp_path / "mock.txt")
-    with open(target, 'w') as f:
+    with open(target, 'w', encoding='utf-8') as f:
         f.write("A line.\nAnother line.\n")
 
     result = run_cli("--read", target)
@@ -75,7 +75,7 @@ def test_cli_read_execution(tmp_path):
 
 def test_cli_write_execution(tmp_path):
     source = str(tmp_path / "mock.txt")
-    with open(source, 'w') as f:
+    with open(source, 'w', encoding='utf-8') as f:
         f.write("Data1\nData2\n")
 
     target = str(tmp_path / "write_mock.txt")
@@ -86,7 +86,7 @@ def test_cli_write_execution(tmp_path):
     assert result.returncode == 0
     assert os.path.exists(target)
     
-    with open(target, 'r') as f:
+    with open(target, 'r', encoding='utf-8') as f:
         data = f.read()
     assert "Data1\nData2\n" == data
 
@@ -97,7 +97,7 @@ def test_cli_input_file_flag_utf8_bytes_and_errors(tmp_path):
     target = tmp_path / "utf8_dst.txt"
     content = "café 日本語\n"
     expected_bytes = len(content.encode("utf-8"))
-    source.write_text(content, encoding="utf-8")
+    source.write_bytes(content.encode("utf-8"))
 
     res_ok = subprocess.run(
         [sys.executable, "-m", "polyopen.polyopen", "--write", "-i", str(source), str(target)],
@@ -161,8 +161,8 @@ def test_cli_write_broadcast_single_read_identical_outputs_and_messages(tmp_path
     payload = "alpha line\ncafé 日本語\nomega line\n"
     expected_bytes = len(payload.encode("utf-8"))
     src = tmp_path / "source.txt.gz"
-    with gzip.open(src, "wt", encoding="utf-8") as fh:
-        fh.write(payload)
+    with gzip.open(src, "wb") as fh:
+        fh.write(payload.encode("utf-8"))
 
     dst_txt = tmp_path / "out1.txt"
     dst_gz = tmp_path / "out2.txt.gz"
@@ -496,3 +496,106 @@ def test_cli_binary_crlf_no_trailing_newline_and_help(tmp_path):
         assert res_w.returncode == 0, res_w.stderr
         assert f"{expected_lines} lines / {len(content):.1f}B" in res_w.stdout
         assert dst.read_bytes() == content
+
+
+@pytest.mark.parametrize(
+    "archive_suffix",
+    [
+        "bad.zip",
+        "bad.tar.gz",
+        "sftp://u@h/a%2Ezip",
+    ],
+)
+def test_cli_write_archive_prevalidation_leaves_earlier_outputs_untouched(tmp_path, archive_suffix):
+    """was3ig E-05: CLI --write rejects archive targets before creating, modifying, or backing up earlier outputs."""
+    src = tmp_path / "source.txt"
+    src.write_bytes(b"fresh payload\n")
+
+    archive_dst = archive_suffix if "://" in archive_suffix else str(tmp_path / archive_suffix)
+
+    # 1. Absent earlier output is never created
+    absent_dst = tmp_path / "absent_first.txt"
+    res_absent = subprocess.run(
+        [sys.executable, "-m", "polyopen", "--write", str(src), str(absent_dst), archive_dst],
+        capture_output=True,
+        text=True,
+        env=_cli_env(),
+    )
+    assert res_absent.returncode != 0
+    assert "UnsupportedArchiveError" in res_absent.stderr
+    assert not absent_dst.exists()
+    assert not (tmp_path / "absent_first.txt.001.bu").exists()
+
+    # 2. Pre-existing earlier output is neither modified nor backed up
+    existing_dst = tmp_path / "existing_first.txt"
+    existing_dst.write_bytes(b"original content\n")
+    res_existing = subprocess.run(
+        [sys.executable, "-m", "polyopen", "--write", str(src), str(existing_dst), archive_dst],
+        capture_output=True,
+        text=True,
+        env=_cli_env(),
+    )
+    assert res_existing.returncode != 0
+    assert "UnsupportedArchiveError" in res_existing.stderr
+    assert existing_dst.read_bytes() == b"original content\n"
+    assert not (tmp_path / "existing_first.txt.001.bu").exists()
+
+
+def test_cli_write_missing_source_preserves_existing_destination_without_backup(tmp_path):
+    """was3ig E-05: CLI --write with a missing source leaves pre-existing outputs untouched with no .001.bu."""
+    missing_src = tmp_path / "does_not_exist.txt"
+    existing_dst = tmp_path / "keep_me.txt"
+    existing_dst.write_bytes(b"do not overwrite\n")
+
+    res = subprocess.run(
+        [sys.executable, "-m", "polyopen", "--write", str(missing_src), str(existing_dst)],
+        capture_output=True,
+        text=True,
+        env=_cli_env(),
+    )
+    assert res.returncode != 0
+    assert existing_dst.read_bytes() == b"do not overwrite\n"
+    assert not (tmp_path / "keep_me.txt.001.bu").exists()
+
+
+@pytest.mark.parametrize("ext", [".gz", ".bz2", ".xz", ".zst"])
+def test_cli_compressed_formats_subprocess_roundtrip(tmp_path, ext):
+    """was3ig E-05: CLI --write and --read handle .gz, .bz2, .xz, and .zst cleanly via subprocess."""
+    from polyopen import PolyReader
+
+    payload_bytes = "cli compressed line 1 café\nline 2 日本語\nline 3\n".encode("utf-8")
+    src = tmp_path / "plain_src.txt"
+    src.write_bytes(payload_bytes)
+    comp_dst = tmp_path / f"roundtrip{ext}"
+    plain_back = tmp_path / f"decoded_{ext.lstrip('.')}.txt"
+
+    res_write = subprocess.run(
+        [sys.executable, "-m", "polyopen", "--write", str(src), str(comp_dst)],
+        capture_output=True,
+        text=True,
+        env=_cli_env(),
+    )
+    assert res_write.returncode == 0, res_write.stderr
+    assert f"FINISHED Writing. {comp_dst}. 3 lines / {len(payload_bytes):.1f}B" in res_write.stdout
+    assert comp_dst.exists()
+
+    with PolyReader(comp_dst, binary=True) as r:
+        assert r.read() == payload_bytes
+
+    res_read = subprocess.run(
+        [sys.executable, "-m", "polyopen", "--read", str(comp_dst)],
+        capture_output=True,
+        text=True,
+        env=_cli_env(),
+    )
+    assert res_read.returncode == 0, res_read.stderr
+    assert f"FINISHED Reading. {comp_dst}. 3 lines / {len(payload_bytes):.1f}B" in res_read.stdout
+
+    res_decode = subprocess.run(
+        [sys.executable, "-m", "polyopen", "--write", str(comp_dst), str(plain_back)],
+        capture_output=True,
+        text=True,
+        env=_cli_env(),
+    )
+    assert res_decode.returncode == 0, res_decode.stderr
+    assert plain_back.read_bytes() == payload_bytes

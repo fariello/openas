@@ -61,5 +61,5 @@ This document records the rationale and trade-offs behind load-bearing design ch
 ## ADR-010: Minimum Python 3.9 to match PEP 639 build backend (2026-11-25)
 
 - **Context:** `pyproject.toml` uses PEP 639 `license` and `license-files` metadata requiring `setuptools>=77.0.0`, which dropped Python 3.8 support in `75.4.0`. Python 3.8 is also end-of-life.
-- **Decision:** Set `requires-python = ">=3.9"` in `pyproject.toml` and test across Python 3.9 through 3.13 in CI.
-- **Consequences:** Packaging metadata matches the actual build backend and supported Python versions.
+- **Decision:** Set `requires-python = ">=3.9"` in `pyproject.toml`, test Python 3.9 through 3.14 on `ubuntu-latest` plus Python 3.12 on `macos-latest` and `windows-latest` in CI, and run the built-wheel smoke test from a temporary directory outside `src/`.
+- **Consequences:** Packaging metadata matches the actual build backend and supported Python versions across Linux, macOS, and Windows.

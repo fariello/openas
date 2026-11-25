@@ -10,12 +10,22 @@ permissions:
 
 jobs:
   pytest:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.9", "3.10", "3.11", "3.12", "3.13"]
+        os: [ubuntu-latest]
+        python-version: ["3.9", "3.10", "3.11", "3.12", "3.13", "3.14"]
+        include:
+          - os: macos-latest
+            python-version: "3.12"
+          - os: windows-latest
+            python-version: "3.12"
     steps:
+      - name: Preserve LF line endings on Windows checkout
+        if: runner.os == 'Windows'
+        run: git config --global core.autocrlf false
+
       - name: Checkout
         uses: actions/checkout@v4
 
@@ -46,8 +56,63 @@ jobs:
       - name: Build wheel
         run: python -m pip wheel --no-deps --wheel-dir dist .
 
-      - name: Install built wheel and verify CLI entry points
+      - name: Install built wheel and run round-trip smoke test outside src/
         run: |
           python -m pip install dist/*.whl
+          CHECKOUT_SRC="$(pwd)/src"
+          SMOKE_DIR="$(mktemp -d)"
+          trap 'rm -rf "$SMOKE_DIR"' EXIT
+          cd "$SMOKE_DIR"
           polyopen --version
           python -m polyopen --help
+          CHECKOUT_SRC="$CHECKOUT_SRC" python - <<'PY'
+          import os
+          import pathlib
+          import subprocess
+          import sys
+          import polyopen
+          from polyopen import polyopen as open_stream
+
+          checkout_src = os.path.realpath(os.environ["CHECKOUT_SRC"])
+          imported_file = os.path.realpath(polyopen.__file__)
+          assert os.path.commonpath([checkout_src, imported_file]) != checkout_src, (
+              f"Expected installed wheel, got checkout source: {imported_file}"
+          )
+
+          work = pathlib.Path.cwd()
+          text_payload = "wheel smoke café\nline 2\n"
+          bin_payload = b"\x00\xff\xfe\x80wheel-bin\nsecond\n"
+
+          for ext in (".gz", ".zst"):
+              txt_path = work / f"smoke_text{ext}"
+              with open_stream(txt_path, "w", backup=False) as w:
+                  w.write(text_payload)
+              with open_stream(txt_path, "r") as r:
+                  assert r.read() == text_payload
+
+              bin_path = work / f"smoke_bin{ext}"
+              with open_stream(bin_path, "wb", backup=False) as w:
+                  w.write(bin_payload)
+              with open_stream(bin_path, "rb") as r:
+                  assert r.read() == bin_payload
+
+          cli_src = work / "smoke_text.gz"
+          cli_dst = work / "cli_out.zst"
+          res_r = subprocess.run(
+              [sys.executable, "-m", "polyopen", "--read", str(cli_src)],
+              capture_output=True,
+              text=True,
+              check=True,
+          )
+          assert "FINISHED Reading." in res_r.stdout
+          res_w = subprocess.run(
+              [sys.executable, "-m", "polyopen", "--write", str(cli_src), str(cli_dst)],
+              capture_output=True,
+              text=True,
+              check=True,
+          )
+          assert "FINISHED Writing." in res_w.stdout
+          with open_stream(cli_dst, "r") as r:
+              assert r.read() == text_payload
+          print(f"wheel-smoke OK: {imported_file}")
+          PY

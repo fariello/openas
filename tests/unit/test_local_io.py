@@ -88,21 +88,22 @@ def test_backup_rotation(tmp_path):
     backup_path = f"{filepath}.001.bu"
     assert os.path.exists(backup_path)
     
-    with open(backup_path, 'r') as f:
+    with open(backup_path, 'r', encoding='utf-8') as f:
         assert f.read() == "First.\n"
 
 @pytest.mark.parametrize("ext", [".gz", ".bz2", ".zst", ".xz"])
-def test_rigorous_line_chunking(tmp_path, ext):
+@pytest.mark.parametrize("binary", [False, True])
+def test_rigorous_line_chunking(tmp_path, ext, binary):
     """
     Rigorously assess how CPython buffers streaming algorithms across native memory constraints.
     Default IO chunks are routinely 131,072 bytes. This suite generates payloads explicitly 
-    engineered to collide cleanly across chunk frames.
+    engineered to collide cleanly across chunk frames in both text ('r'/'w') and binary ('rb'/'wb') modes.
     """
-    filepath = str(tmp_path / f"rigorous_chunk_test{ext}")
+    filepath = str(tmp_path / f"rigorous_chunk_test_{'bin' if binary else 'txt'}{ext}")
     
     # Constructing lines to meet explicit chunking edge logic
     CHUNK_SIZE = 131072
-    lines_to_write = [
+    text_lines = [
         "A short line with whitespace. \n", # 1. Less than chunk size
         "A" * int(CHUNK_SIZE * 0.8) + "\n", # Fill up end of chunk 1
         "B" * int(CHUNK_SIZE * 0.5) + " words \n", # 2. Starts in chunk 1, ends in chunk 2
@@ -116,18 +117,21 @@ def test_rigorous_line_chunking(tmp_path, ext):
         "F" * 200 + "\n",
         "G" * int(CHUNK_SIZE * 1.5) + " final line \n" # 4. Ends file spanning across final chunk
     ]
+    lines_to_write = [line.encode("utf-8") for line in text_lines] if binary else text_lines
     
-    with PolyWriter(filepath) as writer:
+    with PolyWriter(filepath, binary=binary) as writer:
         for line in lines_to_write:
             writer.write(line)
             
     read_data = []
-    with PolyReader(filepath) as reader:
+    with PolyReader(filepath, binary=binary) as reader:
         for line in reader:
              read_data.append(line)
              
     # Asserting exact identical retrieval
     assert len(read_data) == 12
+    expected_type = bytes if binary else str
+    assert all(isinstance(line, expected_type) for line in read_data)
     assert read_data == lines_to_write
 
 
@@ -347,7 +351,7 @@ def test_polyreader_progress_batched_full_and_early_break_flush(tmp_path):
     # Size: 7,500 * 10 = 75,000 bytes (not a multiple of 65,536).
     lines = [f"{i:09d}\n" for i in range(7500)]
     fp = tmp_path / "ascii_progress.txt"
-    fp.write_text("".join(lines), encoding="utf-8")
+    fp.write_bytes("".join(lines).encode("utf-8"))
     expected_size = os.path.getsize(fp)
     assert expected_size % 65536 != 0
 
@@ -654,7 +658,12 @@ def test_local_backup_rejects_directory_and_preserves_broken_symlink(tmp_path):
     src = tmp_path / "target.txt"
     src.write_text("v1\n", encoding="utf-8")
     broken_bu = tmp_path / "target.txt.001.bu"
-    broken_bu.symlink_to(tmp_path / "does_not_exist")
+    try:
+        broken_bu.symlink_to(tmp_path / "does_not_exist")
+    except OSError:
+        if os.name == "nt":
+            pytest.skip("Windows symlink creation requires Developer Mode or elevated privileges")
+        raise
     with patch("os.link", side_effect=OSError(errno.EOPNOTSUPP, "no hard links")):
         with polyopen(src, "w", backup=True) as w:
             w.write("v2\n")
@@ -693,7 +702,7 @@ def test_local_non_ascii_progress_and_mixed_readline_iter_no_double_count(tmp_pa
     fp = tmp_path / "utf8_prog.txt"
     lines = ["café 日本語 🚀\n" for _ in range(10)]
     payload = "".join(lines)
-    fp.write_text(payload, encoding="utf-8")
+    fp.write_bytes(payload.encode("utf-8"))
     expected_bytes = len(payload.encode("utf-8"))
     assert expected_bytes > len(payload)
 
@@ -775,11 +784,12 @@ def test_local_empty_no_newline_multimember_append_file_uri_and_colon_filename(t
     with polyopen(file_uri, "r") as r:
         assert r.read() == "uri line 1\nuri line 2\n"
 
-    colon_fp = tmp_path / f"2026:11:25{ext or '.txt'}"
-    with polyopen(colon_fp, "w", backup=False) as w:
-        w.write("colon ok\n")
-    with polyopen(colon_fp, "r") as r:
-        assert r.read() == "colon ok\n"
+    if os.name != "nt":
+        colon_fp = tmp_path / f"2026:11:25{ext or '.txt'}"
+        with polyopen(colon_fp, "w", backup=False) as w:
+            w.write("colon ok\n")
+        with polyopen(colon_fp, "r") as r:
+            assert r.read() == "colon ok\n"
 
 
 @pytest.mark.parametrize("ext", ["", ".gz", ".bz2", ".xz", ".zst"])
@@ -971,8 +981,8 @@ def test_compressed_progress_eof_before_close_early_break_and_mixed_reads(tmp_pa
     payload_text = "".join(text_lines)
     expected_lines = [line.encode("utf-8") for line in text_lines] if binary else text_lines
     fp = tmp_path / f"counted_prog{ext}"
-    with PolyWriter(fp).open(backup=False) as w:
-        w.write(payload_text)
+    with PolyWriter(fp, binary=True).open(backup=False) as w:
+        w.write(payload_text.encode("utf-8"))
     raw_size = fp.stat().st_size
 
     # 1. Full iteration hits exact raw_size AT EOF BEFORE close() and stays exact after close()
@@ -1057,8 +1067,8 @@ def test_polyreader_readlines_hints_binary_and_progress(tmp_path, ext, binary):
     lines = [f"line-{i:03d}-café-payload\n" for i in range(40)]
     expected = [line.encode("utf-8") for line in lines] if binary else lines
     fp = tmp_path / f"readlines_sample{ext}"
-    with PolyWriter(fp).open(backup=False) as w:
-        w.writelines(lines)
+    with PolyWriter(fp, binary=True).open(backup=False) as w:
+        w.writelines([line.encode("utf-8") for line in lines])
     raw_size = fp.stat().st_size
 
     # Unbounded hints (-1, 0, None) with show_progress=False and show_progress=True
@@ -1107,3 +1117,295 @@ def test_polyreader_readlines_hints_binary_and_progress(tmp_path, ext, binary):
             tail = r.readlines()
             assert tail == ["beta\n", "gamma\n"]
             assert pbar.n == len(crlf_raw)
+
+
+@pytest.mark.parametrize(
+    "ext,kind",
+    [
+        (".gz", "corrupt"),
+        (".gz", "truncated"),
+        (".bz2", "corrupt"),
+        (".bz2", "truncated"),
+        (".xz", "corrupt"),
+        (".xz", "truncated"),
+        (".zst", "corrupt"),
+        pytest.param(
+            ".zst",
+            "truncated",
+            marks=pytest.mark.xfail(
+                strict=True,
+                reason=(
+                    "Known upstream python-zstandard stream_reader() bug (backlog hxile6): truncated .zst frames "
+                    "silently return EOF instead of raising ZstdError or EOFError; requires "
+                    "out-of-scope production decompression change in src/polyopen/polyopen.py."
+                ),
+            ),
+        ),
+    ],
+)
+@pytest.mark.parametrize("mode", ["r", "rb"])
+@pytest.mark.parametrize("show_progress", [False, True])
+def test_corrupt_and_truncated_compressed_streams_raise_and_close_handles(
+    tmp_path, ext, kind, mode, show_progress
+):
+    """was3ig E-03: Corrupt and truncated compressed streams raise codec errors and close all handles cleanly."""
+    import zlib
+
+    sample_bytes = ("corrupt-or-truncated payload line 0123456789abcdef\n" * 200).encode("utf-8")
+    if kind == "corrupt":
+        wire = b"\x00\x01\x02not-valid-compressed-stream\xff\xfe" * 32
+    else:
+        if ext == ".gz":
+            full_wire = gzip.compress(sample_bytes)
+        elif ext == ".bz2":
+            full_wire = bz2.compress(sample_bytes)
+        elif ext == ".xz":
+            full_wire = lzma.compress(sample_bytes)
+        else:
+            full_wire = zstd.ZstdCompressor().compress(sample_bytes)
+        wire = full_wire[: max(10, len(full_wire) // 2)]
+
+    fp = tmp_path / f"{kind}_{mode}_{show_progress}{ext}"
+    fp.write_bytes(wire)
+
+    if ext == ".gz":
+        expected_exc = (OSError, EOFError, zlib.error)
+    elif ext == ".bz2":
+        expected_exc = (OSError, EOFError)
+    elif ext == ".xz":
+        expected_exc = (lzma.LZMAError, EOFError)
+    else:
+        expected_exc = (zstd.ZstdError, EOFError)
+
+    reader = PolyReader(fp, show_progress=show_progress, binary=(mode == "rb"))
+    try:
+        with pytest.raises(expected_exc):
+            with reader:
+                reader.read()
+    finally:
+        assert reader.closed is True
+        assert reader._fh is None
+        assert reader._raw_fh is None
+
+
+@pytest.mark.parametrize("mode", ["r", "rb"])
+@pytest.mark.parametrize("show_progress", [False, True])
+def test_truncated_zst_stream_closes_handles_without_resource_warning(tmp_path, mode, show_progress):
+    """was3ig E-03: Even before truncated .zst raises upstream, PolyReader closes every handle cleanly."""
+    sample_bytes = ("truncated zst payload line 0123456789abcdef\n" * 200).encode("utf-8")
+    full_wire = zstd.ZstdCompressor().compress(sample_bytes)
+    fp = tmp_path / f"truncated_cleanup_{mode}_{show_progress}.zst"
+    fp.write_bytes(full_wire[: max(10, len(full_wire) // 2)])
+
+    reader = PolyReader(fp, show_progress=show_progress, binary=(mode == "rb"))
+    with reader:
+        try:
+            reader.read()
+        except (zstd.ZstdError, EOFError):
+            pass
+    assert reader.closed is True
+    assert reader._fh is None
+    assert reader._raw_fh is None
+
+
+@pytest.mark.parametrize("ext", [".txt", ".gz", ".bz2", ".xz", ".zst"])
+def test_non_utf8_bytes_raise_unicode_decode_error_in_text_and_succeed_in_binary(tmp_path, ext):
+    """was3ig E-03: Non-UTF-8 bytes raise UnicodeDecodeError in 'r' mode (closing handles) and return raw bytes in 'rb'."""
+    raw_bytes = b"valid prefix\n\xff\xfe\x80\x81invalid-utf8\n"
+    fp = tmp_path / f"non_utf8{ext}"
+    with polyopen(fp, "wb", backup=False) as w:
+        w.write(raw_bytes)
+
+    reader = PolyReader(fp, show_progress=True)
+    with pytest.raises(UnicodeDecodeError):
+        with reader:
+            reader.read()
+    assert reader.closed is True
+    assert reader._fh is None
+    assert reader._raw_fh is None
+
+    with polyopen(fp, "rb") as r:
+        assert r.read() == raw_bytes
+
+
+def test_keyboard_interrupt_mid_open_cleans_up_local_handles(tmp_path):
+    """was3ig E-03: KeyboardInterrupt (BaseException) mid-open closes acquired local reader and writer handles."""
+    zst_fp = tmp_path / "ki_sample.zst"
+    with polyopen(zst_fp, "w", backup=False) as w:
+        w.write("hello interrupt\n")
+
+    # 1. PolyReader local open interrupted after _raw_fh and _fh are acquired
+    r_local = PolyReader(zst_fp, show_progress=True)
+    captured = {}
+
+    def interrupt_size():
+        captured["raw_fh"] = r_local._raw_fh
+        raise KeyboardInterrupt("ctrl-c local reader")
+
+    with patch.object(r_local, "_get_file_size", side_effect=interrupt_size):
+        with pytest.raises(KeyboardInterrupt, match="ctrl-c local reader"):
+            r_local.open()
+
+    assert captured["raw_fh"] is not None
+    assert captured["raw_fh"].closed is True
+    assert r_local.closed is True
+    assert r_local._fh is None
+    assert r_local._raw_fh is None
+
+    # 2. PolyWriter local open interrupted after _raw_fh is opened
+    out_zst = tmp_path / "ki_out.zst"
+    w_local = PolyWriter(out_zst)
+    captured_writer = {}
+
+    def interrupt_stream_writer(self, writer_fh, *args, **kwargs):
+        captured_writer["raw_fh"] = writer_fh
+        raise KeyboardInterrupt("ctrl-c local writer")
+
+    with patch.object(zstd.ZstdCompressor, "stream_writer", interrupt_stream_writer):
+        with pytest.raises(KeyboardInterrupt, match="ctrl-c local writer"):
+            w_local.open(backup=False)
+
+    assert captured_writer["raw_fh"] is not None
+    assert captured_writer["raw_fh"].closed is True
+    assert w_local.closed is True
+    assert w_local._fh is None
+    assert w_local._raw_fh is None
+
+
+def test_polyreader_close_flush_progress_error_alone_and_with_handle_close_error(tmp_path):
+    """was3ig E-03: PolyReader.close() closes every handle and propagates the primary _flush_progress error."""
+    fp = tmp_path / "flush_err.txt"
+    fp.write_bytes(b"line 1\nline 2\nline 3\n")
+
+    # 1. _flush_progress raises alone: all handles still close and primary flush error propagates
+    reader1 = PolyReader(fp, show_progress=True).open()
+    orig_fh1 = reader1._fh
+    pbar1 = reader1._progress
+    assert orig_fh1 is not None and pbar1 is not None
+    it1 = iter(reader1)
+    assert next(it1) == "line 1\n"
+    assert reader1._progress_pending > 0
+
+    pbar1_closed = []
+    orig_pbar1_close = pbar1.close
+
+    def spy_pbar1_close():
+        pbar1_closed.append(True)
+        return orig_pbar1_close()
+
+    pbar1.close = spy_pbar1_close
+    pbar1.update = MagicMock(side_effect=RuntimeError("primary flush boom"))
+
+    with pytest.raises(RuntimeError, match="primary flush boom"):
+        reader1.close()
+
+    assert orig_fh1.closed is True
+    assert pbar1_closed == [True]
+    assert reader1.closed is True
+    assert reader1._fh is None
+    assert reader1._progress is None
+
+    # 2. Both _flush_progress and a handle close raise: every handle still closes and primary flush error wins
+    reader2 = PolyReader(fp, show_progress=True).open()
+    orig_fh2 = reader2._fh
+    pbar2 = reader2._progress
+    assert orig_fh2 is not None and pbar2 is not None
+    it2 = iter(reader2)
+    assert next(it2) == "line 1\n"
+    assert reader2._progress_pending > 0
+
+    pbar2_closed = []
+    orig_pbar2_close = pbar2.close
+
+    def spy_pbar2_close():
+        pbar2_closed.append(True)
+        return orig_pbar2_close()
+
+    pbar2.close = spy_pbar2_close
+    pbar2.update = MagicMock(side_effect=RuntimeError("primary flush boom 2"))
+
+    failing_fh = MagicMock()
+    failing_fh.close.side_effect = OSError("secondary fh close boom")
+    sibling_ftp = MagicMock()
+    reader2._fh = failing_fh
+    reader2._ftp = sibling_ftp
+
+    try:
+        with pytest.raises(RuntimeError, match="primary flush boom 2"):
+            reader2.close()
+    finally:
+        if not orig_fh2.closed:
+            orig_fh2.close()
+
+    assert failing_fh.close.call_count == 1
+    assert sibling_ftp.close.call_count == 1
+    assert pbar2_closed == [True]
+    assert reader2.closed is True
+    assert reader2._fh is None
+    assert reader2._ftp is None
+    assert reader2._progress is None
+
+
+@pytest.mark.parametrize("ext", [".gz", ".bz2", ".xz", ".zst"])
+def test_streaming_memory_bound_o1_tracemalloc(tmp_path, ext):
+    """was3ig E-04: Line-by-line streaming over 16 MiB stays O(1) in Python heap across all four codecs."""
+    import gc
+    import tracemalloc
+
+    line_bytes = (b"0123456789abcdef" * 6) + b"ABCD\n"  # 101 bytes/line
+    lines_16m = (16 * 1024 * 1024 // len(line_bytes)) + 1  # > 16 MiB uncompressed
+    expected_bytes_16m = lines_16m * len(line_bytes)
+
+    fp16 = tmp_path / f"mem16m{ext}"
+    with PolyWriter(fp16, binary=True).open(backup=False) as w:
+        block = line_bytes * 1024
+        full_blocks, rem = divmod(lines_16m, 1024)
+        for _ in range(full_blocks):
+            w.write(block)
+        if rem:
+            w.write(line_bytes * rem)
+
+    fp32 = None
+    lines_32m = lines_16m * 2
+    expected_bytes_32m = lines_32m * len(line_bytes)
+    if ext == ".xz":
+        fp32 = tmp_path / "mem32m.xz"
+        with PolyWriter(fp32, binary=True).open(backup=False) as w:
+            block = line_bytes * 1024
+            full_blocks, rem = divmod(lines_32m, 1024)
+            for _ in range(full_blocks):
+                w.write(block)
+            if rem:
+                w.write(line_bytes * rem)
+
+    def _measure_peak(path, mode: str, expected_lines: int, expected_len: int) -> int:
+        # Warm up lazy codec imports before measuring streaming heap.
+        with polyopen(path, mode) as warm:
+            warm.readline()
+        gc.collect()
+        tracemalloc.start()
+        try:
+            count = 0
+            total_len = 0
+            with polyopen(path, mode) as reader:
+                for line in reader:
+                    count += 1
+                    total_len += len(line)
+            _, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+        assert count == expected_lines
+        assert total_len == expected_len
+        return peak
+
+    for mode in ("r", "rb"):
+        peak_16 = _measure_peak(fp16, mode, lines_16m, expected_bytes_16m)
+        if ext == ".xz":
+            assert peak_16 < 12 * 1024 * 1024, f"{ext} ({mode}) 16 MiB peak {peak_16} >= 12 MiB"
+            peak_32 = _measure_peak(fp32, mode, lines_32m, expected_bytes_32m)
+            delta = peak_32 - peak_16
+            assert delta < 512 * 1024, (
+                f"{ext} ({mode}) 32 MiB peak growth {delta} >= 512 KiB (16M={peak_16}, 32M={peak_32})"
+            )
+        else:
+            assert peak_16 < 2 * 1024 * 1024, f"{ext} ({mode}) 16 MiB peak {peak_16} >= 2 MiB"

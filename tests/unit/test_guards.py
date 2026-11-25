@@ -90,7 +90,7 @@ def test_archive_guards_comprehensive_and_redacted(tmp_path, name, mode):
         polyopen(tmp_path / name, mode)
 
     with pytest.raises(UnsupportedArchiveError):
-        polyopen(f"file://{(tmp_path / name).as_posix()}", mode)
+        polyopen((tmp_path / name).as_uri(), mode)
 
     with pytest.raises(UnsupportedArchiveError) as excinfo:
         polyopen(f"sftp://alice:topsecret@host/dir/{name}?token=xyz", mode)
@@ -181,26 +181,27 @@ def test_single_colon_local_paths_and_file_uris(tmp_path, monkeypatch):
     """iev841 E-01: Single-colon local filenames stay local while file:/// and file://localhost/ URIs resolve locally."""
     monkeypatch.chdir(tmp_path)
 
-    # Create a distinct plain report.txt to verify file:report.txt does not strip the file: prefix.
-    (tmp_path / "report.txt").write_text("plain report\n", encoding="utf-8")
+    if os.name != "nt":
+        # Create a distinct plain report.txt to verify file:report.txt does not strip the file: prefix.
+        (tmp_path / "report.txt").write_text("plain report\n", encoding="utf-8")
 
-    for name in ("file:report.txt", "http:2026.log", "sftp:notes.txt", "s3:dump.txt"):
-        payload = f"content for {name}\n"
-        with polyopen(name, "w", backup=False) as w:
-            w.write(payload)
-        assert (tmp_path / name).read_text(encoding="utf-8") == payload
-        with polyopen(name, "r") as r:
-            assert r.read() == payload
+        for name in ("file:report.txt", "http:2026.log", "sftp:notes.txt", "s3:dump.txt"):
+            payload = f"content for {name}\n"
+            with polyopen(name, "w", backup=False) as w:
+                w.write(payload)
+            assert (tmp_path / name).read_text(encoding="utf-8") == payload
+            with polyopen(name, "r") as r:
+                assert r.read() == payload
 
-    assert (tmp_path / "report.txt").read_text(encoding="utf-8") == "plain report\n"
+        assert (tmp_path / "report.txt").read_text(encoding="utf-8") == "plain report\n"
 
-    # A path containing '://' later in the path without starting with scheme:// stays local.
-    (tmp_path / "http:foo:").mkdir()
-    with polyopen("http:foo://bar.txt", "w", backup=False) as w:
-        w.write("nested colon slash\n")
-    assert (tmp_path / "http:foo:" / "bar.txt").read_text(encoding="utf-8") == "nested colon slash\n"
-    with polyopen("http:foo://bar.txt", "r") as r:
-        assert r.read() == "nested colon slash\n"
+        # A path containing '://' later in the path without starting with scheme:// stays local.
+        (tmp_path / "http:foo:").mkdir()
+        with polyopen("http:foo://bar.txt", "w", backup=False) as w:
+            w.write("nested colon slash\n")
+        assert (tmp_path / "http:foo:" / "bar.txt").read_text(encoding="utf-8") == "nested colon slash\n"
+        with polyopen("http:foo://bar.txt", "r") as r:
+            assert r.read() == "nested colon slash\n"
 
     # Valid local file:/// and file://localhost/ URIs continue to resolve to local paths.
     uri_target = tmp_path / "uri_ok.txt"
@@ -209,7 +210,7 @@ def test_single_colon_local_paths_and_file_uris(tmp_path, monkeypatch):
     with polyopen(uri_target.as_uri(), "r") as r:
         assert r.read() == "via file:/// uri\n"
 
-    localhost_uri = f"file://localhost{uri_target.as_posix()}"
+    localhost_uri = uri_target.as_uri().replace("file:///", "file://localhost/", 1)
     with polyopen(localhost_uri, "r") as r:
         assert r.read() == "via file:/// uri\n"
 
