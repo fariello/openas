@@ -1,54 +1,37 @@
 #!/usr/bin/env python3
 """
-polyfile - A Python module for versatile file handling.
+polyopen - Unified UTF-8 stream I/O across local files, remote protocols, and compression formats.
 
-This module provides utility classes and functions for reading and writing files of various formats
-(plain text, gzip, bz2, zst) and from various sources (local files, HTTP/HTTPS URLs, FTP, SSH, and SFTP servers).
+Supports plain text, `.gz`, `.bz2`, `.xz`, and `.zst` streams over local files (`file://` or plain
+paths), `http://` and `https://` (read-only), `ftp://` (read and write), and `ssh://` / `sftp://`
+(read, write, and append). All modes operate on UTF-8 text (`str`).
 
-Classes
--------
-- `FTPSessionWrapper`: A wrapper around `ftplib.FTP` for more flexible FTP session handling.
-- `PolyReader`: A class designed for reading files line-by-line with support for various
-   compression formats and remote sources.
-- `PolyWriter`: A class designed for writing files line-by-line with support for various
-   compression formats and remote destinations.
+Public API
+----------
+- `polyopen(filename, mode='r', backup=None, show_progress=False, compresslevel=None, timeout=None)`:
+  Unified factory returning an opened `PolyReader` or `PolyWriter`.
+- `PolyReader`: Stream reader supporting `read()`, `readline()`, `readlines()`, iteration, and
+  optional raw-byte `tqdm` progress bars.
+- `PolyWriter`: Stream writer supporting `write()`, `writelines()`, `flush()`, `compresslevel`,
+  and collision-safe `.NNN.bu` backup rotation on overwrite.
+- `PolyopenError`, `UnsupportedArchiveError`, `ReadOnlyProtocolError`, `UnsupportedProtocolError`:
+  Exception hierarchy for unsupported archive containers and protocols.
 
 Usage
 -----
-To read from a local gzipped file:
-    >>> with PolyReader("path/to/localfile.gz") as reader:
-    >>>     for line in reader:
-    >>>         process(line)
+Read a local or remote compressed stream:
+    >>> from polyopen import polyopen
+    >>> with polyopen("path/to/data.gz", "r") as reader:
+    ...     for line in reader:
+    ...         process(line)
 
-To read from a remote HTTP source:
-    >>> with PolyReader("http://example.com/data.txt") as reader:
-    >>>     for line in reader:
-    >>>         process(line)
+Read over SSH/SFTP using SSH keys (preferred over inline passwords):
+    >>> with polyopen("sftp://user@hostname/path/to/remote.zst", "r") as reader:
+    ...     content = reader.read()
 
-To read from a remote SSH server with zstd compression:
-    >>> with PolyReader("ssh://username:password@hostname/path/to/remote.zst") as reader:
-    >>>     for line in reader:
-    >>>         process(line)
-
-To write to a local bz2 compressed file:
-    >>> with PolyWriter("path/to/outputfile.bz2") as writer:
-    >>>     writer.write("Some data to write")
-
-To write to a remote SFTP server:
-    >>> with PolyWriter("sftp://username:password@hostname/path/to/outputfile.txt") as writer:
-    >>>     writer.write("Some data to write")
-
-To write to a local file with zstd compression:
-    >>> with PolyWriter("path/to/outputfile.zst") as writer:
-    >>>     writer.write("Some data to write")
-
-Dependencies
-------------
-- `paramiko`: For SSH/SFTP support.
-- `zstandard`: For zst file support.
-- `requests`: For HTTP/HTTPS support.
-- `ftputil`: For enhanced FTP utilities.
-- `tqdm`: For progress bars.
+Write a compressed file with automatic backup rotation:
+    >>> with polyopen("path/to/output.bz2", "w", compresslevel=6) as writer:
+    ...     writer.write("Hello, world!\\n")
 
 Author
 ------
@@ -65,16 +48,16 @@ __version__ = "0.1.0"
 __author__ = "Gabriele Fariello"
 
 class PolyopenError(Exception):
-    """Base exception for polyopen."""
+    """Base exception for all polyopen-specific errors."""
 
 class UnsupportedArchiveError(PolyopenError):
-    """Exception raised when an explicitly unsupported archive format is passed."""
+    """Raised when a container archive format (such as .zip or .tar.gz) is passed to polyopen."""
 
 class ReadOnlyProtocolError(PolyopenError):
-    """Exception raised when attempting to write/append to a read-only stream."""
+    """Raised when attempting to write or append to a read-only protocol (http:// or https://)."""
 
 class UnsupportedProtocolError(PolyopenError):
-    """Exception raised when an explicitly unsupported protocol is invoked."""
+    """Raised when an unsupported protocol or operation (such as s3:// or FTP append) is requested."""
 
 UNSUPPORTED_ARCHIVES = (
     '.zip', '.tar', '.tgz', '.rar', '.7z',
@@ -281,7 +264,7 @@ class _CountingByteStream:
 def format_bytes(num: float) -> str:
     """Format bytes to human readable sizes."""
     for unit in ['B', 'KB', 'MB', 'GB', 'TB', 'PB', 'EB', 'ZB']:
-        if num < 1024.0:
+        if abs(num) < 1024.0:
             return f"{num:3.1f}{unit}"
         num /= 1024.0
     return f"{num:3.1f}YB"
@@ -585,23 +568,56 @@ def __getattr__(name: str):
 
 class PolyReader:
     """
-    A class used to read files line by line, with support for gzip, bz2, xz, and zst compression formats,
-    as well as remote files over HTTP, HTTPS, FTP, SSH, and SFTP.
+    UTF-8 text stream reader supporting `.gz`, `.bz2`, `.xz`, and `.zst` decompression
+    over local files (`file://` or plain paths), HTTP/HTTPS, FTP, and SSH/SFTP.
 
     Attributes
     ----------
     filename : str
-        The name of the file to read.
+        Normalized path or URL to read.
     show_progress : bool
-        Whether to show a progress bar.
+        Whether to display a `tqdm` progress bar tracking raw bytes read.
+    timeout : float or None
+        Optional network timeout in seconds.
+    encoding : str
+        Always `'utf-8'`.
+    closed : bool
+        True when no underlying stream handle is open.
 
     Methods
     -------
-    open() -> 'PolyReader':
-        Opens the file for reading, decompressing it on the fly if necessary.
-    close():
-        Closes the file.
+    open() -> PolyReader
+        Open the stream for reading.
+    read(size=-1) -> str, readline(size=-1) -> str, readlines(hint=-1) -> list
+        Standard text stream read operations.
+    readable() -> bool, writable() -> bool, seekable() -> bool
+        Standard file-like capability predicates.
+    close() -> None
+        Idempotently close all acquired stream and transport handles.
     """
+
+    encoding = 'utf-8'
+
+    @property
+    def closed(self) -> bool:
+        """Return True if the reader is closed."""
+        return self._fh is None
+
+    def readable(self) -> bool:
+        """Return True (PolyReader is a read-only stream)."""
+        return True
+
+    def writable(self) -> bool:
+        """Return False (PolyReader is a read-only stream)."""
+        return False
+
+    def seekable(self) -> bool:
+        """Return False (PolyReader does not support random-access seeking)."""
+        return False
+
+    def __repr__(self) -> str:
+        state = "closed" if self.closed else "open"
+        return f"PolyReader({_redact_url(self.filename)!r}, state={state!r})"
 
     def __init__(
         self,
@@ -1245,23 +1261,55 @@ class PolyReader:
 
 class PolyWriter:
     """
-    A class used to write files line by line, with support for gzip, bz2, xz, and zst compression formats,
-    as well as remote files over FTP, SSH, and SFTP.
+    UTF-8 text stream writer supporting `.gz`, `.bz2`, `.xz`, and `.zst` compression
+    over local files (`file://` or plain paths), FTP (write only), and SSH/SFTP (write/append),
+    with automatic `.NNN.bu` backup rotation on overwrite.
 
     Attributes
     ----------
     filename : str
-        The name of the file to write to.
+        Normalized path or URL to write.
+    timeout : float or None
+        Optional network timeout in seconds.
+    encoding : str
+        Always `'utf-8'`.
+    closed : bool
+        True when no underlying stream handle is open.
 
     Methods
     -------
-    open(append: bool = False, backup: bool = True) -> 'PolyWriter':
-        Opens the file for writing, compressing it on the fly if necessary.
-    write(data):
-        Writes data to the file.
-    close():
-        Closes the file.
+    open(append=False, backup=True, compresslevel=None) -> PolyWriter
+        Open the stream for writing or appending.
+    write(data) -> int, writelines(lines) -> None, flush() -> None
+        Standard text stream write operations.
+    readable() -> bool, writable() -> bool, seekable() -> bool
+        Standard file-like capability predicates.
+    close() -> None
+        Idempotently close all acquired stream and transport handles.
     """
+
+    encoding = 'utf-8'
+
+    @property
+    def closed(self) -> bool:
+        """Return True if the writer is closed."""
+        return self._fh is None
+
+    def readable(self) -> bool:
+        """Return False (PolyWriter is a write-only stream)."""
+        return False
+
+    def writable(self) -> bool:
+        """Return True (PolyWriter is a write-only stream)."""
+        return True
+
+    def seekable(self) -> bool:
+        """Return False (PolyWriter does not support random-access seeking)."""
+        return False
+
+    def __repr__(self) -> str:
+        state = "closed" if self.closed else "open"
+        return f"PolyWriter({_redact_url(self.filename)!r}, state={state!r})"
 
     def __init__(
         self,
@@ -1814,33 +1862,58 @@ def polyopen(
     timeout: Optional[float] = None,
 ) -> Union[PolyReader, PolyWriter]:
     """
-    Open a file for reading or writing, determining the appropriate stream and compression 
-    automatically based on the file extension and protocol scheme.
+    Open a local or remote UTF-8 text stream with transparent compression.
 
-    This function mimics Python's built-in `open()`, returning a `PolyReader` or `PolyWriter`
-    context manager.
-    
+    Supports plain text, `.gz`, `.bz2`, `.xz`, and `.zst` over local paths (`file://` or implicit),
+    `http://`/`https://` (read-only), `ftp://` (read/write), and `ssh://`/`sftp://` (read/write/append).
+
+    Note: All modes operate on UTF-8 text (`str`). The `'rb'`, `'wb'`, and `'ab'` modes are accepted
+    as text-mode aliases for compatibility and do NOT return or accept raw `bytes`.
+
     Parameters
     ----------
     filename : str or os.PathLike
-        The path or URL to open.
+        Path or URL to open (extension matching is case-insensitive and ignores URL query strings).
     mode : str, optional
-        The mode in which the file is opened. 'r' for reading (default), 'w' for writing, 
-        and 'a' for appending.
+        One of `'r'`, `'rt'`, `'rb'` (read, default `'r'`), `'w'`, `'wt'`, `'wb'` (write/truncate),
+        or `'a'`, `'at'`, `'ab'` (append). All modes decode/encode UTF-8 text.
     backup : bool or None, optional
-        If True, creates a backup of the existing file before overwriting.
-        Defaults to True in write modes and False in append modes; passing backup=True
-        with an append mode raises ValueError.
+        Rotate an existing target to `.001.bu`..`.999.bu` (or nanosecond timestamp fallback) before
+        overwriting. Defaults to `True` in write modes and `False` in append modes; passing
+        `backup=True` with an append mode raises `ValueError`.
     show_progress : bool, optional
-        If True, displays a progress bar (read mode only). Default is False.
+        Display a `tqdm` progress bar tracking bytes read (read modes only; passing `True` in
+        write/append modes raises `NotImplementedError`). Default is `False`.
     compresslevel : int or None, optional
-        Optional compression level/preset forwarded to write/append modes (ignored in read
-        modes). When None, each compression library uses its own default.
-        
+        Optional compression level/preset forwarded to `.zst` (default 3), `.xz` (default 6),
+        `.bz2` (default 9), and `.gz` (default 9) writers; ignored in read modes.
+    timeout : float or None, optional
+        Optional network timeout in seconds for HTTP, FTP, and SSH/SFTP connections.
+
     Returns
     -------
     PolyReader or PolyWriter
-        The appropriate reader or writer context manager object.
+        An opened reader or writer context manager.
+
+    Raises
+    ------
+    UnsupportedArchiveError
+        If the target matches a container archive extension (e.g., `.zip`, `.tar`, `.tar.gz`, `.tar.xz`).
+    ReadOnlyProtocolError
+        If writing or appending to `http://` or `https://`.
+    UnsupportedProtocolError
+        If invoking an unsupported scheme (e.g., `s3://`, `gs://`, `az://`, `hdfs://`) or FTP append.
+    ValueError
+        If `mode` is unsupported, `backup=True` is combined with append, or `timeout` is non-positive.
+    NotImplementedError
+        If `show_progress=True` is passed with write or append modes.
+
+    Examples
+    --------
+    >>> with polyopen("data.gz", "w", compresslevel=6) as f:
+    ...     f.write("hello\\n")
+    >>> with polyopen("data.gz", "r") as f:
+    ...     print(f.read())
     """
     filename = os.fsdecode(filename)
     if show_progress and mode in ('w', 'wt', 'wb', 'a', 'at', 'ab'):
@@ -1869,10 +1942,11 @@ def polyopen(
 
 def main():
     """
-    Main function, mostly for testing.
+    CLI entry point for `polyopen` (`python -m polyopen` or `polyopen`).
 
-    This function serves as the entry point for the script, providing functionality to read from and write to files.
-    It supports various compression formats (plain text, gzipped, bzip2, zstandard) and remote sources (HTTP, HTTPS, FTP, SSH, SFTP).
+    Supports streaming reads (`--read`) with line/byte throughput reporting and single-pass
+    multi-target writes (`--write`) across plain text, `.gz`, `.bz2`, `.xz`, and `.zst`
+    files over local paths, HTTP/HTTPS, FTP, and SSH/SFTP.
     """
     def format_rate(rate: float, unit: str = "") -> str:
         """Format rate with standard units."""
@@ -1881,22 +1955,7 @@ def main():
         return f"{format_bytes(rate)}/s"
 
     def pinfo(preface: str, filename: str, line_count: int, bytes_count: int, seconds: float):
-        """
-        Print information about the file processing.
-
-        Parameters
-        ----------
-        preface : str
-            A preface string for the output message.
-        filename : str
-            The name of the file being processed.
-        line_count : int
-            The number of lines processed.
-        bytes_count : int
-            The number of bytes processed.
-        seconds : float
-            The total time taken for processing.
-        """
+        """Print processing summary statistics for a file."""
         rate = line_count / seconds if seconds > 0 else 0
         byterate = bytes_count / seconds if seconds > 0 else 0
         print(
@@ -1906,26 +1965,67 @@ def main():
             f"Total time: {seconds:0.2f} Secs."
         )
 
-    # Set up argument parser for command-line interface
     import argparse
-    parser = argparse.ArgumentParser(description='Test reading of plain text, gzipped, bzip2, or zstandard compressed files locally and remotely.')
+    parser = argparse.ArgumentParser(
+        prog="polyopen",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description=(
+            "Read or broadcast UTF-8 text streams across plain, .gz, .bz2, .xz, and .zst files "
+            "over local paths, HTTP/HTTPS, FTP, and SSH/SFTP."
+        ),
+        epilog=(
+            "Examples:\n"
+            "  python -m polyopen --read data.txt.gz https://example.com/log.zst\n"
+            "  python -m polyopen --write source.gz copy.txt backup.bz2\n"
+            "  python -m polyopen --write -i source.gz copy.txt sftp://user@host/dest.zst"
+        ),
+    )
 
-    # Add argument for input files to process
-    parser.add_argument('files', type=str, nargs='*', default=[], help='The input file(s) to process', metavar="file")
-    parser.add_argument('--input-file', '-i', type=str, default=None, help='Source input file for --write mode')
+    parser.add_argument(
+        '--version',
+        action='version',
+        version=f'%(prog)s {__version__}',
+    )
+    parser.add_argument(
+        'files',
+        type=str,
+        nargs='*',
+        default=[],
+        metavar="file",
+        help=(
+            "Target path(s) or URL(s): files to read with --read; SRC DEST... with --write "
+            "(or DEST... when --input-file/-i is given)."
+        ),
+    )
+    parser.add_argument(
+        '--input-file',
+        '-i',
+        type=str,
+        default=None,
+        help='Source path or URL for --write mode (makes all positional file arguments destinations).',
+    )
 
-    # Add mutually exclusive group for read/write modes
     group = parser.add_mutually_exclusive_group(required=True)
-    group.add_argument('--write', '-w', action='store_true', help='Write mode')
-    group.add_argument('--read', '-r', action='store_true', help='Read mode')
+    group.add_argument(
+        '--write',
+        '-w',
+        action='store_true',
+        help='Read one source stream and broadcast every line to one or more destinations.',
+    )
+    group.add_argument(
+        '--read',
+        '-r',
+        action='store_true',
+        help='Read one or more files sequentially and report line/byte throughput.',
+    )
 
-    # Parse the command-line arguments
     args = parser.parse_args()
 
-    # If read mode is specified
     if args.read:
         if args.input_file is not None:
             parser.error("--input-file/-i is only valid with --write")
+        if len(args.files) < 1:
+            parser.error("Read mode requires at least one file (e.g., 'python -m polyopen -r path/to/file.gz')")
         for input_file in args.files:
             print(f"TESTING reading {_redact_url(input_file)}")
             with PolyReader(input_file) as reader:
@@ -1935,10 +2035,8 @@ def main():
                 for line in reader:
                     line_count += 1
                     bytes_count += len(line.encode('utf-8'))
-                # Print final reading statistics
                 pinfo("FINISHED Reading.", _redact_url(reader.filename), line_count, bytes_count, time.monotonic() - t0)
     else:
-        # If write mode is specified
         if args.input_file is not None:
             if len(args.files) < 1:
                 parser.error("Write mode with --input-file/-i requires at least one destination file")
@@ -1949,6 +2047,17 @@ def main():
                 parser.error("Write mode requires at least one source file and one destination file (e.g., 'python -m polyopen -w src dest')")
             source_file = args.files[0]
             output_files = args.files[1:]
+
+        # Pre-validate destination schemes and archive guards before rotating/truncating earlier outputs.
+        for output_file in output_files:
+            resolved_out, parsed_out, scheme_out = _resolve_target(output_file)
+            if _normalized_path(resolved_out, parsed_out).endswith(UNSUPPORTED_ARCHIVES):
+                raise UnsupportedArchiveError(
+                    f"polyopen does not support writing or appending to archive formats safely: {_redact_url(output_file)}. "
+                    f"Use Python's zipfile or tarfile module instead."
+                )
+            if scheme_out in ('http', 'https'):
+                raise ReadOnlyProtocolError(f"Protocol '{parsed_out.scheme}' does not support write/append operations in polyopen.")
 
         import contextlib
         print(f"Will Read from {_redact_url(source_file)}")

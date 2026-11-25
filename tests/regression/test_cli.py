@@ -56,9 +56,10 @@ def test_cli_illegal_modes():
     assert result.returncode != 0
     assert "one of the arguments --write/-w --read/-r is required" in result.stderr
 
-    # Omitting target file entirely
+    # Omitting target file in --read mode must fail via parser.error
     result = run_cli("--read")
-    assert result.returncode == 0 # Wait, main() takes `nargs='*'`, so providing no files might succeed and do nothing. Wait, no files means the script exits clean or prints help? Let's check locally via test.
+    assert result.returncode != 0
+    assert "requires at least one file" in result.stderr
 
 def test_cli_read_execution(tmp_path):
     # Establish a local target
@@ -275,16 +276,29 @@ def test_cli_write_broadcast_closes_handles_on_writer_error(tmp_path, monkeypatc
     assert ("writer", str(dst1)) in closed
     assert ("writer", str(dst2)) in closed
 
-    # Open-time error on 2nd writer also closes reader and 1st writer cleanly
+    # Pre-validation rejects read-only destination before opening/creating earlier destinations
     closed.clear()
     monkeypatch.setattr(PolyWriter, "open", orig_writer_open)
-    dst_ok = tmp_path / "dst_ok.txt"
+    dst_never = tmp_path / "dst_never.txt"
     monkeypatch.setattr(
         sys,
         "argv",
-        ["polyopen", "-w", str(src), str(dst_ok), "https://example.com/readonly.txt"],
+        ["polyopen", "-w", str(src), str(dst_never), "https://example.com/readonly.txt"],
     )
     with pytest.raises(ReadOnlyProtocolError):
+        cli_main()
+    assert not dst_never.exists()
+
+    # Open-time error on 2nd writer (missing parent dir) still closes reader and 1st writer cleanly
+    closed.clear()
+    dst_ok = tmp_path / "dst_ok.txt"
+    dst_missing_dir = tmp_path / "missing_subdir" / "out.txt"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["polyopen", "-w", str(src), str(dst_ok), str(dst_missing_dir)],
+    )
+    with pytest.raises(FileNotFoundError):
         cli_main()
 
     assert ("reader", str(src)) in closed
