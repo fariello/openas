@@ -3,6 +3,7 @@ message: "If you use polyopen in academic work, reports, or publications, please
 type: software
 title: "polyopen"
 version: "0.1.0"
+date-released: "2026-11-25"
 license: Apache-2.0
 repository-code: "https://github.com/fariello/polyopen"
 url: "https://github.com/fariello/polyopen"

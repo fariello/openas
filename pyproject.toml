@@ -5,28 +5,52 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "polyopen"
 version = "0.1.0"
-description = "A Python module for versatile file handling (compression formats and basic remote sources)."
+description = "Unified UTF-8 stream-level file handling across local files, remote protocols (HTTP/HTTPS, FTP, SSH/SFTP), and transparent compression (.gz, .bz2, .xz, .zst)."
 readme = "README.md"
-requires-python = ">=3.8"
+requires-python = ">=3.9"
 license = "Apache-2.0"
 license-files = ["LICENSE", "NOTICE"]
 authors = [
-    { name = "Gabriele Fariello" }
+  { name = "Gabriele Fariello" }
 ]
 classifiers = [
-    "Programming Language :: Python :: 3",
-    "Operating System :: OS Independent",
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Developers",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.9",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+  "Operating System :: OS Independent",
 ]
 dependencies = [
-    "paramiko",
-    "zstandard",
-    "requests",
-    "tqdm",
-    "ftputil"
+  "paramiko",
+  "zstandard>=0.14.0",
+  "requests",
+  "tqdm",
+  "ftputil",
 ]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=7.0",
+]
+
+[project.scripts]
+polyopen = "polyopen.polyopen:main"
 
 [project.urls]
 Homepage = "https://github.com/fariello/polyopen"
+Repository = "https://github.com/fariello/polyopen"
+Issues = "https://github.com/fariello/polyopen/issues"
+Documentation = "https://github.com/fariello/polyopen/blob/main/docs/API.md"
+Changelog = "https://github.com/fariello/polyopen/blob/main/CHANGELOG.md"
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]
+testpaths = ["tests"]
+filterwarnings = [
+  "error::ResourceWarning",
+]

@@ -47,6 +47,8 @@ coverage.xml
 *.py,cover
 .hypothesis/
 .pytest_cache/
+.mypy_cache/
+.ruff_cache/
 cover/
 
 # Environments
@@ -68,10 +70,8 @@ scratch/
 *.swp
 *.swo
 
-# Python Packaging
-*.egg-info/
-dist/
-build/
+# polyopen automatic backup files
+*.bu
 
 # Credentials and keys
 .env.*
