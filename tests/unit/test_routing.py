@@ -1001,3 +1001,98 @@ def test_http_real_server_gzip_stream():
         server.server_close()
         thread.join(timeout=5)
     assert seen_accept == ["identity"]
+
+
+@pytest.mark.parametrize("ext", ["", ".gz", ".bz2", ".xz", ".zst"])
+def test_remote_binary_mode_http_ftp_and_sftp(ext):
+    """Binary modes (rb/wb/ab) stream exact non-UTF-8 bytes across HTTP, FTP, and SFTP for all codecs."""
+    from polyopen import UnsupportedProtocolError
+
+    part1 = [b"\x00\xff\xfeheader\n", b"\x80\x81body1\n"]
+    part2 = b"\xde\xad\xbe\xefbody2\n"
+    full_bytes = b"".join(part1) + part2
+
+    def _compress(raw: bytes) -> bytes:
+        if ext == ".gz":
+            return gzip.compress(raw)
+        if ext == ".bz2":
+            return bz2.compress(raw)
+        if ext == ".xz":
+            return lzma.compress(raw)
+        if ext == ".zst":
+            return zstd.ZstdCompressor().compress(raw)
+        return raw
+
+    # 1. HTTP binary read ('rb') with show_progress=True
+    wire = _compress(full_bytes)
+    with patch("requests.Session.get") as mock_get:
+        resp = MagicMock()
+        resp.headers = {"Content-Length": str(len(wire))}
+        resp.raw = io.BytesIO(wire)
+        mock_get.return_value = resp
+        with polyopen(f"https://example.com/blob{ext or '.bin'}", "rb", show_progress=True) as r:
+            assert r.encoding is None
+            pbar = r._progress
+            assert pbar is not None and pbar.total == len(wire)
+            assert list(r) == part1 + [part2]
+        assert pbar.n == len(wire)
+
+    # 2. FTP binary write ('wb'), read ('rb'), and append ('ab') rejection
+    with patch("ftputil.FTPHost") as mock_ftp:
+        host = MagicMock()
+        mock_ftp.return_value = host
+        write_proxy = _StrictFTPFileProxy()
+        host.open.return_value = write_proxy
+        with polyopen(f"ftp://user:pass@host/dir/blob{ext or '.bin'}", "wb", backup=False) as w:
+            assert w.encoding is None
+            assert w.write(part1[0]) == len(part1[0])
+            w.writelines([part1[1], part2])
+            with pytest.raises(TypeError):
+                w.write("str rejected on ftp binary writer")
+        assert write_proxy.closed
+
+        read_proxy = _StrictFTPFileProxy(write_proxy.saved_bytes)
+        host.open.return_value = read_proxy
+        host.path.getsize.return_value = len(write_proxy.saved_bytes)
+        with polyopen(f"ftp://user:pass@host/dir/blob{ext or '.bin'}", "rb", show_progress=True) as r:
+            assert r.encoding is None
+            pbar = r._progress
+            assert list(r) == part1 + [part2]
+        assert pbar.n == len(write_proxy.saved_bytes)
+        assert read_proxy.closed
+
+        mock_ftp.reset_mock()
+        with pytest.raises(UnsupportedProtocolError, match="append"):
+            polyopen(f"ftp://user:pass@host/dir/blob{ext or '.bin'}", "ab")
+        assert not mock_ftp.called
+
+    # 3. SFTP binary write ('wb'), append ('ab'), and read ('rb') using minimal SFTPFile (no readinto)
+    with patch("paramiko.SSHClient") as mock_ssh:
+        client = MagicMock()
+        sftp = MagicMock()
+        mock_ssh.return_value = client
+        client.open_sftp.return_value = sftp
+
+        # Write part1
+        w1_proxy = _StrictFTPFileProxy()
+        sftp.file.return_value = w1_proxy
+        with polyopen(f"sftp://u:p@host/dir/blob{ext or '.bin'}", "wb", backup=False) as w:
+            assert w.encoding is None
+            w.writelines(part1)
+            with pytest.raises(TypeError):
+                w.write("str rejected on sftp binary writer")
+
+        # Append part2 (multi-member stream for compressed formats, raw bytes for plain)
+        w2_proxy = _StrictFTPFileProxy()
+        sftp.file.return_value = w2_proxy
+        with polyopen(f"sftp://u:p@host/dir/blob{ext or '.bin'}", "ab") as w:
+            assert w.encoding is None
+            assert w.write(part2) == len(part2)
+
+        combined_wire = w1_proxy.saved_bytes + w2_proxy.saved_bytes
+        r_proxy = _StrictFTPFileProxy(combined_wire)
+        sftp.file.return_value = r_proxy
+        with polyopen(f"sftp://u:p@host/dir/blob{ext or '.bin'}", "rb", show_progress=True) as r:
+            assert r.encoding is None
+            assert list(r) == part1 + [part2]
+        assert r_proxy.closed

@@ -53,3 +53,14 @@ def test_golden_file_integrity(ext, tmp_path):
     assert _independent_decode(out_path, ext) == "".join(EXPECTED_LINES)
     with polyopen(out_path, 'r') as reader:
         assert list(reader) == EXPECTED_LINES
+
+    expected_bytes = [line.encode("utf-8") for line in EXPECTED_LINES]
+    with polyopen(fixture_path, 'rb') as reader:
+        assert list(reader) == expected_bytes
+
+    bin_out_path = tmp_path / f"roundtrip_bin{ext}"
+    with polyopen(bin_out_path, 'wb', backup=False) as writer:
+        writer.writelines(expected_bytes)
+    assert _independent_decode(bin_out_path, ext) == "".join(EXPECTED_LINES)
+    with polyopen(bin_out_path, 'rb') as reader:
+        assert list(reader) == expected_bytes

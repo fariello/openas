@@ -780,3 +780,71 @@ def test_local_empty_no_newline_multimember_append_file_uri_and_colon_filename(t
         w.write("colon ok\n")
     with polyopen(colon_fp, "r") as r:
         assert r.read() == "colon ok\n"
+
+
+@pytest.mark.parametrize("ext", ["", ".gz", ".bz2", ".xz", ".zst"])
+def test_local_binary_mode_all_formats_roundtrip_append_iter_and_progress(tmp_path, ext):
+    """Binary modes (wb/ab/rb) handle non-UTF-8 bytes, line iteration, writelines, and progress across all codecs."""
+    fp = tmp_path / f"binary_sample{ext or '.bin'}"
+    initial_lines = [
+        b"\x00\xff\xfe\x80line1\n",
+        b"\x89PNG\r\n",
+        b"\x1a\x00line3\n",
+    ]
+    appended = b"\xde\xad\xbe\xefline4_no_nl"
+    expected_lines = initial_lines + [appended]
+    expected_bytes = b"".join(expected_lines)
+
+    with polyopen(fp, "wb", backup=False) as w:
+        assert w.binary is True
+        assert w.encoding is None
+        assert "mode='wb'" in repr(w)
+        assert w.write(initial_lines[0]) == len(initial_lines[0])
+        w.writelines(initial_lines[1:])
+        with pytest.raises(TypeError):
+            w.write("str rejected in binary mode\n")
+        with pytest.raises(TypeError):
+            w.writelines(["str line rejected\n"])
+
+    with polyopen(fp, "ab") as w:
+        assert w.binary is True
+        assert w.encoding is None
+        assert w.write(appended) == len(appended)
+
+    # Full read(), partial read(size), readline(), next(), readlines(), and for-loop iteration
+    with polyopen(fp, "rb") as r:
+        assert r.binary is True
+        assert r.encoding is None
+        assert "mode='rb'" in repr(r)
+        got = r.read()
+        assert isinstance(got, bytes)
+        assert got == expected_bytes
+
+    with polyopen(fp, "rb") as r:
+        got_lines = list(r)
+        assert all(isinstance(line, bytes) for line in got_lines)
+        assert got_lines == expected_lines
+
+    with polyopen(fp, "rb") as r:
+        assert r.readline() == initial_lines[0]
+        assert next(r) == initial_lines[1]
+        assert r.readlines() == [initial_lines[2], appended]
+
+    with polyopen(fp, "rb") as r:
+        assert r.read(4) == b"\x00\xff\xfe\x80"
+        assert r.readline() == b"line1\n"
+
+    # Multi-chunk (>128 KiB) binary line streaming with show_progress=True
+    big_fp = tmp_path / f"big_binary{ext or '.bin'}"
+    big_lines = [bytes([0x80 + (i % 128)]) + b"\xff\x00" + f"row-{i:05d}-".encode("ascii") + (b"X" * 60) + b"\n" for i in range(2200)]
+    with PolyWriter(big_fp, binary=True).open(backup=False) as w:
+        w.writelines(big_lines)
+
+    raw_size = big_fp.stat().st_size
+    with PolyReader(big_fp, show_progress=True, binary=True) as r:
+        pbar = r._progress
+        assert pbar is not None
+        assert pbar.total == raw_size
+        streamed = list(r)
+    assert streamed == big_lines
+    assert pbar.n == raw_size

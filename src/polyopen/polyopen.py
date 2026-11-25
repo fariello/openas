@@ -1,19 +1,20 @@
 #!/usr/bin/env python3
 """
-polyopen - Unified UTF-8 stream I/O across local files, remote protocols, and compression formats.
+polyopen - Unified streaming I/O across local files, remote protocols, and compression formats.
 
-Supports plain text, `.gz`, `.bz2`, `.xz`, and `.zst` streams over local files (`file://` or plain
+Supports plain, `.gz`, `.bz2`, `.xz`, and `.zst` streams over local files (`file://` or plain
 paths), `http://` and `https://` (read-only), `ftp://` (read and write), and `ssh://` / `sftp://`
-(read, write, and append). All modes operate on UTF-8 text (`str`).
+(read, write, and append). Text modes (`'r'`/`'rt'`, `'w'`/`'wt'`, `'a'`/`'at'`) operate on UTF-8
+`str`; binary modes (`'rb'`, `'wb'`, `'ab'`) operate on raw `bytes`.
 
 Public API
 ----------
 - `polyopen(filename, mode='r', backup=None, show_progress=False, compresslevel=None, timeout=None)`:
   Unified factory returning an opened `PolyReader` or `PolyWriter`.
-- `PolyReader`: Stream reader supporting `read()`, `readline()`, `readlines()`, iteration, and
-  optional raw-byte `tqdm` progress bars.
+- `PolyReader`: Stream reader supporting `read()`, `readline()`, `readlines()`, line-by-line
+  iteration (`str` in text mode, `bytes` in binary mode), and optional raw-byte `tqdm` progress bars.
 - `PolyWriter`: Stream writer supporting `write()`, `writelines()`, `flush()`, `compresslevel`,
-  and collision-safe `.NNN.bu` backup rotation on overwrite.
+  and collision-safe sequential `.NNN.bu` backups on overwrite.
 - `PolyopenError`, `UnsupportedArchiveError`, `ReadOnlyProtocolError`, `UnsupportedProtocolError`:
   Exception hierarchy for unsupported archive containers and protocols.
 
@@ -139,7 +140,7 @@ class _BinaryStreamAdapter(io.BufferedIOBase):
     def write(self, b):
         if self._closed:
             raise ValueError("I/O operation on closed file.")
-        data = bytes(b) if isinstance(b, memoryview) else b
+        data = b if isinstance(b, bytes) else memoryview(b).tobytes()
         res = self._raw.write(data)
         return res if isinstance(res, int) else len(data)
 
@@ -389,9 +390,11 @@ def _close_handles(*handles):
         except Exception as err:
             if first_err is None:
                 first_err = err
-        buf = getattr(handle, 'buffer', None)
-        if isinstance(buf, _BinaryStreamAdapter) and buf._raw_close_attempted:
-            seen.add(id(buf._raw))
+        inner = getattr(handle, 'buffer', None) or getattr(handle, 'raw', None)
+        if isinstance(inner, _CountingByteStream):
+            inner = inner._stream
+        if isinstance(inner, _BinaryStreamAdapter) and inner._raw_close_attempted:
+            seen.add(id(inner._raw))
         elif isinstance(handle, _BinaryStreamAdapter) and handle._raw_close_attempted:
             seen.add(id(handle._raw))
     if first_err is not None:
@@ -568,8 +571,10 @@ def __getattr__(name: str):
 
 class PolyReader:
     """
-    UTF-8 text stream reader supporting `.gz`, `.bz2`, `.xz`, and `.zst` decompression
+    Streaming reader supporting `.gz`, `.bz2`, `.xz`, and `.zst` decompression
     over local files (`file://` or plain paths), HTTP/HTTPS, FTP, and SSH/SFTP.
+
+    Operates on UTF-8 text (`str`) by default, or raw `bytes` when `binary=True`.
 
     Attributes
     ----------
@@ -579,8 +584,10 @@ class PolyReader:
         Whether to display a `tqdm` progress bar tracking raw bytes read.
     timeout : float or None
         Optional network timeout in seconds.
-    encoding : str
-        Always `'utf-8'`.
+    binary : bool
+        When True, stream operations return raw `bytes`; when False, UTF-8 `str`.
+    encoding : str or None
+        `'utf-8'` in text mode, or `None` in binary mode.
     closed : bool
         True when no underlying stream handle is open.
 
@@ -588,15 +595,18 @@ class PolyReader:
     -------
     open() -> PolyReader
         Open the stream for reading.
-    read(size=-1) -> str, readline(size=-1) -> str, readlines(hint=-1) -> list
-        Standard text stream read operations.
+    read(size=-1) -> str or bytes, readline(size=-1) -> str or bytes, readlines(hint=-1) -> list
+        Standard stream read operations (`str` in text mode, `bytes` in binary mode).
     readable() -> bool, writable() -> bool, seekable() -> bool
         Standard file-like capability predicates.
     close() -> None
         Idempotently close all acquired stream and transport handles.
     """
 
-    encoding = 'utf-8'
+    @property
+    def encoding(self) -> Optional[str]:
+        """Return `'utf-8'` in text mode or `None` in binary mode."""
+        return None if self.binary else 'utf-8'
 
     @property
     def closed(self) -> bool:
@@ -617,13 +627,15 @@ class PolyReader:
 
     def __repr__(self) -> str:
         state = "closed" if self.closed else "open"
-        return f"PolyReader({_redact_url(self.filename)!r}, state={state!r})"
+        mode = "rb" if self.binary else "r"
+        return f"PolyReader({_redact_url(self.filename)!r}, mode={mode!r}, state={state!r})"
 
     def __init__(
         self,
         filename: Union[str, os.PathLike],
         show_progress: bool = False,
         timeout: Optional[float] = None,
+        binary: bool = False,
     ):
         """
         Initialize PolyReader with a filename.
@@ -636,10 +648,13 @@ class PolyReader:
             Whether to show a progress bar.
         timeout : float or None, optional
             Optional network timeout in seconds for HTTP, FTP, and SSH/SFTP connections.
+        binary : bool, optional
+            If True, read raw `bytes` instead of UTF-8 decoded `str` (default is False).
         """
         self.filename = os.fsdecode(filename)
         self.show_progress = show_progress
         self.timeout = _validate_timeout(timeout)
+        self.binary = bool(binary)
         self._fh = None
         self._raw_fh = None
         self._ssh_client = None
@@ -682,7 +697,7 @@ class PolyReader:
             progress.update(self._progress_pending)
             self._progress_pending = 0
 
-    def _update_progress(self, text: str = ""):
+    def _update_progress(self, data: Union[str, bytes] = ""):
         if not (self.show_progress and self._progress is not None):
             return
         if self._progress_pending > 0:
@@ -692,8 +707,10 @@ class PolyReader:
             if delta > 0:
                 self._progress.update(delta)
                 self._progress_raw_bytes += delta
-        elif text:
-            self._progress.update(len(text.encode('utf-8')))
+        elif data:
+            self._progress.update(
+                len(data) if isinstance(data, (bytes, bytearray)) else len(data.encode('utf-8'))
+            )
 
     def __enter__(self) -> 'PolyReader':
         """
@@ -734,13 +751,14 @@ class PolyReader:
         """
         Return an iterator over lines in the stream.
 
-        When progress tracking is disabled and the underlying handle is an
-        ``io.TextIOBase``, this returns the handle's own C-level iterator directly.
+        When progress tracking is disabled and the underlying handle is already in
+        the target mode (`io.TextIOBase` for text or any binary stream when `binary=True`),
+        this returns the handle's own C-level iterator directly.
         """
         self._ensure_open()
         if self.show_progress:
             return self._iter_progress()
-        if isinstance(self._fh, io.TextIOBase):
+        if self.binary or isinstance(self._fh, io.TextIOBase):
             return iter(self._fh)
         return self._iter_decoded()
 
@@ -753,15 +771,16 @@ class PolyReader:
                 yield line
 
     def _iter_progress(self):
-        """Yield text lines while batching tqdm progress updates to 64 KiB."""
+        """Yield lines (`str` or `bytes`) while batching tqdm progress updates to 64 KiB."""
         try:
             fh = self._fh
             progress = self._progress
+            binary = self.binary
             is_text = isinstance(fh, io.TextIOBase)
             counting = self._counting_stream
 
             if progress is None:
-                if is_text:
+                if binary or is_text:
                     yield from fh
                 else:
                     for line in fh:
@@ -770,7 +789,7 @@ class PolyReader:
 
             update = progress.update
             if counting is not None:
-                if is_text:
+                if binary or is_text:
                     for line in fh:
                         delta = counting.bytes_read - self._progress_raw_bytes
                         if delta > 0:
@@ -792,6 +811,13 @@ class PolyReader:
                                 update(self._progress_pending)
                                 self._progress_pending = 0
                         yield line
+            elif binary:
+                for line in fh:
+                    self._progress_pending += len(line)
+                    if self._progress_pending >= 65536:
+                        update(self._progress_pending)
+                        self._progress_pending = 0
+                    yield line
             elif is_text:
                 for line in fh:
                     self._progress_pending += len(line.encode('utf-8'))
@@ -814,20 +840,20 @@ class PolyReader:
         finally:
             self._flush_progress()
 
-    def readline(self, size: int = -1) -> str:
-        """Read and return one line from the stream, or up to size characters."""
+    def readline(self, size: int = -1) -> Union[str, bytes]:
+        """Read and return one line from the stream, or up to size characters/bytes."""
         self._ensure_open()
         line = self._fh.readline() if (size is None or size < 0) else self._fh.readline(size)
-        if isinstance(line, bytes):
+        if not self.binary and isinstance(line, bytes):
             line = line.decode('utf-8')
         self._update_progress(line)
         return line
 
-    def read(self, size: int = -1) -> str:
-        """Read and return up to size characters, or the entire remaining stream if size < 0."""
+    def read(self, size: int = -1) -> Union[str, bytes]:
+        """Read and return up to size characters/bytes, or the entire remaining stream if size < 0."""
         self._ensure_open()
         data = self._fh.read() if (size is None or size < 0) else self._fh.read(size)
-        if isinstance(data, bytes):
+        if not self.binary and isinstance(data, bytes):
             data = data.decode('utf-8')
         self._update_progress(data)
         return data
@@ -847,7 +873,7 @@ class PolyReader:
                 break
         return lines
 
-    def __next__(self) -> str:
+    def __next__(self) -> Union[str, bytes]:
         """
         Provide the next line in the file.
 
@@ -855,8 +881,8 @@ class PolyReader:
 
         Returns
         -------
-        str
-            The next line in the file.
+        str or bytes
+            The next line in the file (`bytes` in binary mode, `str` in text mode).
 
         Raises
         ------
@@ -907,21 +933,19 @@ class PolyReader:
         if norm.endswith('.zst'):
             import zstandard as zstd
             dctx = zstd.ZstdDecompressor(max_window_size=2**31)
-            self._fh = io.TextIOWrapper(
-                dctx.stream_reader(stream, read_across_frames=True),
-                encoding='utf-8',
-            )
+            sr = dctx.stream_reader(stream, read_across_frames=True)
+            self._fh = io.BufferedReader(sr) if self.binary else io.TextIOWrapper(sr, encoding='utf-8')
         elif norm.endswith('.bz2'):
             import bz2
-            self._fh = bz2.open(stream, 'rt', encoding='utf-8')
+            self._fh = bz2.open(stream, 'rb') if self.binary else bz2.open(stream, 'rt', encoding='utf-8')
         elif norm.endswith('.xz'):
             import lzma
-            self._fh = lzma.open(stream, 'rt', encoding='utf-8')
+            self._fh = lzma.open(stream, 'rb') if self.binary else lzma.open(stream, 'rt', encoding='utf-8')
         elif norm.endswith('.gz'):
             import gzip
-            self._fh = gzip.open(stream, 'rt', encoding='utf-8')
+            self._fh = gzip.open(stream, 'rb') if self.binary else gzip.open(stream, 'rt', encoding='utf-8')
         else:
-            self._fh = io.TextIOWrapper(stream, encoding='utf-8')
+            self._fh = io.BufferedReader(stream) if self.binary else io.TextIOWrapper(stream, encoding='utf-8')
 
     def _wrap_ssh(self, parsed: ParseResult):
         """
@@ -984,26 +1008,33 @@ class PolyReader:
             self.close()
             raise
 
-        stream = self._make_counted_stream(self._sftp_file)
         norm = _normalized_path(self.filename, parsed)
         if norm.endswith('.zst'):
             import zstandard as zstd
+            stream = self._make_counted_stream(self._sftp_file)
             dctx = zstd.ZstdDecompressor(max_window_size=2**31)
-            self._fh = io.TextIOWrapper(
-                dctx.stream_reader(stream, read_across_frames=True),
-                encoding='utf-8',
-            )
+            sr = dctx.stream_reader(stream, read_across_frames=True)
+            self._fh = io.BufferedReader(sr) if self.binary else io.TextIOWrapper(sr, encoding='utf-8')
         elif norm.endswith('.bz2'):
             import bz2
-            self._fh = bz2.open(stream, 'rt', encoding='utf-8')
+            stream = self._make_counted_stream(self._sftp_file)
+            self._fh = bz2.open(stream, 'rb') if self.binary else bz2.open(stream, 'rt', encoding='utf-8')
         elif norm.endswith('.xz'):
             import lzma
-            self._fh = lzma.open(stream, 'rt', encoding='utf-8')
+            stream = self._make_counted_stream(self._sftp_file)
+            self._fh = lzma.open(stream, 'rb') if self.binary else lzma.open(stream, 'rt', encoding='utf-8')
         elif norm.endswith('.gz'):
             import gzip
-            self._fh = gzip.open(stream, 'rt', encoding='utf-8')
+            stream = self._make_counted_stream(self._sftp_file)
+            self._fh = gzip.open(stream, 'rb') if self.binary else gzip.open(stream, 'rt', encoding='utf-8')
         else:
-            self._fh = io.TextIOWrapper(stream, encoding='utf-8')
+            if self.binary:
+                adapted = _BinaryStreamAdapter(self._sftp_file, readable=True, writable=False)
+                stream = self._make_counted_stream(adapted)
+                self._fh = io.BufferedReader(stream)
+            else:
+                stream = self._make_counted_stream(self._sftp_file)
+                self._fh = io.TextIOWrapper(stream, encoding='utf-8')
 
     def _wrap_http(self, parsed: Optional[ParseResult] = None):
         """
@@ -1050,22 +1081,20 @@ class PolyReader:
             import zstandard as zstd
             stream = self._make_counted_stream(response.raw)
             dctx = zstd.ZstdDecompressor(max_window_size=2**31)
-            self._fh = io.TextIOWrapper(
-                dctx.stream_reader(stream, read_across_frames=True),
-                encoding='utf-8',
-            )
+            sr = dctx.stream_reader(stream, read_across_frames=True)
+            self._fh = io.BufferedReader(sr) if self.binary else io.TextIOWrapper(sr, encoding='utf-8')
         elif norm.endswith('.bz2'):
             import bz2
             stream = self._make_counted_stream(response.raw)
-            self._fh = bz2.open(stream, 'rt', encoding='utf-8')
+            self._fh = bz2.open(stream, 'rb') if self.binary else bz2.open(stream, 'rt', encoding='utf-8')
         elif norm.endswith('.xz'):
             import lzma
             stream = self._make_counted_stream(response.raw)
-            self._fh = lzma.open(stream, 'rt', encoding='utf-8')
+            self._fh = lzma.open(stream, 'rb') if self.binary else lzma.open(stream, 'rt', encoding='utf-8')
         elif norm.endswith('.gz'):
             import gzip
             stream = self._make_counted_stream(response.raw)
-            self._fh = gzip.open(stream, 'rt', encoding='utf-8')
+            self._fh = gzip.open(stream, 'rb') if self.binary else gzip.open(stream, 'rt', encoding='utf-8')
         else:
             content_encoding = response.headers.get('Content-Encoding')
             if isinstance(content_encoding, str) and content_encoding.strip().lower() not in ('', 'identity'):
@@ -1075,7 +1104,7 @@ class PolyReader:
             except AttributeError:
                 pass
             stream = self._make_counted_stream(_HttpRawStream(response.raw))
-            self._fh = io.TextIOWrapper(stream, encoding='utf-8')
+            self._fh = io.BufferedReader(stream) if self.binary else io.TextIOWrapper(stream, encoding='utf-8')
 
     def _wrap_local(self, parsed: Optional[ParseResult] = None):
         """
@@ -1099,33 +1128,34 @@ class PolyReader:
             dctx = zstd.ZstdDecompressor(max_window_size=2**31)
             self._raw_fh = open(self.filename, 'rb')
             stream = self._make_counted_stream(self._raw_fh)
-            self._fh = io.TextIOWrapper(
-                dctx.stream_reader(stream, read_across_frames=True),
-                encoding='utf-8',
-            )
+            sr = dctx.stream_reader(stream, read_across_frames=True)
+            self._fh = io.BufferedReader(sr) if self.binary else io.TextIOWrapper(sr, encoding='utf-8')
         elif norm.endswith('.bz2'):
             import bz2
+            open_kwargs = {'mode': 'rb'} if self.binary else {'mode': 'rt', 'encoding': 'utf-8'}
             if self.show_progress:
                 self._raw_fh = open(self.filename, 'rb')
-                self._fh = bz2.open(self._make_counted_stream(self._raw_fh), 'rt', encoding='utf-8')
+                self._fh = bz2.open(self._make_counted_stream(self._raw_fh), **open_kwargs)
             else:
-                self._fh = bz2.open(self.filename, 'rt', encoding='utf-8')
+                self._fh = bz2.open(self.filename, **open_kwargs)
         elif norm.endswith('.xz'):
             import lzma
+            open_kwargs = {'mode': 'rb'} if self.binary else {'mode': 'rt', 'encoding': 'utf-8'}
             if self.show_progress:
                 self._raw_fh = open(self.filename, 'rb')
-                self._fh = lzma.open(self._make_counted_stream(self._raw_fh), 'rt', encoding='utf-8')
+                self._fh = lzma.open(self._make_counted_stream(self._raw_fh), **open_kwargs)
             else:
-                self._fh = lzma.open(self.filename, 'rt', encoding='utf-8')
+                self._fh = lzma.open(self.filename, **open_kwargs)
         elif norm.endswith('.gz'):
             import gzip
+            open_kwargs = {'mode': 'rb'} if self.binary else {'mode': 'rt', 'encoding': 'utf-8'}
             if self.show_progress:
                 self._raw_fh = open(self.filename, 'rb')
-                self._fh = gzip.open(self._make_counted_stream(self._raw_fh), 'rt', encoding='utf-8')
+                self._fh = gzip.open(self._make_counted_stream(self._raw_fh), **open_kwargs)
             else:
-                self._fh = gzip.open(self.filename, 'rt', encoding='utf-8')
+                self._fh = gzip.open(self.filename, **open_kwargs)
         else:
-            self._fh = open(self.filename, 'r', encoding='utf-8')
+            self._fh = open(self.filename, 'rb') if self.binary else open(self.filename, 'r', encoding='utf-8')
 
     def open(self) -> 'PolyReader':
         """
@@ -1261,9 +1291,11 @@ class PolyReader:
 
 class PolyWriter:
     """
-    UTF-8 text stream writer supporting `.gz`, `.bz2`, `.xz`, and `.zst` compression
+    Streaming writer supporting `.gz`, `.bz2`, `.xz`, and `.zst` compression
     over local files (`file://` or plain paths), FTP (write only), and SSH/SFTP (write/append),
-    with automatic `.NNN.bu` backup rotation on overwrite.
+    with collision-safe sequential `.NNN.bu` backups on overwrite.
+
+    Operates on UTF-8 text (`str`) by default, or raw `bytes` when `binary=True`.
 
     Attributes
     ----------
@@ -1271,8 +1303,10 @@ class PolyWriter:
         Normalized path or URL to write.
     timeout : float or None
         Optional network timeout in seconds.
-    encoding : str
-        Always `'utf-8'`.
+    binary : bool
+        When True, stream operations accept raw `bytes`-like data; when False, UTF-8 `str`.
+    encoding : str or None
+        `'utf-8'` in text mode, or `None` in binary mode.
     closed : bool
         True when no underlying stream handle is open.
 
@@ -1281,14 +1315,17 @@ class PolyWriter:
     open(append=False, backup=True, compresslevel=None) -> PolyWriter
         Open the stream for writing or appending.
     write(data) -> int, writelines(lines) -> None, flush() -> None
-        Standard text stream write operations.
+        Standard stream write operations (`str` in text mode, `bytes`-like in binary mode).
     readable() -> bool, writable() -> bool, seekable() -> bool
         Standard file-like capability predicates.
     close() -> None
         Idempotently close all acquired stream and transport handles.
     """
 
-    encoding = 'utf-8'
+    @property
+    def encoding(self) -> Optional[str]:
+        """Return `'utf-8'` in text mode or `None` in binary mode."""
+        return None if self.binary else 'utf-8'
 
     @property
     def closed(self) -> bool:
@@ -1309,13 +1346,15 @@ class PolyWriter:
 
     def __repr__(self) -> str:
         state = "closed" if self.closed else "open"
-        return f"PolyWriter({_redact_url(self.filename)!r}, state={state!r})"
+        mode = "wb" if self.binary else "w"
+        return f"PolyWriter({_redact_url(self.filename)!r}, mode={mode!r}, state={state!r})"
 
     def __init__(
         self,
         filename: Union[str, os.PathLike],
         show_progress: bool = False,
         timeout: Optional[float] = None,
+        binary: bool = False,
     ):
         """
         Initialize PolyWriter with a filename.
@@ -1328,12 +1367,15 @@ class PolyWriter:
             Progress tracking on writers is not implemented; passing True raises NotImplementedError.
         timeout : float or None, optional
             Optional network timeout in seconds for FTP and SSH/SFTP connections.
+        binary : bool, optional
+            If True, write raw `bytes`-like objects instead of UTF-8 `str` (default is False).
         """
         if show_progress:
             raise NotImplementedError('Progress tracking is currently isolated to reader paths. Write implementations are deferred.')
         self.filename = os.fsdecode(filename)
         self.show_progress = show_progress
         self.timeout = _validate_timeout(timeout)
+        self.binary = bool(binary)
         self._fh = None
         self._raw_fh = None
         self._ftp = None
@@ -1439,27 +1481,28 @@ class PolyWriter:
         if norm.endswith('.zst'):
             import zstandard as zstd
             cctx = zstd.ZstdCompressor() if compresslevel is None else zstd.ZstdCompressor(level=compresslevel)
-            self._fh = io.TextIOWrapper(cctx.stream_writer(adapted), encoding='utf-8')
+            sw = cctx.stream_writer(adapted)
+            self._fh = sw if self.binary else io.TextIOWrapper(sw, encoding='utf-8')
         elif norm.endswith('.bz2'):
             import bz2
-            bz2_kwargs = {'mode': 'wt', 'encoding': 'utf-8'}
+            bz2_kwargs = {'mode': 'wb'} if self.binary else {'mode': 'wt', 'encoding': 'utf-8'}
             if compresslevel is not None:
                 bz2_kwargs['compresslevel'] = compresslevel
             self._fh = bz2.open(adapted, **bz2_kwargs)
         elif norm.endswith('.xz'):
             import lzma
-            lzma_kwargs = {'mode': 'wt', 'encoding': 'utf-8'}
+            lzma_kwargs = {'mode': 'wb'} if self.binary else {'mode': 'wt', 'encoding': 'utf-8'}
             if compresslevel is not None:
                 lzma_kwargs['preset'] = compresslevel
             self._fh = lzma.open(adapted, **lzma_kwargs)
         elif norm.endswith('.gz'):
             import gzip
-            gz_kwargs = {'mode': 'wt', 'encoding': 'utf-8'}
+            gz_kwargs = {'mode': 'wb'} if self.binary else {'mode': 'wt', 'encoding': 'utf-8'}
             if compresslevel is not None:
                 gz_kwargs['compresslevel'] = compresslevel
             self._fh = gzip.open(adapted, **gz_kwargs)
         else:
-            self._fh = io.TextIOWrapper(adapted, encoding='utf-8')
+            self._fh = adapted if self.binary else io.TextIOWrapper(adapted, encoding='utf-8')
 
     def _ssh_backup_if(self, sftp, path):
         """
@@ -1581,31 +1624,39 @@ class PolyWriter:
             self.close()
             raise
 
+        codec_mode = ('ab' if append else 'wb') if self.binary else ('at' if append else 'wt')
         if norm.endswith('.zst'):
             import zstandard as zstd
             cctx = zstd.ZstdCompressor() if compresslevel is None else zstd.ZstdCompressor(level=compresslevel)
-            self._fh = io.TextIOWrapper(cctx.stream_writer(self._sftp_file), encoding='utf-8')
+            sw = cctx.stream_writer(self._sftp_file)
+            self._fh = sw if self.binary else io.TextIOWrapper(sw, encoding='utf-8')
         elif norm.endswith('.bz2'):
             import bz2
-            bz2_kwargs = {'mode': 'at' if append else 'wt', 'encoding': 'utf-8'}
+            bz2_kwargs = {'mode': codec_mode}
+            if not self.binary:
+                bz2_kwargs['encoding'] = 'utf-8'
             if compresslevel is not None:
                 bz2_kwargs['compresslevel'] = compresslevel
             self._fh = bz2.open(self._sftp_file, **bz2_kwargs)
         elif norm.endswith('.xz'):
             import lzma
-            lzma_kwargs = {'mode': 'at' if append else 'wt', 'encoding': 'utf-8'}
+            lzma_kwargs = {'mode': codec_mode}
+            if not self.binary:
+                lzma_kwargs['encoding'] = 'utf-8'
             if compresslevel is not None:
                 lzma_kwargs['preset'] = compresslevel
             self._fh = lzma.open(self._sftp_file, **lzma_kwargs)
         elif norm.endswith('.gz'):
             import gzip
-            gz_kwargs = {'mode': 'at' if append else 'wt', 'encoding': 'utf-8'}
+            gz_kwargs = {'mode': codec_mode}
+            if not self.binary:
+                gz_kwargs['encoding'] = 'utf-8'
             if compresslevel is not None:
                 gz_kwargs['compresslevel'] = compresslevel
             self._fh = gzip.open(self._sftp_file, **gz_kwargs)
         else:
             adapted = _BinaryStreamAdapter(self._sftp_file, readable=False, writable=True)
-            self._fh = io.TextIOWrapper(adapted, encoding='utf-8')
+            self._fh = adapted if self.binary else io.TextIOWrapper(adapted, encoding='utf-8')
 
     def _backup_local_file(self):
         """Atomically rotate an existing local file to the next free .bu slot."""
@@ -1705,31 +1756,39 @@ class PolyWriter:
 
         norm = _normalized_path(self.filename, parsed)
         mode = 'ab' if append else 'wb'
+        codec_mode = mode if self.binary else ('at' if append else 'wt')
         if norm.endswith('.zst'):
             import zstandard as zstd
             cctx = zstd.ZstdCompressor() if compresslevel is None else zstd.ZstdCompressor(level=compresslevel)
             self._raw_fh = open(self.filename, mode)
-            self._fh = io.TextIOWrapper(cctx.stream_writer(self._raw_fh), encoding='utf-8')
+            sw = cctx.stream_writer(self._raw_fh)
+            self._fh = sw if self.binary else io.TextIOWrapper(sw, encoding='utf-8')
         elif norm.endswith('.bz2'):
             import bz2
-            bz2_kwargs = {'mode': 'at' if append else 'wt', 'encoding': 'utf-8'}
+            bz2_kwargs = {'mode': codec_mode}
+            if not self.binary:
+                bz2_kwargs['encoding'] = 'utf-8'
             if compresslevel is not None:
                 bz2_kwargs['compresslevel'] = compresslevel
             self._fh = bz2.open(self.filename, **bz2_kwargs)
         elif norm.endswith('.xz'):
             import lzma
-            lzma_kwargs = {'mode': 'at' if append else 'wt', 'encoding': 'utf-8'}
+            lzma_kwargs = {'mode': codec_mode}
+            if not self.binary:
+                lzma_kwargs['encoding'] = 'utf-8'
             if compresslevel is not None:
                 lzma_kwargs['preset'] = compresslevel
             self._fh = lzma.open(self.filename, **lzma_kwargs)
         elif norm.endswith('.gz'):
             import gzip
-            gz_kwargs = {'mode': 'at' if append else 'wt', 'encoding': 'utf-8'}
+            gz_kwargs = {'mode': codec_mode}
+            if not self.binary:
+                gz_kwargs['encoding'] = 'utf-8'
             if compresslevel is not None:
                 gz_kwargs['compresslevel'] = compresslevel
             self._fh = gzip.open(self.filename, **gz_kwargs)
         else:
-            self._fh = open(self.filename, 'a' if append else 'w', encoding='utf-8')
+            self._fh = open(self.filename, mode) if self.binary else open(self.filename, 'a' if append else 'w', encoding='utf-8')
 
     def open(self, append: bool = False, backup: bool = True, compresslevel: Optional[int] = None) -> 'PolyWriter':
         """
@@ -1800,23 +1859,27 @@ class PolyWriter:
 
         Parameters
         ----------
-        data : str
-            The data to write to the file.
+        data : str or bytes-like
+            The data to write to the file (`str` in text mode, `bytes`-like in binary mode).
 
         Returns
         -------
         int
-            The number of characters written.
+            The number of characters (text mode) or bytes (binary mode) written.
         """
         if self._fh is None:
             raise ValueError("I/O operation on closed file.")
         return self._fh.write(data)
 
     def writelines(self, lines) -> None:
-        """Write an iterable of strings to the file."""
+        """Write an iterable of lines (`str` in text mode, `bytes`-like in binary mode) to the file."""
         if self._fh is None:
             raise ValueError("I/O operation on closed file.")
-        self._fh.writelines(lines)
+        if self.binary:
+            for line in lines:
+                self._fh.write(line)
+        else:
+            self._fh.writelines(lines)
 
     def flush(self) -> None:
         """Flush buffered write data to the underlying stream."""
@@ -1862,27 +1925,28 @@ def polyopen(
     timeout: Optional[float] = None,
 ) -> Union[PolyReader, PolyWriter]:
     """
-    Open a local or remote UTF-8 text stream with transparent compression.
+    Open a local or remote stream with transparent compression in text (`str`) or binary (`bytes`) mode.
 
-    Supports plain text, `.gz`, `.bz2`, `.xz`, and `.zst` over local paths (`file://` or implicit),
+    Supports plain, `.gz`, `.bz2`, `.xz`, and `.zst` over local paths (`file://` or implicit),
     `http://`/`https://` (read-only), `ftp://` (read/write), and `ssh://`/`sftp://` (read/write/append).
 
-    Note: All modes operate on UTF-8 text (`str`). The `'rb'`, `'wb'`, and `'ab'` modes are accepted
-    as text-mode aliases for compatibility and do NOT return or accept raw `bytes`.
+    Text modes (`'r'`/`'rt'`, `'w'`/`'wt'`, `'a'`/`'at'`) decode and encode UTF-8 `str`.
+    Binary modes (`'rb'`, `'wb'`, `'ab'`) read and write raw `bytes`.
 
     Parameters
     ----------
     filename : str or os.PathLike
         Path or URL to open (extension matching is case-insensitive and ignores URL query strings).
     mode : str, optional
-        One of `'r'`, `'rt'`, `'rb'` (read, default `'r'`), `'w'`, `'wt'`, `'wb'` (write/truncate),
-        or `'a'`, `'at'`, `'ab'` (append). All modes decode/encode UTF-8 text.
+        One of `'r'`, `'rt'` (UTF-8 text read, default `'r'`), `'rb'` (binary read),
+        `'w'`, `'wt'` (UTF-8 text write/truncate), `'wb'` (binary write/truncate),
+        `'a'`, `'at'` (UTF-8 text append), or `'ab'` (binary append).
     backup : bool or None, optional
-        Rotate an existing target to `.001.bu`..`.999.bu` (or nanosecond timestamp fallback) before
-        overwriting. Defaults to `True` in write modes and `False` in append modes; passing
+        Move an existing target to sequential `.001.bu`..`.999.bu` (or nanosecond timestamp fallback)
+        before overwriting. Defaults to `True` in write modes and `False` in append modes; passing
         `backup=True` with an append mode raises `ValueError`.
     show_progress : bool, optional
-        Display a `tqdm` progress bar tracking bytes read (read modes only; passing `True` in
+        Display a `tqdm` progress bar tracking raw bytes read (read modes only; passing `True` in
         write/append modes raises `NotImplementedError`). Default is `False`.
     compresslevel : int or None, optional
         Optional compression level/preset forwarded to `.zst` (default 3), `.xz` (default 6),
@@ -1914,29 +1978,31 @@ def polyopen(
     ...     f.write("hello\\n")
     >>> with polyopen("data.gz", "r") as f:
     ...     print(f.read())
+    >>> with polyopen("data.zst", "rb") as f:
+    ...     raw_line = f.readline()
     """
     filename = os.fsdecode(filename)
     if show_progress and mode in ('w', 'wt', 'wb', 'a', 'at', 'ab'):
         raise NotImplementedError('Progress tracking is currently isolated to reader paths. Write implementations are deferred.')
     if mode in ('r', 'rt', 'rb'):
-        return PolyReader(filename, show_progress=show_progress, timeout=timeout).open()
+        return PolyReader(filename, show_progress=show_progress, timeout=timeout, binary=(mode == 'rb')).open()
     elif mode in ('w', 'wt', 'wb'):
         effective_backup = True if backup is None else backup
-        return PolyWriter(filename, show_progress=show_progress, timeout=timeout).open(
+        return PolyWriter(filename, show_progress=show_progress, timeout=timeout, binary=(mode == 'wb')).open(
             append=False,
             backup=effective_backup,
             compresslevel=compresslevel,
         )
     elif mode in ('a', 'at', 'ab'):
         effective_backup = False if backup is None else backup
-        return PolyWriter(filename, show_progress=show_progress, timeout=timeout).open(
+        return PolyWriter(filename, show_progress=show_progress, timeout=timeout, binary=(mode == 'ab')).open(
             append=True,
             backup=effective_backup,
             compresslevel=compresslevel,
         )
     else:
         raise ValueError(
-            f"Unsupported mode: '{mode}'. Supported modes are 'r', 'rt', 'rb', 'w', 'wt', 'wb', 'a', 'at', 'ab' (all UTF-8 text)."
+            f"Unsupported mode: '{mode}'. Supported modes are 'r', 'rt', 'rb', 'w', 'wt', 'wb', 'a', 'at', 'ab'."
         )
 
 

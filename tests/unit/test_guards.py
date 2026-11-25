@@ -138,15 +138,40 @@ def test_invalid_modes_and_append_progress_and_timeout_validation(tmp_path, bad_
             polyopen(target, "r", timeout=bad_timeout)
 
 
-@pytest.mark.parametrize("w_mode,a_mode,r_mode", [("wt", "at", "rt"), ("wb", "ab", "rb")])
-def test_text_and_binary_alias_modes_are_utf8_text(tmp_path, w_mode, a_mode, r_mode):
-    """S2-B2 / S3-T1: Documented v0.1.0 contract — rt/wt/at and rb/wb/ab operate on UTF-8 str."""
-    target = tmp_path / f"alias_{w_mode}.txt"
+@pytest.mark.parametrize("w_mode,a_mode,r_mode", [("w", "a", "r"), ("wt", "at", "rt")])
+def test_text_modes_are_utf8_str_and_reject_bytes(tmp_path, w_mode, a_mode, r_mode):
+    """Text modes (r/rt, w/wt, a/at) operate on UTF-8 str and reject raw bytes."""
+    target = tmp_path / f"text_{w_mode}.txt"
     with polyopen(target, w_mode, backup=False) as w:
+        assert w.encoding == "utf-8"
         w.write("café\n")
         with pytest.raises(TypeError):
             w.write(b"raw bytes")
     with polyopen(target, a_mode) as w:
+        assert w.encoding == "utf-8"
         w.write("more\n")
     with polyopen(target, r_mode, compresslevel=9) as r:
-        assert r.read() == "café\nmore\n"
+        assert r.encoding == "utf-8"
+        content = r.read()
+        assert isinstance(content, str)
+        assert content == "café\nmore\n"
+
+
+def test_binary_modes_are_raw_bytes_and_reject_str(tmp_path):
+    """Binary modes (rb, wb, ab) operate on raw bytes (including non-UTF-8) and reject str."""
+    target = tmp_path / "raw_binary.bin"
+    raw1 = b"\x00\xff\xfe\x80first\n"
+    raw2 = b"\xde\xad\xbe\xefsecond\n"
+    with polyopen(target, "wb", backup=False) as w:
+        assert w.encoding is None
+        assert w.write(raw1) == len(raw1)
+        with pytest.raises(TypeError):
+            w.write("text not allowed")
+    with polyopen(target, "ab") as w:
+        assert w.encoding is None
+        assert w.write(raw2) == len(raw2)
+    with polyopen(target, "rb", compresslevel=9) as r:
+        assert r.encoding is None
+        content = r.read()
+        assert isinstance(content, bytes)
+        assert content == raw1 + raw2
