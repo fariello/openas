@@ -4,11 +4,11 @@ Thank you for contributing to `polyopen`.
 
 ## Local development setup
 
-1. Create and activate a Python 3.8+ virtual environment.
-2. Install the package in editable mode together with `pytest`:
+1. Create and activate a Python 3.9+ virtual environment.
+2. Install the package in editable mode with its development dependencies:
 
 ```bash
-pip install -e . pytest
+pip install -e ".[dev]"
 ```
 
 ## Running tests
@@ -25,7 +25,7 @@ Tests should verify observable behavior (outputs, exceptions, and side effects) 
 
 1. Create a focused branch from `main`.
 2. Add or update unit and regression tests for any behavior change or bug fix.
-3. Update relevant documentation (`README.md`, `docs/API.md`, `docs/CLI.md`, `FUNCTIONAL_SPEC.md`, or `ARCHITECTURE.md`) when public behavior changes.
+3. Update relevant documentation (`README.md`, `docs/API.md`, `docs/CLI.md`, `FUNCTIONAL_SPEC.md`, `ARCHITECTURE.md`, `DECISIONS.md`, or `CHANGELOG.md`) when public behavior or design invariants change.
 4. Keep commits scoped and free of secrets or machine-specific paths.
 5. Open a pull request describing what changed and how you verified it.
 

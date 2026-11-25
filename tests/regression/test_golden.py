@@ -13,7 +13,8 @@ EXPECTED_LINES = ["line 1\n", "line 2\n", "line 3\n"]
 
 def _independent_decode(path, ext: str) -> str:
     if ext == ".txt":
-        return open(path, "r", encoding="utf-8").read()
+        with open(path, "r", encoding="utf-8") as fh:
+            return fh.read()
     if ext == ".txt.gz":
         with gzip.open(path, "rt", encoding="utf-8") as fh:
             return fh.read()

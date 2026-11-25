@@ -2,57 +2,74 @@
 
 *[Return to Main README](../README.md)*
 
-This document serves as the formal specification for developers programmatically integrating `polyopen` into Python workspaces. 
+Formal Python API reference for `polyopen` v0.1.0.
 
-## The Core Wrapper
+## Unified Entry Point
 
-### `polyopen(filename: Union[str, os.PathLike], mode: str = 'r', backup: Optional[bool] = None, show_progress: bool = False, compresslevel: Optional[int] = None)`
-This function provides a drop-in replacement for the native Python `builtins.open()` context manager. It resolves remote protocols and stream compression formats automatically behind a uniform UTF-8 text interface.
+### `polyopen(filename, mode='r', backup=None, show_progress=False, compresslevel=None, timeout=None) -> Union[PolyReader, PolyWriter]`
+
+Opens a local or remote UTF-8 text stream with transparent compression and returns an opened `PolyReader` or `PolyWriter` context manager.
+
+> **UTF-8 text only:** All modes operate on UTF-8 `str`. Modes `'rb'`, `'wb'`, and `'ab'` are accepted as compatibility aliases for text modes; they do not return or accept raw `bytes`.
 
 #### Parameters
-- **`filename`** (`Union[str, os.PathLike]`): The target path or URL (for example `tests/data.txt`, `pathlib.Path("data.gz")`, `https://example.com/log.zst`, `ftp://user:pass@host/data.txt`, or `ssh://user@host/syslog`). Query strings are ignored when detecting extensions, and extension matching is case-insensitive.
-- **`mode`** (`str`): Target I/O mode:
-  - Reading operations (`'r'`, `'rt'`, `'rb'`) open a `PolyReader`.
-  - Writing / truncating operations (`'w'`, `'wt'`, `'wb'`) open a `PolyWriter(append=False)`.
-  - Appending operations (`'a'`, `'at'`, `'ab'`) open a `PolyWriter(append=True)`.
-- **`backup`** (`Optional[bool]`): Controls whether `polyopen` rotates an existing file before overwriting locally or over SSH/FTP. Rotation checks `<path>.001.bu` first in O(1); if occupied, it runs a single directory listing (`os.scandir` locally, `listdir` on SFTP/FTP) to select the lowest free 3-digit slot (`file.001.bu` through `file.999.bu`), falling back to a collision-safe nanosecond timestamp (`time.time_ns()`) past 999. Defaults to `None`, which resolves to `True` in write modes and `False` in append modes.
-  - *Guard Rails:* Explicitly passing `backup=True` with an append mode (`'a'`, `'at'`, `'ab'`) raises `ValueError`.
-- **`show_progress`** (`bool`): Enables a console `tqdm` progress bar tracking exact raw bytes read (compressed bytes on compressed streams, batched in 64 KiB increments with exact flush on EOF/exit/`close()`, and indeterminate `total=None` when stream size is unknown or missing `Content-Length`).
-  - *Guard Rails:* Only supported on `PolyReader`. Passing `show_progress=True` to `polyopen(..., 'w'/'a')` or `PolyWriter(..., show_progress=True)` raises `NotImplementedError`.
-- **`compresslevel`** (`Optional[int]`): Optional compression level or preset forwarded to write and append modes (ignored in read mode). When `None` (default), each compression library uses its own default: `zstd` level 3, `lzma` preset 6, `bz2` level 9, and `gzip` level 9.
+
+- **`filename`** (`Union[str, os.PathLike]`): Target path or URL (for example `tests/data.txt`, `pathlib.Path("data.gz")`, `https://example.com/log.zst`, `ftp://user@host/data.txt`, or `sftp://user@host/syslog.zst`). Query strings are ignored when detecting extensions, extension matching is case-insensitive, and FTP/SSH/SFTP credentials and paths are percent-decoded. `file://` URIs require an empty host or `localhost`.
+- **`mode`** (`str`, default `'r'`):
+  - Read (`'r'`, `'rt'`, `'rb'`): opens `PolyReader`.
+  - Write / truncate (`'w'`, `'wt'`, `'wb'`): opens `PolyWriter(append=False)`.
+  - Append (`'a'`, `'at'`, `'ab'`): opens `PolyWriter(append=True)`.
+  - Any other mode raises `ValueError`.
+- **`backup`** (`Optional[bool]`, default `None`): Rotates an existing file before overwriting locally or over SSH/SFTP/FTP. Checks `<path>.001.bu` first in O(1); if occupied, lists the parent directory once (`os.scandir` locally, single `listdir` on SFTP/FTP) to pick the lowest free slot (`.001.bu`..`.999.bu`), falling back to nanosecond timestamps (`time.time_ns()`) past 999. Resolves to `True` in write modes and `False` in append modes. Passing `backup=True` with append raises `ValueError`.
+- **`show_progress`** (`bool`, default `False`): Enables a `tqdm` progress bar on `PolyReader` tracking exact bytes read (batched at 64 KiB with exact remainder flush on EOF, early exit, and `close()`, falling back to `total=None` when stream size is unavailable). Passing `show_progress=True` in write/append modes or to `PolyWriter` raises `NotImplementedError`.
+- **`compresslevel`** (`Optional[int]`, default `None`): Optional compression level/preset forwarded to write/append codecs (ignored on read). Validated before backup rotation (booleans raise `TypeError`; out-of-range integers raise `ValueError`). Defaults when `None`: `zstd` level 3, `lzma` preset 6, `bz2` level 9, `gzip` level 9.
+- **`timeout`** (`Optional[float]`, default `None`): Optional positive timeout in seconds forwarded to HTTP (`requests.Session.get`), SSH/SFTP (`timeout`, `banner_timeout`, `auth_timeout`), and FTP (`connect`). Non-positive or boolean values raise `ValueError`.
 
 #### Exceptions
+
 All custom exceptions inherit from `PolyopenError`:
 
-- `UnsupportedArchiveError`: Raised when the normalized path matches an unsupported archive format (`.zip`, `.tar`, `.tgz`, `.7z`, `.rar`, `.tar.gz`, `.tar.bz2`, `.tar.zst`, `.gz.tar`), including URLs with query strings.
-- `ReadOnlyProtocolError`: Raised when attempting write or append operations on `http://` or `https://`.
-- `UnsupportedProtocolError`: Raised when invoking unsupported cloud object store schemes (`s3://`, `gs://`, `az://`, `hdfs://`), recommending `smart_open` or dedicated SDKs such as `boto3`.
-- Standard transport exceptions: missing remote SFTP files raise `FileNotFoundError` (never `SystemExit` or credential printing), and HTTP 4xx/5xx responses close the response and raise `requests.HTTPError`.
+- `UnsupportedArchiveError`: Raised when the normalized path matches a container archive extension (`.zip`, `.tar`, `.tgz`, `.rar`, `.7z`, `.tar.gz`, `.tar.bz2`, `.tar.xz`, `.tar.zst`, `.tar.lzma`, `.tbz`, `.tbz2`, `.txz`, `.tzst`, `.tlz`, `.gz.tar`, `.bz2.tar`, `.xz.tar`, `.zst.tar`), including URLs with query strings. URL credentials and query strings are redacted in the error message.
+- `ReadOnlyProtocolError`: Raised when writing or appending to `http://` or `https://`.
+- `UnsupportedProtocolError`: Raised for cloud object stores (`s3://`, `gs://`, `az://`, `hdfs://`), unknown `scheme://` URLs, non-localhost `file://` hosts, and FTP append mode.
+- Standard exceptions: `FileNotFoundError` for missing files/SFTP targets, `IsADirectoryError` when attempting local backup rotation on an existing directory, `requests.HTTPError` for HTTP 4xx/5xx responses (response closed before re-raising), and `ValueError` for invalid modes, missing URL hostnames, `append=True` + `backup=True`, invalid `timeout`, or operations on closed handles.
 
 ---
 
-## Direct Handler Abstractions
-
-Advanced callers bypassing `polyopen(...)` may use `PolyReader` and `PolyWriter` directly.
+## Direct Handler Classes
 
 ### `class PolyReader`
+
 Reads local and remote (`ftp://`, `ssh://`, `sftp://`, `http://`, `https://`) UTF-8 text streams with transparent `.gz`, `.bz2`, `.xz`, and multi-frame `.zst` decompression.
 
-#### Methods
-- **`__init__(self, filename: Union[str, os.PathLike], show_progress: bool = False)`**: Normalizes `PathLike` inputs via `os.fsdecode()` and configures optional raw-byte progress tracking.
-- **`open(self) -> 'PolyReader'`**: Establishes transport connections:
-  - FTP defaults to port 21 and forwards custom URL ports.
-  - SSH/SFTP defaults to port 22, forwards custom URL ports, caches `stat().st_size` once for `_get_file_size()`, and calls bounded `prefetch(file_size, max_concurrent_requests=64)` when size is known (falling back to `prefetch(file_size)` on Paramiko `<3.3`).
-  - HTTP/HTTPS reuses a thread-local, cookie-free `requests.Session` (`http.cookiejar.DefaultCookiePolicy(allowed_domains=[])`), validates status via `raise_for_status()` (closing the response on error), parses `Content-Length` safely, sets `response.raw.decode_content = True` strictly on uncompressed HTTP, and streams via `io.TextIOWrapper(response.raw, encoding='utf-8')`.
-  - Calling `open()` after `close()` reopens cleanly.
-- **`read(self, size: int = -1) -> str`**, **`readline(self, size: int = -1) -> str`**, **`readlines(self, hint: int = -1) -> list`**, **`__iter__(self)`**, and **`__next__(self) -> str`**: Standard file-object read methods returning UTF-8 `str`. When `show_progress=False`, `__iter__()` returns the underlying `io.TextIOBase` C-level iterator directly. Raise `ValueError` when called on a closed reader.
-- **`close(self) -> None`**: Deterministically and idempotently closes all acquired handles (`_fh`, `_raw_fh`, `_sftp_file`, `_sftp_client`, `_ssh_client`, `_ftp`, `_response`, and `_progress`) and resets state attributes, including on early iteration exit or when an individual handle close raises.
+#### Properties and Methods
+
+- **`__init__(self, filename: Union[str, os.PathLike], show_progress: bool = False, timeout: Optional[float] = None)`**: Normalizes `PathLike` inputs via `os.fsdecode()` and validates `timeout`.
+- **`closed` (`bool`)**, **`encoding` (`'utf-8'`)**, **`readable() -> True`**, **`writable() -> False`**, **`seekable() -> False`**, **`__repr__() -> str`** (with URL credentials/queries redacted).
+- **`open(self) -> PolyReader`**: Opens the transport and codec stream:
+  - FTP defaults to port 21, forwards custom ports and `timeout`, and wraps `ftputil.file.FTPFile` in an `io.BufferedIOBase` adapter.
+  - SSH/SFTP defaults to port 22, verifies system host keys (`load_system_host_keys()` + `RejectPolicy`), caches `stat().st_size` once, and invokes `prefetch(file_size, max_concurrent_requests=64)` when size is known (Paramiko `<3.3` falls back to `prefetch(file_size)`). Note: Paramiko buffers prefetched chunks in RAM until read.
+  - HTTP/HTTPS reuses a lock-initialized, thread-local, cookie-free `requests.Session`, sends `Accept-Encoding: identity` for compressed extensions, validates status via `raise_for_status()`, enables `response.raw.decode_content = True` strictly on uncompressed responses, and sets `total=None` if `Content-Encoding` is set on uncompressed responses.
+  - Reopening after `close()` works cleanly.
+- **`read(size=-1) -> str`**, **`readline(size=-1) -> str`**, **`readlines(hint=-1) -> list`**, **`__iter__()`**, **`__next__() -> str`**: Standard text read operations. Raise `ValueError` on a closed reader.
+- **`close() -> None`**: Deterministically and idempotently closes all acquired handles and resets state, even if one handle raises.
 
 ### `class PolyWriter`
-Writes local and remote (`ftp://`, `ssh://`, `sftp://`) UTF-8 text streams with transparent `.gz`, `.bz2`, `.xz`, and `.zst` compression and collision-safe backup rotation.
 
-#### Methods
-- **`__init__(self, filename: Union[str, os.PathLike], show_progress: bool = False)`**: Normalizes `PathLike` inputs via `os.fsdecode()`; raises `NotImplementedError` if `show_progress=True`.
-- **`open(self, append: bool = False, backup: bool = True, compresslevel: Optional[int] = None) -> 'PolyWriter'`**: Opens the target for writing or appending. Performs `.001.bu` O(1) fast-path backup rotation followed by a single directory listing (`os.scandir` locally with atomic `os.link`/`os.unlink` and `os.rename` fallback; single `listdir` on SFTP/FTP) capped at 999 sequential slots with collision-safe nanosecond timestamp fallback. Forwards optional `compresslevel` to `.zst`, `.gz`, `.bz2`, and `.xz` compressors (using library defaults when `None`: `zstd` level 3, `lzma` preset 6, `bz2` 9, `gzip` 9). FTP defaults to port 21; SSH/SFTP defaults to port 22, forwards custom URL ports, opens compressed targets in binary mode (`'wb'`/`'ab'`), and enables `set_pipelined(True)`.
-- **`write(self, data: str) -> int`**, **`writelines(self, lines) -> None`**, and **`flush(self) -> None`**: Write UTF-8 text (or an iterable of strings) and flush buffered output; raise `ValueError` when called on a closed writer. When `write` is not overridden by a subclass, `open()` binds `self.write` directly to `self._fh.write` for minimal per-call overhead.
-- **`close(self) -> None`**: Deterministically and idempotently closes all acquired handles (`_fh`, `_raw_fh`, `_sftp_file`, `_sftp_client`, `_ssh_client`, and `_ftp`) and resets state attributes, even if an individual handle fails to close.
+Writes local and remote (`ftp://`, `ssh://`, `sftp://`) UTF-8 text streams with transparent `.gz`, `.bz2`, `.xz`, and `.zst` compression and backup rotation.
+
+> **Context-manager options note:** `with PolyWriter(path) as w:` calls `open()` with defaults (`append=False, backup=True, compresslevel=None`). To pass custom options with a `with` statement, chain `with PolyWriter(path).open(append=..., backup=..., compresslevel=...) as w:` or use `polyopen(...)`.
+
+#### Properties and Methods
+
+- **`__init__(self, filename: Union[str, os.PathLike], show_progress: bool = False, timeout: Optional[float] = None)`**: Normalizes `PathLike` inputs; raises `NotImplementedError` if `show_progress=True`; validates `timeout`.
+- **`closed` (`bool`)**, **`encoding` (`'utf-8'`)**, **`readable() -> False`**, **`writable() -> True`**, **`seekable() -> False`**, **`__repr__() -> str`** (with URL credentials/queries redacted).
+- **`open(self, append: bool = False, backup: bool = True, compresslevel: Optional[int] = None) -> PolyWriter`**: Validates `compresslevel` and imports required codecs before rotating backups or opening the target. Local backups reject existing directories (`IsADirectoryError`) and use atomic `os.link`/`os.unlink`. SFTP opens binary mode (`'wb'`/`'ab'`) with `set_pipelined(True)` and wraps uncompressed writes in UTF-8 `io.TextIOWrapper` so `write()` returns `int`; SFTP backup retries rename collisions. FTP rejects `append=True` with `UnsupportedProtocolError`.
+- **`write(data: str) -> int`**, **`writelines(lines) -> None`**, **`flush() -> None`**: Write UTF-8 text and flush buffered output; raise `ValueError` when closed. When `write` is not overridden by a subclass, `open()` binds `self.write` directly to `self._fh.write`.
+- **`close() -> None`**: Deterministically and idempotently closes all acquired handles and resets state.
+
+---
+
+## Internal Compatibility Export
+
+- **`FTPSessionWrapper`**: Internal `ftplib.FTP` subclass used as the `ftputil` session factory. It remains lazily accessible via PEP 562 module `__getattr__` for backward compatibility in v0.1.0, is not intended for direct end-user use, and is scheduled for removal from `__all__` in v0.2.

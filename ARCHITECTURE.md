@@ -2,43 +2,72 @@
 
 *[Return to Main README](README.md)*
 
-The core philosophy of `polyopen` is mapping heterogeneous stream protocol objects and non-contiguous native algorithm dictionaries perfectly uniformly behind a single standard CPython `io.TextIOWrapper` barrier dynamically. 
+`polyopen` exposes a uniform UTF-8 `io.TextIOWrapper`-backed streaming interface over local files, remote network transports, and transparent stream compressors while keeping optional dependencies lazily imported.
 
-This strict separation ensures that complex internal file iterations natively remain immune to multi-level architectural memory boundaries seamlessly.
+## Stream Layering
 
-## Topology Core Components
+```text
+Caller (polyopen() / PolyReader / PolyWriter / CLI)
+  |
+  v
+Target Resolution & Guards (_resolve_target, _validate_write_options)
+  |-- rejects container archives (.zip, .tar.*, .7z, .rar, ...)
+  |-- rejects cloud schemes (s3://, gs://, az://, hdfs://) and unknown scheme://
+  |-- rejects HTTP/HTTPS writes and FTP append
+  |-- validates compresslevel & imports codec before backup rotation
+  v
+Transport Layer (_wrap_local, _wrap_http, _wrap_ftp, _wrap_ssh)
+  |-- Local: plain file / atomic os.link+os.unlink backup rotation
+  |-- HTTP/HTTPS: thread-local cookie-free requests.Session + _HttpRawStream
+  |-- FTP: ftputil.FTPHost + FTPSessionWrapper + _BinaryStreamAdapter
+  |-- SSH/SFTP: paramiko.SSHClient (system host keys) + SFTPFile + _BinaryStreamAdapter
+  v
+Optional Raw-Byte Counter (_CountingByteStream, when show_progress=True)
+  v
+Codec Layer (.gz, .bz2, .xz, .zst multi-frame, or plain UTF-8)
+  v
+UTF-8 Text Interface (io.TextIOWrapper / io.TextIOBase)
+```
 
-### 1. The Interceptor Routing Engine (`polyopen()`)
-Provides a drop-in factory facade over `PolyReader` and `PolyWriter`:
-- Maps `'r'`/`'rt'`/`'rb'` to `PolyReader`, `'w'`/`'wt'`/`'wb'` to `PolyWriter(append=False)`, and `'a'`/`'at'`/`'ab'` to `PolyWriter(append=True)`.
-- Forwards `backup`, `show_progress`, and optional `compresslevel: Optional[int] = None` (ignored in read mode) to the underlying handler.
-- Defers optional standard library (`argparse`, `bz2`, `ftplib`, `gzip`, `lzma`, `urllib.parse`) and transport dependencies (`paramiko`, `ftputil`, `requests`, `zstandard`, `tqdm`) to first use, including PEP 562 lazy resolution for `FTPSessionWrapper`.
+## Core Components
 
-### 2. URL Protocol Extractor
-Uses `urllib.parse.urlparse` on demand (skipped for plain local paths without `:`):
-- Detects explicit scheme prefixes (`ftp://`, `ssh://`, `sftp://`, `http://`, `https://`, `file://`).
-- Converts `file://` URIs to local OS paths via `urllib.request.url2pathname`.
-- Explicitly rejects cloud object store schemes (`s3://`, `gs://`, `az://`, `hdfs://`) by raising `UnsupportedProtocolError`.
+### 1. Routing Facade (`polyopen()`)
 
-### 3. Context De-Mux Handlers (`_wrap_*`)
-Determines backend communication semantics and isolates transport handle lifecycles cleanly:
-- **`_wrap_ssh` & `_wrap_ftp`**: Support both reading and writing (default port 22 for SSH/SFTP and 21 for FTP, forwarding custom URL ports). On write, optional `compresslevel: Optional[int] = None` forwards `level` (`zstandard`), `preset` (`lzma`), or `compresslevel` (`gzip`, `bz2`), omitting `None` so each library uses its own default (`zstd` level 3, `lzma` preset 6, `bz2` 9, `gzip` 9). Compressed SSH writes open the SFTP file in binary mode (`'wb'`/`'ab'`) and call `set_pipelined(True)`. SFTP reads record `stat().st_size` once in `_sftp_file_size` (avoiding duplicate round trips in `_get_file_size()`) and invoke bounded `prefetch(file_size, max_concurrent_requests=64)` when file size is known (falling back to `prefetch(file_size)` on Paramiko `<3.3` `TypeError`). Backup rotation checks `<path>.001.bu` first in O(1); if occupied, it performs a single directory listing (`os.scandir` locally, `listdir` on SFTP/FTP with POSIX parent splitting) to pick the lowest free 3-digit ASCII slot up to `.999.bu`, falling back to collision-safe nanosecond timestamps (`time.time_ns()`). Local backups use atomic `os.link()` + `os.unlink()` with `os.rename()` fallback when hard links are unavailable. Missing SFTP files propagate `FileNotFoundError` cleanly without printing credentials or calling `exit(1)`. `close()` is idempotent and closes `_fh`, `_raw_fh`, `_sftp_file`, `_sftp_client`, `_ssh_client`, `_ftp`, `_response`, and `_progress` via `_close_handles()` even when an individual handle raises.
-- **`_wrap_http`**: Uses a thread-local `requests.Session` from `_get_http_session()` with cookie persistence disabled (`http.cookiejar.DefaultCookiePolicy(allowed_domains=[])`). Validates status with `response.raise_for_status()` (closing the response on error), parses `Content-Length` safely to `Optional[int]`, and matches extensions case-insensitively on the URL path without query strings. Uncompressed HTTP responses set `response.raw.decode_content = True` and stream via `io.TextIOWrapper(_HttpRawStream(response.raw), encoding='utf-8')`, while compressed responses pass raw bytes directly to the matching decompressor without toggling `decode_content`. Closing the reader deterministically calls `response.close()`, including on early iteration exit.
-- **Hot-Path Iteration, Progress Accounting, and CLI Fan-Out**: When `show_progress=False`, `PolyReader.__iter__()` returns the underlying `io.TextIOBase` C-level iterator directly. When `show_progress=True`, compressed streams wrap their binary handle in `_CountingByteStream`, batching `tqdm` updates in 64 KiB increments with exact remainder flushes on EOF, early exit, and `close()`, and falling back to `total=None` when stream size is unknown. `PolyWriter.open()` binds `self.write` directly to `self._fh.write` when `write` is not overridden by a subclass, and exposes `PolyWriter.writelines()`. The CLI `--write` command uses `contextlib.ExitStack` to read the source once and fan out each line synchronously to all destination writers, closing every handle on error.
+`polyopen()` maps modes to `PolyReader` (`'r'`, `'rt'`, `'rb'`) or `PolyWriter` (`'w'`, `'wt'`, `'wb'` with `append=False`; `'a'`, `'at'`, `'ab'` with `append=True`), forwarding `backup`, `show_progress`, optional `compresslevel`, and optional `timeout`. All modes operate on UTF-8 text (`str`).
 
-### 4. Mathematical Chunk Boundaries & Compression (`io.TextIOWrapper`)
-Directly extracts dictionary frame sizes globally enforcing contiguous buffer extraction formats reliably:
-- Defers dictionary buffer maps explicitly to standard internal packages natively tracking algorithms independently (`gzip`, `bz2`, `lzma`).
-- Evaluates purely autonomous C-binding interfaces dynamically intercepting the `zstandard` module mapping chunk output frames seamlessly identically conforming to CPython bounds dynamically (e.g. standardizes variable byte output block tracking arrays enforcing native `128KB` chunk alignment implicitly).
+Optional standard library modules (`argparse`, `atexit`, `bz2`, `ftplib`, `gzip`, `lzma`, `urllib.parse`, `urllib.request`) and third-party packages (`paramiko`, `ftputil`, `requests`, `zstandard`, `tqdm`) are imported lazily on first use. `FTPSessionWrapper` is exposed lazily via PEP 562 module `__getattr__`.
 
-## Local Development Topology
+### 2. Target Resolution and Safety Guards
 
-The localized development and testing frameworks are strictly mapped executing continuous validation loops verifying system boundary architectures correctly cleanly structurally.
+`_resolve_target()` skips URL parsing for plain local paths without `:` and parses URLs on demand:
 
-### Hybrid Evaluation Mocks
-To maintain a blazingly fast iteration scope safely averting massive computational CI overhead constraints locally:
-- Exact algorithm ingestion validation paths uniformly track memory constraints verifying boundary overlaps perfectly against heavily isolated native files identically (`tests/unit/test_local_io.py`).
-- SFTP and remote HTTP dependencies uniquely evaluate Mocked byte objects statically determining strictly algorithmic logic intercepts successfully tracking code branches correctly entirely independently avoiding establishing live architectural nodes entirely (`tests/unit/test_routing.py`).
+- `file://` URIs are accepted only with an empty host or `localhost` and converted via `urllib.request.url2pathname` (decoding percent-encoded paths).
+- Cloud object store schemes (`s3://`, `gs://`, `az://`, `hdfs://`) and unrecognized multi-letter `scheme://` URLs raise `UnsupportedProtocolError`.
+- Supported remote URLs (`http`, `https`, `ftp`, `ssh`, `sftp`) require a non-empty hostname; FTP and SSH/SFTP credentials and paths are percent-decoded via `urllib.parse.unquote`.
+- Extension checks match case-insensitively on the URL path (ignoring query strings) and reject container archives (`UNSUPPORTED_ARCHIVES`) with `UnsupportedArchiveError`.
+- `_redact_url()` masks URL passwords and query parameters before printing in CLI output, `__repr__()`, or archive error messages.
 
-### Golden Master Subsystem
-Internal logic strictly relies upon isolated 1KB backend archive references internally housed validating internal memory execution targets fundamentally ensuring backwards binary decoding loops permanently remain identical seamlessly (`tests/fixtures/gold.zst`, `tests/regression/test_golden.py`).
+### 3. Transport Wrappers
+
+- **Local (`_wrap_local`, `_backup_local_file`):** Validates `compresslevel` and imports optional codecs before touching disk. Backup rotation checks `<path>.001.bu` first in O(1); if occupied, it scans the parent directory once via `os.scandir` to find the lowest free 3-digit ASCII slot up to `.999.bu`, then falls back to nanosecond timestamps (`time.time_ns()`). Existing directories raise `IsADirectoryError` rather than being renamed. Moves use atomic `os.link()` + `os.unlink()`, falling back to `os.rename()` (only when the destination does not exist per `os.path.lexists`) on filesystems that do not support hard links.
+- **SSH / SFTP (`_wrap_ssh`, `_ssh_backup_if`):** Uses `paramiko.SSHClient()` with `load_system_host_keys()` and Paramiko's default `RejectPolicy`. Assigns `self._ssh_client` before `connect()` so host-key or authentication failures close the transport thread cleanly. Reads record `stat().st_size` once in `_sftp_file_size` and invoke `prefetch(file_size, max_concurrent_requests=64)` when size is known (falling back to `prefetch(file_size)` on Paramiko `<3.3`). Writes open SFTP files in binary mode (`'wb'`/`'ab'`), enable `set_pipelined(True)`, wrap uncompressed streams in `io.TextIOWrapper(_BinaryStreamAdapter(...), encoding='utf-8')` so `write()` consistently returns `int`, and retry backup `rename()` collisions.
+- **FTP (`_wrap_ftp`, `FTPSessionWrapper`):** Uses `ftputil.FTPHost` with `FTPSessionWrapper` (default port 21, custom ports and optional `timeout` forwarded, socket closed if `login()` fails). Wraps `ftputil.file.FTPFile` in `_BinaryStreamAdapter(io.BufferedIOBase)` so `io.TextIOWrapper`, `bz2.open`, and `lzma.open` work reliably on real FTP handles. FTP append mode is rejected up front with `UnsupportedProtocolError`.
+- **HTTP / HTTPS (`_wrap_http`, `_get_http_session`):** Reuses a lock-initialized, thread-local `requests.Session` with cookie persistence disabled (`DefaultCookiePolicy(allowed_domains=[])`) and `atexit` cleanup. Sends `Accept-Encoding: identity` on compressed extensions so servers do not double-encode compressed bodies. On uncompressed responses, enables `response.raw.decode_content = True`, streams through `_HttpRawStream(response.raw)`, and sets `_http_file_size = None` when `Content-Encoding` is present so progress bars do not compare compressed `Content-Length` against decompressed bytes.
+
+### 4. Hot Paths, Progress Accounting, Handle Teardown, and CLI
+
+- **Iteration and Write Hot Paths:** When `show_progress=False`, `PolyReader.__iter__()` returns the underlying `io.TextIOBase` C-level iterator directly. When `PolyWriter.write` is not overridden by a subclass, `PolyWriter.open()` binds `self.write` directly to `self._fh.write` (removed on `close()`).
+- **Progress Accounting:** Compressed and remote streams wrap their binary handle in `_CountingByteStream`; `_iter_progress()` batches `tqdm` updates in 64 KiB increments, stays synchronized with `self._progress_pending`/`self._progress_raw_bytes` across `yield`, and flushes exact remainders on EOF, early exit, or `close()`. Uncompressed local reads count UTF-8 byte length (`len(line.encode('utf-8'))`). When file size is unavailable or `stat()`/`getsize()` fails, `tqdm` uses `total=None`.
+- **Deterministic Teardown:** `close()` snapshots and clears all handle attributes before invoking `_close_handles()`, ensuring idempotent cleanup even when one handle fails to close. Mid-`open()` cleanup catches `BaseException` so interrupts (`KeyboardInterrupt`) do not leak sockets or threads.
+- **CLI (`main()`, `src/polyopen/__main__.py`):** Exposed via `polyopen`, `python -m polyopen`, and `python -m polyopen.polyopen`. `--write` pre-validates destination guards before opening streams, reads the source once inside `contextlib.ExitStack`, and fans lines out synchronously to all destinations.
+
+## Test and Benchmark Layout
+
+- **Unit tests (`tests/unit/`):**
+  - `test_local_io.py`: Local codecs, chunking, backups, progress accounting, `file://` URIs, lifecycle, lazy imports, and file-like attributes.
+  - `test_routing.py`: Mocked FTP/SFTP/HTTP routing, real `FTPFile`-contract tests, `FTPSessionWrapper`, percent-decoding, timeouts, and an ephemeral local `ThreadingHTTPServer` for cookie-free and gzip HTTP streaming.
+  - `test_guards.py`: Archive guards, protocol guards, invalid modes, append/backup conflicts, and text/binary alias contracts.
+- **Regression tests (`tests/regression/`):**
+  - `test_golden.py`: Reads and round-trip verifies `tests/fixtures/gold.txt`, `gold.txt.gz`, `gold.txt.bz2`, `gold.txt.xz`, and `gold.txt.zst` against independent stdlib and `zstandard` decoders.
+  - `test_cli.py`: CLI flags, single-pass broadcast, error exits, credential redaction, and checkout `src/` import verification.
+- **Benchmarks (`benchmarks/bench_polyopen.py`):** Standalone informational suite measuring import latency, 200k-line read/write throughput, compression peak RSS, local HTTP throughput, 500-backup rotation latency, and 3-target CLI broadcast.
