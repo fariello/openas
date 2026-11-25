@@ -10,4 +10,4 @@ url: "https://github.com/fariello/polyopen"
 authors:
   - family-names: "Fariello"
     given-names: "Gabriele"
-abstract: "A Python module for unified stream-level reading and writing across local files, remote protocols (HTTP, HTTPS, FTP, SSH, SFTP), and transparent compression formats (.gz, .bz2, .xz, .zst)."
+abstract: "A Python library and CLI for line-by-line and chunked streaming I/O across plain and compressed files (.gz, .bz2, .xz, .zst) in UTF-8 text or binary mode over local paths, HTTP/HTTPS, FTP, and SSH/SFTP."

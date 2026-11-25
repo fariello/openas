@@ -42,26 +42,26 @@ Use the unified `polyopen()` function for local or remote compressed streams in 
 ```python
 from polyopen import polyopen
 
-# 1. Stream a compressed text file line-by-line (local or remote)
+# 1. Write a compressed text file (optional compresslevel tunes speed vs ratio)
+with polyopen("events.jsonl.zst", "w", compresslevel=3) as f:
+    f.write('{"event": "start"}\n')
+
+# 2. Append to the compressed file without creating a .bu backup
+with polyopen("events.jsonl.zst", "a") as f:
+    f.writelines(['{"event": "tick"}\n', '{"event": "stop"}\n'])
+
+# 3. Stream the compressed text file back line-by-line
 with polyopen("events.jsonl.zst", "r") as f:
     for line in f:
-        process(line)
+        print(line.strip())
 
-# 2. Write a compressed file (optional compresslevel tunes speed vs ratio)
-with polyopen("output.bz2", "w", compresslevel=6) as f:
-    f.write("Hello, World!\n")
-
-# 3. Append without creating a .bu backup file
-with polyopen("output.bz2", "a") as f:
-    f.writelines(["Appended line 1.\n", "Appended line 2.\n"])
-
-# 4. Read and write raw binary streams (including non-UTF-8 payloads)
+# 4. Write and stream back a raw binary compressed file (including non-UTF-8 bytes)
 with polyopen("payload.bin.gz", "wb", backup=False) as f:
     f.write(b"\x00\xffrecord1\nrecord2\n")
 
 with polyopen("payload.bin.gz", "rb") as f:
     for raw_line in f:
-        process_bytes(raw_line)
+        print(raw_line)
 ```
 
 ## Capabilities and Support Matrix
@@ -154,6 +154,13 @@ python benchmarks/bench_polyopen.py
 - [Guiding Principles](GUIDING_PRINCIPLES.md): Core engineering boundaries of `polyopen`.
 - [Changelog](CHANGELOG.md): Release history.
 - [Contributing](CONTRIBUTING.md): Development workflow and testing expectations.
+
+## Troubleshooting and Tips
+
+- **SSH `known_hosts` / `RejectPolicy` errors:** `polyopen` loads system host keys (`load_system_host_keys()`) and enforces Paramiko's `RejectPolicy` to protect against Man-in-the-Middle attacks. If a connection fails because the host key is unknown, verify the server's fingerprint out of band and add the verified host key to `~/.ssh/known_hosts` (for example via an interactive `ssh` check or `ssh-keyscan` after verifying the fingerprint). Do not disable host-key verification.
+- **Special characters in URL credentials or paths:** Percent-encode reserved characters (`@` as `%40`, `:` as `%3A`, `/` as `%2F`, space as `%20`, `%` as `%25`) in `ftp://`, `ssh://`, and `sftp://` URLs (for example `sftp://user@host/logs%202026/data.gz`, or if inline credentials cannot be avoided, `ftp://user:p%40ss@host/data.txt`). `polyopen` decodes FTP/SSH/SFTP credentials and paths automatically via `urllib.parse.unquote()`. Prefer SSH agent or `~/.ssh` key authentication over inline passwords.
+- **`UnsupportedArchiveError` on `.zip` or `.tar.*` files:** `polyopen` handles single-file streams and rejects multi-file container archives to prevent corrupting archive headers or directory tables. Use Python's `zipfile` module for `.zip` archives and `tarfile` for `.tar` and `.tar.*` archives.
+- **Streaming multi-GB `.zst` and `.gz` corpora in `'rb'` mode:** When downstream parsers accept `bytes` directly (for example JSON or byte-level log parsers), open large compressed files with `'rb'` instead of `'r'`. Binary mode avoids per-line UTF-8 decoding overhead and uses C-level `io.BufferedReader` line scanning; benchmark your own environment with `benchmarks/bench_polyopen.py`.
 
 ## Known Limitations
 
