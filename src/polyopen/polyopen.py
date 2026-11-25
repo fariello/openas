@@ -76,11 +76,17 @@ class ReadOnlyProtocolError(PolyopenError):
 class UnsupportedProtocolError(PolyopenError):
     """Exception raised when an explicitly unsupported protocol is invoked."""
 
-UNSUPPORTED_ARCHIVES = ('.zip', '.tar', '.tgz', '.rar', '.7z', '.gz.tar', '.tar.gz', '.tar.bz2', '.tar.zst')
+UNSUPPORTED_ARCHIVES = (
+    '.zip', '.tar', '.tgz', '.rar', '.7z',
+    '.gz.tar', '.bz2.tar', '.xz.tar', '.zst.tar',
+    '.tar.gz', '.tar.bz2', '.tar.xz', '.tar.zst', '.tar.lzma',
+    '.tbz', '.tbz2', '.txz', '.tzst', '.tlz',
+)
 
 import errno
 import io
 import os
+import threading
 import time
 from typing import TYPE_CHECKING, Optional, Union
 
@@ -88,12 +94,86 @@ if TYPE_CHECKING:
     from urllib.parse import ParseResult
 
 _NETWORK_SCHEMES = frozenset(('http', 'https', 'ftp', 'ssh', 'sftp', 's3', 'gs', 'az', 'hdfs'))
+_SUPPORTED_SCHEMES = frozenset(('file', 'http', 'https', 'ftp', 'ssh', 'sftp'))
+_CLOUD_SCHEMES = frozenset(('s3', 'gs', 'az', 'hdfs'))
 _LINK_FALLBACK_ERRNOS = frozenset(
     code
     for name in ('EOPNOTSUPP', 'ENOTSUP', 'ENOSYS', 'EPERM', 'EXDEV', 'EMLINK')
     for code in (getattr(errno, name, None),)
     if code is not None
 )
+
+
+class _BinaryStreamAdapter(io.BufferedIOBase):
+    """io.BufferedIOBase adapter for binary streams (e.g. ftputil FTPFile, Paramiko SFTPFile)."""
+
+    def __init__(self, raw, *, readable: bool = False, writable: bool = False):
+        self._raw = raw
+        self._readable = readable
+        self._writable = writable
+        self._closed = False
+        self._raw_close_attempted = False
+
+    @property
+    def closed(self) -> bool:
+        return self._closed
+
+    def readable(self) -> bool:
+        return self._readable
+
+    def writable(self) -> bool:
+        return self._writable
+
+    def seekable(self) -> bool:
+        return False
+
+    def read(self, size: int = -1):
+        if self._closed:
+            raise ValueError("I/O operation on closed file.")
+        if size is None or size < 0:
+            return self._raw.read()
+        return self._raw.read(size)
+
+    def read1(self, size: int = -1):
+        if self._closed:
+            raise ValueError("I/O operation on closed file.")
+        read1_fn = getattr(self._raw, 'read1', None)
+        if read1_fn is not None:
+            return read1_fn(size)
+        return self.read(size)
+
+    def readinto(self, b):
+        if self._closed:
+            raise ValueError("I/O operation on closed file.")
+        readinto_fn = getattr(self._raw, 'readinto', None)
+        if readinto_fn is not None:
+            return readinto_fn(b)
+        data = self.read(len(b))
+        n = len(data)
+        b[:n] = data
+        return n
+
+    def write(self, b):
+        if self._closed:
+            raise ValueError("I/O operation on closed file.")
+        data = bytes(b) if isinstance(b, memoryview) else b
+        res = self._raw.write(data)
+        return res if isinstance(res, int) else len(data)
+
+    def flush(self):
+        if self._closed:
+            raise ValueError("I/O operation on closed file.")
+        flush_fn = getattr(self._raw, 'flush', None)
+        if flush_fn is not None:
+            flush_fn()
+
+    def close(self):
+        if not self._closed:
+            self._closed = True
+            self._raw_close_attempted = True
+            close_fn = getattr(self._raw, 'close', None)
+            if close_fn is not None:
+                close_fn()
 
 
 class _HttpRawStream(io.BufferedIOBase):
@@ -207,6 +287,100 @@ def format_bytes(num: float) -> str:
     return f"{num:3.1f}YB"
 
 
+def _redact_url(target: str) -> str:
+    """Mask URL passwords and query strings so credentials/tokens never leak in logs or errors."""
+    if '://' not in target:
+        return target
+    from urllib.parse import urlsplit, urlunsplit
+    parts = urlsplit(target)
+    if parts.password is None and not parts.query:
+        return target
+    netloc = parts.netloc
+    if parts.password is not None and '@' in netloc:
+        userinfo, hostport = netloc.rsplit('@', 1)
+        if ':' in userinfo:
+            user, _ = userinfo.split(':', 1)
+            netloc = f"{user}:***@{hostport}"
+        else:
+            netloc = f"***@{hostport}"
+    query = '<redacted>' if parts.query else ''
+    return urlunsplit((parts.scheme, netloc, parts.path, query, parts.fragment))
+
+
+def _validate_timeout(timeout: Optional[float]) -> Optional[float]:
+    """Validate optional network timeout (positive float/int or None)."""
+    if timeout is None:
+        return None
+    if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or timeout <= 0:
+        raise ValueError("timeout must be a positive number or None.")
+    return float(timeout)
+
+
+def _validate_write_options(norm: str, compresslevel: Optional[int]) -> None:
+    """Validate compresslevel and import optional codecs before rotating backups or opening files."""
+    if compresslevel is not None:
+        if isinstance(compresslevel, bool) or not isinstance(compresslevel, int):
+            raise TypeError(f"compresslevel must be an int or None, got {type(compresslevel).__name__}.")
+    if norm.endswith('.zst'):
+        import zstandard as zstd
+        if compresslevel is not None:
+            zstd.ZstdCompressor(level=compresslevel)
+    elif norm.endswith('.bz2'):
+        if compresslevel is not None and not (1 <= compresslevel <= 9):
+            raise ValueError(f"bz2 compresslevel must be between 1 and 9, got {compresslevel}.")
+    elif norm.endswith('.gz'):
+        if compresslevel is not None and not (0 <= compresslevel <= 9):
+            raise ValueError(f"gzip compresslevel must be between 0 and 9, got {compresslevel}.")
+    elif norm.endswith('.xz'):
+        import lzma
+        if compresslevel is not None:
+            preset_level = compresslevel & ~lzma.PRESET_EXTREME
+            if preset_level < 0 or preset_level > 9 or (compresslevel & ~(lzma.PRESET_EXTREME | 0xF)) != 0:
+                raise ValueError(f"lzma preset must be between 0 and 9 (optionally OR'd with PRESET_EXTREME), got {compresslevel}.")
+
+
+def _resolve_target(filename: str):
+    """Parse and validate target URL or local path, returning (resolved_filename, parsed, scheme)."""
+    if ':' not in filename:
+        return filename, None, ''
+    from urllib.parse import urlparse
+    parsed = urlparse(filename)
+    scheme = parsed.scheme.lower()
+    if scheme == 'file':
+        if parsed.netloc and parsed.netloc.lower() != 'localhost':
+            raise UnsupportedProtocolError(
+                f"Unsupported remote host '{parsed.netloc}' in file:// URI: {_redact_url(filename)}. "
+                f"Only local file:// URIs (empty host or localhost) are supported."
+            )
+        from urllib.request import url2pathname
+        local_path = url2pathname(parsed.path)
+        return local_path, None, ''
+    if scheme in _CLOUD_SCHEMES:
+        raise UnsupportedProtocolError(
+            f"polyopen does not support cloud object stores ('{parsed.scheme}://'). "
+            f"Use 'smart_open' or a dedicated cloud SDK (such as boto3) instead."
+        )
+    if scheme in _SUPPORTED_SCHEMES:
+        if not parsed.hostname:
+            raise ValueError(f"Missing hostname in {scheme}:// URL: {_redact_url(filename)}")
+        return filename, parsed, scheme
+    if len(scheme) > 1 and f"{scheme}://" in filename.lower():
+        raise UnsupportedProtocolError(
+            f"Unsupported protocol '{parsed.scheme}://'. "
+            f"Supported protocols: file, http, https, ftp, ssh, sftp."
+        )
+    return filename, parsed, ''
+
+
+def _unquote_remote_parts(parsed: ParseResult):
+    """Percent-decode username, password, and path components of FTP/SSH/SFTP URLs."""
+    from urllib.parse import unquote
+    username = unquote(parsed.username) if parsed.username is not None else None
+    password = unquote(parsed.password) if parsed.password is not None else None
+    remote_path = unquote(parsed.path)
+    return username, password, remote_path
+
+
 def _normalized_path(filename: str, parsed: Optional[ParseResult] = None) -> str:
     """Return lowercase path component for network URLs and lowercase filename for local paths."""
     if parsed is not None and parsed.scheme.lower() in _NETWORK_SCHEMES:
@@ -222,6 +396,8 @@ def _close_handles(*handles):
         if handle is None or id(handle) in seen:
             continue
         seen.add(id(handle))
+        if getattr(handle, 'closed', False) is True:
+            continue
         close_fn = getattr(handle, 'close', None)
         if close_fn is None:
             continue
@@ -230,6 +406,11 @@ def _close_handles(*handles):
         except Exception as err:
             if first_err is None:
                 first_err = err
+        buf = getattr(handle, 'buffer', None)
+        if isinstance(buf, _BinaryStreamAdapter) and buf._raw_close_attempted:
+            seen.add(id(buf._raw))
+        elif isinstance(handle, _BinaryStreamAdapter) and handle._raw_close_attempted:
+            seen.add(id(handle._raw))
     if first_err is not None:
         raise first_err
 
@@ -267,24 +448,47 @@ def _select_backup_filename(path: str, basename: str, entry_names, reserved_slot
     return f"{path}.{ts_ns}.bu"
 
 
+_http_session_lock = threading.Lock()
 _http_session_local = None
+_http_sessions_registry = []
+_http_atexit_registered = False
+
+
+def _close_registered_http_sessions():
+    """Close all thread-local requests.Session objects created by _get_http_session() at interpreter exit."""
+    with _http_session_lock:
+        sessions = list(_http_sessions_registry)
+        _http_sessions_registry.clear()
+    for session in sessions:
+        try:
+            session.close()
+        except Exception:
+            pass
 
 
 def _get_http_session():
     """Return a thread-local requests.Session with cookie persistence disabled."""
-    global _http_session_local
+    global _http_session_local, _http_atexit_registered
     local = _http_session_local
     if local is None:
-        import threading
-        local = threading.local()
-        _http_session_local = local
+        with _http_session_lock:
+            local = _http_session_local
+            if local is None:
+                local = threading.local()
+                _http_session_local = local
     session = getattr(local, 'session', None)
     if session is None:
+        import atexit
         import http.cookiejar
         import requests
         session = requests.Session()
         session.cookies.set_policy(http.cookiejar.DefaultCookiePolicy(allowed_domains=[]))
         local.session = session
+        with _http_session_lock:
+            _http_sessions_registry.append(session)
+            if not _http_atexit_registered:
+                atexit.register(_close_registered_http_sessions)
+                _http_atexit_registered = True
     return session
 
 
@@ -322,7 +526,14 @@ def _ftp_session_wrapper_class():
                 Initializes the FTP connection and logs in with the provided credentials.
             """
 
-            def __init__(self, host: str, userid: str, password: str, port: Optional[int] = 21):
+            def __init__(
+                self,
+                host: str,
+                userid: str,
+                password: str,
+                port: Optional[int] = 21,
+                timeout: Optional[float] = None,
+            ):
                 """
                 Initialize the FTPSessionWrapper with the given host, userid, password, and port.
 
@@ -339,15 +550,27 @@ def _ftp_session_wrapper_class():
                     The password for FTP login.
                 port : int or None, optional
                     The port to connect to on the FTP server (defaults to 21 when None).
+                timeout : float or None, optional
+                    Optional socket timeout in seconds.
                 """
                 if port is None:
                     port = 21
                 # Initialize the parent ftplib.FTP class
                 ftplib.FTP.__init__(self)
-                # Connect to the specified FTP server on the given port
-                self.connect(host, port)
-                # Log in to the FTP server with the provided username and password
-                self.login(userid, password)
+                try:
+                    # Connect to the specified FTP server on the given port
+                    if timeout is not None:
+                        self.connect(host, port, timeout=timeout)
+                    else:
+                        self.connect(host, port)
+                    # Log in to the FTP server with the provided username and password
+                    self.login(userid, password)
+                except BaseException:
+                    try:
+                        self.close()
+                    except Exception:
+                        pass
+                    raise
 
         _FTP_SESSION_WRAPPER_CLASS = FTPSessionWrapper
     return _FTP_SESSION_WRAPPER_CLASS
@@ -380,7 +603,12 @@ class PolyReader:
         Closes the file.
     """
 
-    def __init__(self, filename: Union[str, os.PathLike], show_progress: bool = False):
+    def __init__(
+        self,
+        filename: Union[str, os.PathLike],
+        show_progress: bool = False,
+        timeout: Optional[float] = None,
+    ):
         """
         Initialize PolyReader with a filename.
 
@@ -390,15 +618,19 @@ class PolyReader:
             The name of the file to read.
         show_progress : bool
             Whether to show a progress bar.
+        timeout : float or None, optional
+            Optional network timeout in seconds for HTTP, FTP, and SSH/SFTP connections.
         """
         self.filename = os.fsdecode(filename)
         self.show_progress = show_progress
+        self.timeout = _validate_timeout(timeout)
         self._fh = None
         self._raw_fh = None
         self._ssh_client = None
         self._sftp_client = None
         self._sftp_file = None
         self._sftp_file_size = None
+        self._sftp_stat_checked = False
         self._ftp = None
         self._ftp_path = None
         self._response = None
@@ -522,55 +754,46 @@ class PolyReader:
 
             update = progress.update
             if counting is not None:
-                pending = self._progress_pending
-                raw_bytes = self._progress_raw_bytes
                 if is_text:
                     for line in fh:
-                        delta = counting.bytes_read - raw_bytes
+                        delta = counting.bytes_read - self._progress_raw_bytes
                         if delta > 0:
-                            raw_bytes += delta
-                            pending += delta
-                            if pending >= 65536:
-                                update(pending)
-                                pending = 0
-                            self._progress_raw_bytes = raw_bytes
-                            self._progress_pending = pending
+                            self._progress_raw_bytes += delta
+                            self._progress_pending += delta
+                            if self._progress_pending >= 65536:
+                                update(self._progress_pending)
+                                self._progress_pending = 0
                         yield line
                 else:
                     for line in fh:
                         if isinstance(line, bytes):
                             line = line.decode('utf-8')
-                        delta = counting.bytes_read - raw_bytes
+                        delta = counting.bytes_read - self._progress_raw_bytes
                         if delta > 0:
-                            raw_bytes += delta
-                            pending += delta
-                            if pending >= 65536:
-                                update(pending)
-                                pending = 0
-                            self._progress_raw_bytes = raw_bytes
-                            self._progress_pending = pending
+                            self._progress_raw_bytes += delta
+                            self._progress_pending += delta
+                            if self._progress_pending >= 65536:
+                                update(self._progress_pending)
+                                self._progress_pending = 0
                         yield line
             elif is_text:
-                line_len = len
-                pending = self._progress_pending
                 for line in fh:
-                    pending += line_len(line)
-                    if pending >= 65536:
-                        update(pending)
-                        pending = 0
-                    self._progress_pending = pending
+                    self._progress_pending += len(line.encode('utf-8'))
+                    if self._progress_pending >= 65536:
+                        update(self._progress_pending)
+                        self._progress_pending = 0
                     yield line
             else:
-                line_len = len
-                pending = self._progress_pending
                 for line in fh:
                     if isinstance(line, bytes):
+                        line_bytes = len(line)
                         line = line.decode('utf-8')
-                    pending += line_len(line)
-                    if pending >= 65536:
-                        update(pending)
-                        pending = 0
-                    self._progress_pending = pending
+                    else:
+                        line_bytes = len(line.encode('utf-8'))
+                    self._progress_pending += line_bytes
+                    if self._progress_pending >= 65536:
+                        update(self._progress_pending)
+                        self._progress_pending = 0
                     yield line
         finally:
             self._flush_progress()
@@ -645,17 +868,24 @@ class PolyReader:
         """
         import ftputil
         port = 21 if parsed.port is None else parsed.port
+        username, password, remote_path = _unquote_remote_parts(parsed)
+        ftp_kwargs = {
+            'port': port,
+            'session_factory': _ftp_session_wrapper_class(),
+        }
+        if self.timeout is not None:
+            ftp_kwargs['timeout'] = self.timeout
         self._ftp = ftputil.FTPHost(
             parsed.hostname,
-            parsed.username,
-            parsed.password,
-            port=port,
-            session_factory=_ftp_session_wrapper_class(),
+            username,
+            password,
+            **ftp_kwargs,
         )
-        self._ftp_path = parsed.path
-        raw_fh = self._ftp.open(parsed.path, 'rb')
+        self._ftp_path = remote_path
+        raw_fh = self._ftp.open(remote_path, 'rb')
         self._raw_fh = raw_fh
-        stream = self._make_counted_stream(self._raw_fh)
+        adapted = _BinaryStreamAdapter(raw_fh, readable=True, writable=False)
+        stream = self._make_counted_stream(adapted)
 
         norm = _normalized_path(self.filename, parsed)
         if norm.endswith('.zst'):
@@ -697,20 +927,26 @@ class PolyReader:
         client = paramiko.SSHClient()
         client.load_system_host_keys()
         port = 22 if parsed.port is None else parsed.port
+        username, password, remote_path = _unquote_remote_parts(parsed)
+        connect_kwargs = {
+            'port': port,
+            'username': username,
+            'password': password,
+        }
+        if self.timeout is not None:
+            connect_kwargs['timeout'] = self.timeout
+            connect_kwargs['banner_timeout'] = self.timeout
+            connect_kwargs['auth_timeout'] = self.timeout
         try:
-            client.connect(
-                parsed.hostname,
-                port=port,
-                username=parsed.username,
-                password=parsed.password,
-            )
             self._ssh_client = client
+            client.connect(parsed.hostname, **connect_kwargs)
             sftp = client.open_sftp()
             self._sftp_client = sftp
-            sftp_file = sftp.file(parsed.path, 'rb')
+            sftp_file = sftp.file(remote_path, 'rb')
             self._sftp_file = sftp_file
 
             file_size = None
+            self._sftp_stat_checked = True
             stat_fn = getattr(sftp_file, 'stat', None)
             if stat_fn is not None:
                 try:
@@ -728,7 +964,7 @@ class PolyReader:
                     prefetch_fn(file_size, max_concurrent_requests=64)
                 except TypeError:
                     prefetch_fn(file_size)
-        except Exception:
+        except BaseException:
             self.close()
             raise
 
@@ -773,11 +1009,18 @@ class PolyReader:
         if parsed is None:
             from urllib.parse import urlparse
             parsed = urlparse(self.filename)
-        response = _get_http_session().get(self.filename, stream=True)
+        norm = _normalized_path(self.filename, parsed)
+        is_compressed = norm.endswith(('.zst', '.bz2', '.xz', '.gz'))
+        get_kwargs = {'stream': True}
+        if is_compressed:
+            get_kwargs['headers'] = {'Accept-Encoding': 'identity'}
+        if self.timeout is not None:
+            get_kwargs['timeout'] = self.timeout
+        response = _get_http_session().get(self.filename, **get_kwargs)
         self._response = response
         try:
             response.raise_for_status()
-        except Exception:
+        except BaseException:
             self.close()
             raise
 
@@ -787,7 +1030,6 @@ class PolyReader:
         except (TypeError, ValueError):
             self._http_file_size = None
 
-        norm = _normalized_path(self.filename, parsed)
         if norm.endswith('.zst'):
             import zstandard as zstd
             stream = self._make_counted_stream(response.raw)
@@ -809,6 +1051,9 @@ class PolyReader:
             stream = self._make_counted_stream(response.raw)
             self._fh = gzip.open(stream, 'rt', encoding='utf-8')
         else:
+            content_encoding = response.headers.get('Content-Encoding')
+            if isinstance(content_encoding, str) and content_encoding.strip().lower() not in ('', 'identity'):
+                self._http_file_size = None
             try:
                 response.raw.decode_content = True
             except AttributeError:
@@ -881,22 +1126,12 @@ class PolyReader:
         if self._fh is not None:
             return self
 
-        if ':' in self.filename:
-            from urllib.parse import urlparse
-            parsed = urlparse(self.filename)
-            if parsed.scheme == 'file':
-                from urllib.request import url2pathname
-                self.filename = url2pathname(parsed.path)
-                parsed = urlparse(self.filename)
-            scheme = parsed.scheme.lower()
-        else:
-            parsed = None
-            scheme = ''
+        self.filename, parsed, scheme = _resolve_target(self.filename)
 
         if _normalized_path(self.filename, parsed).endswith(UNSUPPORTED_ARCHIVES):
             raise UnsupportedArchiveError(
-                f"polyopen does not support reading archive formats directly: {self.filename}. "
-                f"Use the standard library (e.g. zipfile) instead."
+                f"polyopen does not support reading archive formats directly: {_redact_url(self.filename)}. "
+                f"Use Python's zipfile or tarfile module instead."
             )
 
         try:
@@ -906,11 +1141,6 @@ class PolyReader:
                 self._wrap_ssh(parsed)
             elif scheme in ('http', 'https'):
                 self._wrap_http(parsed)
-            elif scheme in ('s3', 'gs', 'az', 'hdfs'):
-                raise UnsupportedProtocolError(
-                    f"polyopen does not support cloud object stores like '{parsed.scheme}://'. "
-                    f"We heavily recommend using the 'smart_open' library or dedicated SDKs (like boto3) for this architecture."
-                )
             else:
                 self._wrap_local(parsed)
 
@@ -922,7 +1152,7 @@ class PolyReader:
                 self._progress_pending = 0
                 total = file_size if (file_size is not None and file_size > 0) else None
                 self._progress = tqdm(total=total, initial=initial_bytes, unit='B', unit_scale=True)
-        except Exception:
+        except BaseException:
             self.close()
             raise
         return self
@@ -942,12 +1172,24 @@ class PolyReader:
         if self._sftp_file_size is not None:
             return self._sftp_file_size
         if self._sftp_file is not None:
-            return self._sftp_file.stat().st_size
+            if self._sftp_stat_checked:
+                return None
+            try:
+                size = self._sftp_file.stat().st_size
+                return size if (isinstance(size, int) and not isinstance(size, bool)) else None
+            except OSError:
+                return None
         if self._ftp is not None:
-            return self._ftp.path.getsize(self._ftp_path)
+            try:
+                return self._ftp.path.getsize(self._ftp_path)
+            except Exception:
+                return None
         if self._response is not None:
             return self._http_file_size
-        return os.path.getsize(self.filename)
+        try:
+            return os.path.getsize(self.filename)
+        except OSError:
+            return None
 
     def close(self):
         """
@@ -979,6 +1221,7 @@ class PolyReader:
             self._raw_fh = None
             self._sftp_file = None
             self._sftp_file_size = None
+            self._sftp_stat_checked = False
             self._sftp_client = None
             self._ssh_client = None
             self._ftp = None
@@ -1020,7 +1263,12 @@ class PolyWriter:
         Closes the file.
     """
 
-    def __init__(self, filename: Union[str, os.PathLike], show_progress: bool = False):
+    def __init__(
+        self,
+        filename: Union[str, os.PathLike],
+        show_progress: bool = False,
+        timeout: Optional[float] = None,
+    ):
         """
         Initialize PolyWriter with a filename.
 
@@ -1030,11 +1278,14 @@ class PolyWriter:
             The name of the file to write to.
         show_progress : bool, optional
             Progress tracking on writers is not implemented; passing True raises NotImplementedError.
+        timeout : float or None, optional
+            Optional network timeout in seconds for FTP and SSH/SFTP connections.
         """
         if show_progress:
             raise NotImplementedError('Progress tracking is currently isolated to reader paths. Write implementations are deferred.')
         self.filename = os.fsdecode(filename)
         self.show_progress = show_progress
+        self.timeout = _validate_timeout(timeout)
         self._fh = None
         self._raw_fh = None
         self._ftp = None
@@ -1099,59 +1350,68 @@ class PolyWriter:
         -------
         None
         """
+        if append:
+            raise UnsupportedProtocolError(
+                "Protocol 'ftp' does not support append mode in polyopen (ftputil does not support FTP append)."
+            )
         import ftputil
         port = 21 if parsed.port is None else parsed.port
+        username, password, remote_path = _unquote_remote_parts(parsed)
+        ftp_kwargs = {
+            'port': port,
+            'session_factory': _ftp_session_wrapper_class(),
+        }
+        if self.timeout is not None:
+            ftp_kwargs['timeout'] = self.timeout
         self._ftp = ftputil.FTPHost(
             parsed.hostname,
-            parsed.username,
-            parsed.password,
-            port=port,
-            session_factory=_ftp_session_wrapper_class(),
+            username,
+            password,
+            **ftp_kwargs,
         )
-        self.remote_filename = parsed.path
 
-        if backup and self._ftp.path.exists(parsed.path):
-            first_candidate = f"{parsed.path}.001.bu"
+        if backup and self._ftp.path.exists(remote_path):
+            first_candidate = f"{remote_path}.001.bu"
             if not self._ftp.path.exists(first_candidate):
                 backup_filename = first_candidate
             else:
                 import posixpath
-                parent = posixpath.dirname(parsed.path) or "."
-                basename = posixpath.basename(parsed.path)
+                parent = posixpath.dirname(remote_path) or "."
+                basename = posixpath.basename(remote_path)
                 entries = self._ftp.listdir(parent)
                 backup_filename = _select_backup_filename(
-                    parsed.path, basename, entries, reserved_slots=(1,)
+                    remote_path, basename, entries, reserved_slots=(1,)
                 )
-            self._ftp.rename(parsed.path, backup_filename)
+            self._ftp.rename(remote_path, backup_filename)
 
-        mode = 'ab' if append else 'wb'
-        raw_fh = self._ftp.open(parsed.path, mode)
+        raw_fh = self._ftp.open(remote_path, 'wb')
         self._raw_fh = raw_fh
+        adapted = _BinaryStreamAdapter(raw_fh, readable=False, writable=True)
         norm = _normalized_path(self.filename, parsed)
         if norm.endswith('.zst'):
             import zstandard as zstd
             cctx = zstd.ZstdCompressor() if compresslevel is None else zstd.ZstdCompressor(level=compresslevel)
-            self._fh = io.TextIOWrapper(cctx.stream_writer(self._raw_fh), encoding='utf-8')
+            self._fh = io.TextIOWrapper(cctx.stream_writer(adapted), encoding='utf-8')
         elif norm.endswith('.bz2'):
             import bz2
-            bz2_kwargs = {'mode': 'at' if append else 'wt', 'encoding': 'utf-8'}
+            bz2_kwargs = {'mode': 'wt', 'encoding': 'utf-8'}
             if compresslevel is not None:
                 bz2_kwargs['compresslevel'] = compresslevel
-            self._fh = bz2.open(self._raw_fh, **bz2_kwargs)
+            self._fh = bz2.open(adapted, **bz2_kwargs)
         elif norm.endswith('.xz'):
             import lzma
-            lzma_kwargs = {'mode': 'at' if append else 'wt', 'encoding': 'utf-8'}
+            lzma_kwargs = {'mode': 'wt', 'encoding': 'utf-8'}
             if compresslevel is not None:
                 lzma_kwargs['preset'] = compresslevel
-            self._fh = lzma.open(self._raw_fh, **lzma_kwargs)
+            self._fh = lzma.open(adapted, **lzma_kwargs)
         elif norm.endswith('.gz'):
             import gzip
-            gz_kwargs = {'mode': 'at' if append else 'wt', 'encoding': 'utf-8'}
+            gz_kwargs = {'mode': 'wt', 'encoding': 'utf-8'}
             if compresslevel is not None:
                 gz_kwargs['compresslevel'] = compresslevel
-            self._fh = gzip.open(self._raw_fh, **gz_kwargs)
+            self._fh = gzip.open(adapted, **gz_kwargs)
         else:
-            self._fh = io.TextIOWrapper(self._raw_fh, encoding='utf-8')
+            self._fh = io.TextIOWrapper(adapted, encoding='utf-8')
 
     def _ssh_backup_if(self, sftp, path):
         """
@@ -1159,7 +1419,7 @@ class PolyWriter:
 
         Checks `<path>.001.bu` first in O(1); if it already exists, lists the parent
         directory once and selects the lowest free 001..999 slot (or collision-safe
-        timestamp fallback when all 999 slots are occupied).
+        timestamp fallback when all 999 slots are occupied), retrying on rename collision.
 
         Parameters
         ----------
@@ -1181,19 +1441,41 @@ class PolyWriter:
         try:
             sftp.stat(first_candidate)
         except FileNotFoundError:
-            sftp.rename(path, first_candidate)
-            return
+            try:
+                sftp.rename(path, first_candidate)
+                return
+            except OSError:
+                try:
+                    sftp.stat(path)
+                except FileNotFoundError:
+                    return
 
         import posixpath
         parent = posixpath.dirname(path) or "."
         basename = posixpath.basename(path)
-        entries = sftp.listdir(parent)
-        backup_filename = _select_backup_filename(
-            path, basename, entries, reserved_slots=(1,)
-        )
-        sftp.rename(path, backup_filename)
+        reserved = {1}
+        last_err = None
+        for _ in range(5):
+            entries = sftp.listdir(parent)
+            backup_filename = _select_backup_filename(
+                path, basename, entries, reserved_slots=reserved
+            )
+            try:
+                sftp.rename(path, backup_filename)
+                return
+            except OSError as exc:
+                last_err = exc
+                try:
+                    sftp.stat(path)
+                except FileNotFoundError:
+                    return
+                suffix_part = backup_filename[len(path) + 1:-3]
+                if len(suffix_part) == 3 and suffix_part.isascii() and suffix_part.isdigit():
+                    reserved.add(int(suffix_part))
+        if last_err is not None:
+            raise last_err
 
-    def _wrap_ssh(self, parsed: ParseResult, append: bool, backup: bool, compresslevel: Optional[int] = None):  # noqa: C901
+    def _wrap_ssh(self, parsed: ParseResult, append: bool, backup: bool, compresslevel: Optional[int] = None):
         """
         Wrap self._fh to handle SSH/SFTP connections and file operations.
 
@@ -1219,35 +1501,38 @@ class PolyWriter:
         client = paramiko.SSHClient()
         client.load_system_host_keys()
         port = 22 if parsed.port is None else parsed.port
+        username, password, remote_path = _unquote_remote_parts(parsed)
         norm = _normalized_path(self.filename, parsed)
-        is_compressed = norm.endswith(('.zst', '.bz2', '.xz', '.gz'))
-        sftp_mode = ('ab' if append else 'wb') if is_compressed else ('a' if append else 'w')
+        sftp_mode = 'ab' if append else 'wb'
+        connect_kwargs = {
+            'port': port,
+            'username': username,
+            'password': password,
+        }
+        if self.timeout is not None:
+            connect_kwargs['timeout'] = self.timeout
+            connect_kwargs['banner_timeout'] = self.timeout
+            connect_kwargs['auth_timeout'] = self.timeout
 
         try:
-            client.connect(
-                parsed.hostname,
-                port=port,
-                username=parsed.username,
-                password=parsed.password,
-            )
             self._ssh_client = client
+            client.connect(parsed.hostname, **connect_kwargs)
             sftp = client.open_sftp()
             self._sftp_client = sftp
 
             if backup:
-                self._ssh_backup_if(sftp, parsed.path)
+                self._ssh_backup_if(sftp, remote_path)
 
-            sftp_file = sftp.file(parsed.path, sftp_mode)
+            sftp_file = sftp.file(remote_path, sftp_mode)
             self._sftp_file = sftp_file
 
             set_pipelined_fn = getattr(sftp_file, 'set_pipelined', None)
             if set_pipelined_fn is not None:
                 set_pipelined_fn(True)
-        except Exception:
+        except BaseException:
             self.close()
             raise
 
-        self._fh = sftp_file
         if norm.endswith('.zst'):
             import zstandard as zstd
             cctx = zstd.ZstdCompressor() if compresslevel is None else zstd.ZstdCompressor(level=compresslevel)
@@ -1270,12 +1555,17 @@ class PolyWriter:
             if compresslevel is not None:
                 gz_kwargs['compresslevel'] = compresslevel
             self._fh = gzip.open(self._sftp_file, **gz_kwargs)
+        else:
+            adapted = _BinaryStreamAdapter(self._sftp_file, readable=False, writable=True)
+            self._fh = io.TextIOWrapper(adapted, encoding='utf-8')
 
     def _backup_local_file(self):
         """Atomically rotate an existing local file to the next free .bu slot."""
         src = self.filename
-        if not os.path.exists(src):
+        if not os.path.lexists(src):
             return
+        if os.path.isdir(src) and not os.path.islink(src):
+            raise IsADirectoryError(errno.EISDIR, os.strerror(errno.EISDIR), src)
 
         def _try_move(dst: str) -> str:
             """Return 'moved', 'exists', or 'gone'."""
@@ -1286,10 +1576,16 @@ class PolyWriter:
             except FileNotFoundError:
                 return 'gone'
             except (NotImplementedError, AttributeError):
+                if os.path.lexists(dst):
+                    return 'exists'
                 os.rename(src, dst)
                 return 'moved'
             except OSError as exc:
                 if exc.errno in _LINK_FALLBACK_ERRNOS:
+                    if os.path.isdir(src) and not os.path.islink(src):
+                        raise IsADirectoryError(errno.EISDIR, os.strerror(errno.EISDIR), src) from exc
+                    if os.path.lexists(dst):
+                        return 'exists'
                     os.rename(src, dst)
                     return 'moved'
                 raise
@@ -1300,7 +1596,7 @@ class PolyWriter:
             return 'moved'
 
         first_candidate = f"{src}.001.bu"
-        if not os.path.exists(first_candidate):
+        if not os.path.lexists(first_candidate):
             outcome = _try_move(first_candidate)
             if outcome in ('moved', 'gone'):
                 return
@@ -1417,22 +1713,13 @@ class PolyWriter:
         if self._fh is not None:
             return self
 
-        if ':' in self.filename:
-            from urllib.parse import urlparse
-            parsed = urlparse(self.filename)
-            if parsed.scheme == 'file':
-                from urllib.request import url2pathname
-                self.filename = url2pathname(parsed.path)
-                parsed = urlparse(self.filename)
-            scheme = parsed.scheme.lower()
-        else:
-            parsed = None
-            scheme = ''
+        self.filename, parsed, scheme = _resolve_target(self.filename)
+        norm = _normalized_path(self.filename, parsed)
 
-        if _normalized_path(self.filename, parsed).endswith(UNSUPPORTED_ARCHIVES):
+        if norm.endswith(UNSUPPORTED_ARCHIVES):
             raise UnsupportedArchiveError(
-                f"polyopen does not support writing or appending to archive formats safely: {self.filename}. "
-                f"Use the standard library (e.g. zipfile) to mutate archives."
+                f"polyopen does not support writing or appending to archive formats safely: {_redact_url(self.filename)}. "
+                f"Use Python's zipfile or tarfile module instead."
             )
 
         if append and backup:
@@ -1441,11 +1728,7 @@ class PolyWriter:
         if scheme in ('http', 'https'):
             raise ReadOnlyProtocolError(f"Protocol '{parsed.scheme}' does not support write/append operations in polyopen.")
 
-        if scheme in ('s3', 'gs', 'az', 'hdfs'):
-            raise UnsupportedProtocolError(
-                f"polyopen does not support explicitly pushing to cloud object stores like '{parsed.scheme}://'. "
-                f"We heavily recommend using the 'smart_open' library or dedicated SDKs (like boto3) for unified cloud I/O."
-            )
+        _validate_write_options(norm, compresslevel)
 
         try:
             if scheme == 'ftp':
@@ -1454,7 +1737,7 @@ class PolyWriter:
                 self._wrap_ssh(parsed, append, backup, compresslevel=compresslevel)
             else:
                 self._wrap_local(append, backup, parsed, compresslevel=compresslevel)
-        except Exception:
+        except BaseException:
             self.close()
             raise
 
@@ -1528,7 +1811,8 @@ def polyopen(
     backup: Optional[bool] = None,
     show_progress: bool = False,
     compresslevel: Optional[int] = None,
-):
+    timeout: Optional[float] = None,
+) -> Union[PolyReader, PolyWriter]:
     """
     Open a file for reading or writing, determining the appropriate stream and compression 
     automatically based on the file extension and protocol scheme.
@@ -1562,23 +1846,25 @@ def polyopen(
     if show_progress and mode in ('w', 'wt', 'wb', 'a', 'at', 'ab'):
         raise NotImplementedError('Progress tracking is currently isolated to reader paths. Write implementations are deferred.')
     if mode in ('r', 'rt', 'rb'):
-        return PolyReader(filename, show_progress=show_progress).open()
+        return PolyReader(filename, show_progress=show_progress, timeout=timeout).open()
     elif mode in ('w', 'wt', 'wb'):
         effective_backup = True if backup is None else backup
-        return PolyWriter(filename, show_progress=show_progress).open(
+        return PolyWriter(filename, show_progress=show_progress, timeout=timeout).open(
             append=False,
             backup=effective_backup,
             compresslevel=compresslevel,
         )
     elif mode in ('a', 'at', 'ab'):
         effective_backup = False if backup is None else backup
-        return PolyWriter(filename, show_progress=show_progress).open(
+        return PolyWriter(filename, show_progress=show_progress, timeout=timeout).open(
             append=True,
             backup=effective_backup,
             compresslevel=compresslevel,
         )
     else:
-        raise ValueError(f"Unsupported mode: '{mode}'. Supported modes are 'r', 'w', 'a'.")
+        raise ValueError(
+            f"Unsupported mode: '{mode}'. Supported modes are 'r', 'rt', 'rb', 'w', 'wt', 'wb', 'a', 'at', 'ab' (all UTF-8 text)."
+        )
 
 
 def main():
@@ -1641,7 +1927,7 @@ def main():
         if args.input_file is not None:
             parser.error("--input-file/-i is only valid with --write")
         for input_file in args.files:
-            print(f"TESTING reading {input_file}")
+            print(f"TESTING reading {_redact_url(input_file)}")
             with PolyReader(input_file) as reader:
                 line_count = 0
                 t0 = time.monotonic()
@@ -1650,7 +1936,7 @@ def main():
                     line_count += 1
                     bytes_count += len(line.encode('utf-8'))
                 # Print final reading statistics
-                pinfo("FINISHED Reading.", reader.filename, line_count, bytes_count, time.monotonic() - t0)
+                pinfo("FINISHED Reading.", _redact_url(reader.filename), line_count, bytes_count, time.monotonic() - t0)
     else:
         # If write mode is specified
         if args.input_file is not None:
@@ -1660,12 +1946,12 @@ def main():
             output_files = args.files
         else:
             if len(args.files) < 2:
-                parser.error("Write mode requires at least one source file and one destination file (e.g., 'python -m polyopen.polyopen -w src dest')")
+                parser.error("Write mode requires at least one source file and one destination file (e.g., 'python -m polyopen -w src dest')")
             source_file = args.files[0]
             output_files = args.files[1:]
 
         import contextlib
-        print(f"Will Read from {source_file}")
+        print(f"Will Read from {_redact_url(source_file)}")
         line_count = 0
         bytes_count = 0
         dest_names = []
@@ -1675,9 +1961,9 @@ def main():
             writers = []
             for output_file in output_files:
                 writer = stack.enter_context(PolyWriter(output_file))
-                print(f"Writing {writer.filename}")
+                print(f"Writing {_redact_url(writer.filename)}")
                 writers.append(writer)
-                dest_names.append(writer.filename)
+                dest_names.append(_redact_url(writer.filename))
             write_fns = [w.write for w in writers]
             for line in reader:
                 line_count += 1

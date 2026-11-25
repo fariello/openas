@@ -373,7 +373,7 @@ def test_sftp_backup_rotation_fast_path_500_posix_and_999_cap(mock_ssh):
         raise FileNotFoundError(path)
 
     sftp.stat.side_effect = stat_fast
-    sftp.file.return_value = io.StringIO()
+    sftp.file.return_value = _InspectableBytesIO()
     with PolyWriter("sftp://u:p@host/nested/dir/file.txt").open(backup=True) as w:
         w.write("new\n")
     sftp.listdir.assert_not_called()
@@ -401,7 +401,7 @@ def test_sftp_backup_rotation_fast_path_500_posix_and_999_cap(mock_ssh):
         + [f"cap.txt.{i:03d}.bu" for i in range(1, 1000)]
         + ["cap.txt.1700000000000000123.bu"]
     )
-    sftp.file.return_value = io.StringIO()
+    sftp.file.return_value = _InspectableBytesIO()
     with patch("time.time_ns", return_value=1700000000000000123):
         with PolyWriter("sftp://u:p@host/sub/cap.txt").open(backup=True) as w:
             w.write("after cap\n")
@@ -582,7 +582,7 @@ def test_sftp_writer_close_idempotent_and_error_paths(mock_ssh):
     sftp_file = MagicMock()
     sftp.file.return_value = sftp_file
     writer = PolyWriter("sftp://u:p@host/plain.txt").open(backup=False)
-    sftp.file.assert_called_once_with("/plain.txt", "w")
+    sftp.file.assert_called_once_with("/plain.txt", "wb")
     sftp_file.set_pipelined.assert_called_once_with(True)
     writer.close()
     writer.close()
