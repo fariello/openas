@@ -153,13 +153,18 @@ def test_close_reopen_idempotency_and_sibling_cleanup(tmp_path):
     reader.open()
     assert next(reader) == "line1\n"
 
+    orig_fh = reader._fh
     sibling = MagicMock()
     failing = MagicMock()
     failing.close.side_effect = OSError("close failed")
     reader._fh = failing
     reader._ftp = sibling
-    with pytest.raises(OSError):
-        reader.close()
+    try:
+        with pytest.raises(OSError):
+            reader.close()
+    finally:
+        if orig_fh is not None:
+            orig_fh.close()
     assert sibling.close.called
     assert reader._fh is None
     assert reader._ftp is None
@@ -630,3 +635,148 @@ def test_local_backup_999_cap_single_scandir_and_collision_safe_timestamp(tmp_pa
     assert preexisting_ts.read_text(encoding="utf-8") == "existing-ts\n"
     assert (cap_dir / "cap.txt.1700000000000001000.bu").read_text(encoding="utf-8") == "before-cap\n"
     assert target.read_text(encoding="utf-8") == "after-cap\n"
+
+
+def test_local_backup_rejects_directory_and_preserves_broken_symlink(tmp_path):
+    """S2-LIVE1: Local backup raises IsADirectoryError on directories and avoids overwriting broken symlinks."""
+    existing_dir = tmp_path / "important_dir"
+    existing_dir.mkdir()
+    (existing_dir / "keep.txt").write_text("precious\n", encoding="utf-8")
+
+    with pytest.raises(IsADirectoryError):
+        polyopen(existing_dir, "w", backup=True)
+
+    assert existing_dir.is_dir()
+    assert (existing_dir / "keep.txt").read_text(encoding="utf-8") == "precious\n"
+    assert not (tmp_path / "important_dir.001.bu").exists()
+
+    # Broken symlink at .001.bu is skipped on fallback rather than silently overwritten
+    src = tmp_path / "target.txt"
+    src.write_text("v1\n", encoding="utf-8")
+    broken_bu = tmp_path / "target.txt.001.bu"
+    broken_bu.symlink_to(tmp_path / "does_not_exist")
+    with patch("os.link", side_effect=OSError(errno.EOPNOTSUPP, "no hard links")):
+        with polyopen(src, "w", backup=True) as w:
+            w.write("v2\n")
+    assert os.path.islink(broken_bu)
+    assert (tmp_path / "target.txt.002.bu").read_text(encoding="utf-8") == "v1\n"
+    assert src.read_text(encoding="utf-8") == "v2\n"
+
+
+@pytest.mark.parametrize(
+    "ext,bad_level,exc_type",
+    [
+        (".gz", 99, ValueError),
+        (".bz2", 0, ValueError),
+        (".xz", 99, ValueError),
+        (".zst", 999, ValueError),
+        (".gz", True, TypeError),
+        (".zst", "fast", TypeError),
+    ],
+)
+def test_invalid_compresslevel_fails_before_rotating_backup(tmp_path, ext, bad_level, exc_type):
+    """S2-LIVE2: Invalid or bool compresslevel fails before rotating the existing file."""
+    target = tmp_path / f"keep{ext}"
+    with polyopen(target, "w", backup=False) as w:
+        w.write("original\n")
+
+    with pytest.raises(exc_type):
+        polyopen(target, "w", backup=True, compresslevel=bad_level)
+
+    assert not os.path.exists(f"{target}.001.bu")
+    with polyopen(target, "r") as r:
+        assert r.read() == "original\n"
+
+
+def test_local_non_ascii_progress_and_mixed_readline_iter_no_double_count(tmp_path):
+    """S2-B8: Plain local UTF-8 progress tracks exact byte length and mixed readline()+iter does not double-count."""
+    fp = tmp_path / "utf8_prog.txt"
+    lines = ["café 日本語 🚀\n" for _ in range(10)]
+    payload = "".join(lines)
+    fp.write_text(payload, encoding="utf-8")
+    expected_bytes = len(payload.encode("utf-8"))
+    assert expected_bytes > len(payload)
+
+    with PolyReader(fp, show_progress=True) as r:
+        pbar = r._progress
+        assert pbar is not None
+        assert pbar.total == expected_bytes
+        first = r.readline()
+        rest = list(r)
+        assert [first, *rest] == lines
+    assert pbar.n == expected_bytes
+
+
+def test_file_like_attributes_repr_redaction_and_unknown_pkg_attr(tmp_path):
+    """S5-F1 & S3-T1: PolyReader/PolyWriter expose closed/readable/writable/seekable/encoding/redacted __repr__."""
+    import polyopen as pkg
+
+    fp = tmp_path / "attrs.txt"
+    w = PolyWriter(fp)
+    assert w.closed is True
+    assert w.writable() is True and w.readable() is False and w.seekable() is False
+    assert w.encoding == "utf-8"
+    w.open(backup=False)
+    assert w.closed is False
+    w.write("hello\n")
+    w.close()
+    assert w.closed is True
+    # Reopen after close with backup=False overwrites without creating .bu
+    with w.open(backup=False):
+        w.write("rewritten\n")
+    assert not os.path.exists(f"{fp}.001.bu")
+    assert fp.read_text(encoding="utf-8") == "rewritten\n"
+
+    r = PolyReader(fp)
+    assert r.closed is True
+    assert r.readable() is True and r.writable() is False and r.seekable() is False
+    assert r.encoding == "utf-8"
+    with r:
+        assert r.closed is False
+        assert r.readlines(hint=4) == ["rewritten\n"]
+    assert r.closed is True
+
+    secret_reader = PolyReader("sftp://alice:mysecret@host/data.txt?token=tok")
+    rep = repr(secret_reader)
+    assert "mysecret" not in rep and "tok" not in rep and "***" in rep
+
+    with pytest.raises(AttributeError):
+        getattr(pkg, "NonExistentSymbol123")
+
+
+@pytest.mark.parametrize("ext", ["", ".gz", ".bz2", ".xz", ".zst"])
+def test_local_empty_no_newline_multimember_append_file_uri_and_colon_filename(tmp_path, ext):
+    """S3-T1: Empty files, missing trailing newline, multi-member append, file:// writer (with spaces), and colons."""
+    # Empty file round-trip (including show_progress=True)
+    empty_fp = tmp_path / f"empty{ext or '.txt'}"
+    with polyopen(empty_fp, "w", backup=False):
+        pass
+    with polyopen(empty_fp, "r", show_progress=True) as r:
+        assert r.read() == ""
+
+    # Missing trailing newline + multi-member append across all formats
+    app_fp = tmp_path / f"append{ext or '.txt'}"
+    with polyopen(app_fp, "w", backup=False) as w:
+        w.write("part1\n")
+    with polyopen(app_fp, "a") as w:
+        w.write("part2_no_nl")
+    with polyopen(app_fp, "r") as r:
+        assert r.read() == "part1\npart2_no_nl"
+
+    # file:// URI write/append/read with space (%20) and local colon filename
+    spaced_dir = tmp_path / "dir with space"
+    spaced_dir.mkdir()
+    spaced_fp = spaced_dir / f"doc{ext or '.txt'}"
+    file_uri = spaced_fp.as_uri()
+    with polyopen(file_uri, "w", backup=False) as w:
+        w.write("uri line 1\n")
+    with polyopen(file_uri, "a") as w:
+        w.write("uri line 2\n")
+    with polyopen(file_uri, "r") as r:
+        assert r.read() == "uri line 1\nuri line 2\n"
+
+    colon_fp = tmp_path / f"2026:11:25{ext or '.txt'}"
+    with polyopen(colon_fp, "w", backup=False) as w:
+        w.write("colon ok\n")
+    with polyopen(colon_fp, "r") as r:
+        assert r.read() == "colon ok\n"

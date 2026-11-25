@@ -303,3 +303,94 @@ def test_cli_write_broadcast_closes_handles_on_writer_error(tmp_path, monkeypatc
 
     assert ("reader", str(src)) in closed
     assert ("writer", str(dst_ok)) in closed
+
+
+def test_cli_package_entrypoint_help_version_and_errors(tmp_path):
+    """S5-U1 / S4-U1 / S2-B9: python -m polyopen works without RuntimeWarning, exposes --version, and validates args."""
+    res_help = subprocess.run(
+        [sys.executable, "-m", "polyopen", "--help"],
+        capture_output=True,
+        text=True,
+        env=_cli_env(),
+    )
+    assert res_help.returncode == 0
+    assert "RuntimeWarning" not in res_help.stderr
+    assert ".xz" in res_help.stdout
+    assert "Examples:" in res_help.stdout
+
+    res_ver = subprocess.run(
+        [sys.executable, "-m", "polyopen", "--version"],
+        capture_output=True,
+        text=True,
+        env=_cli_env(),
+    )
+    assert res_ver.returncode == 0
+    assert "0.1.0" in res_ver.stdout
+
+    # Mutually exclusive --read --write fails
+    res_both = subprocess.run(
+        [sys.executable, "-m", "polyopen", "--read", "--write", "a.txt", "b.txt"],
+        capture_output=True,
+        text=True,
+        env=_cli_env(),
+    )
+    assert res_both.returncode != 0
+
+    # --write with only 1 positional file fails
+    res_one = subprocess.run(
+        [sys.executable, "-m", "polyopen", "--write", "only_one.txt"],
+        capture_output=True,
+        text=True,
+        env=_cli_env(),
+    )
+    assert res_one.returncode != 0
+
+    # Multi-file --read and --write backup rotation
+    f1 = tmp_path / "m1.txt"
+    f2 = tmp_path / "m2.txt"
+    f1.write_text("a\n", encoding="utf-8")
+    f2.write_text("b\nc\n", encoding="utf-8")
+    res_multi = subprocess.run(
+        [sys.executable, "-m", "polyopen", "--read", str(f1), str(f2)],
+        capture_output=True,
+        text=True,
+        env=_cli_env(),
+    )
+    assert res_multi.returncode == 0, res_multi.stderr
+    assert str(f1) in res_multi.stdout and str(f2) in res_multi.stdout
+
+    dst = tmp_path / "existing.txt"
+    dst.write_text("old\n", encoding="utf-8")
+    res_bu = subprocess.run(
+        [sys.executable, "-m", "polyopen", "--write", str(f1), str(dst)],
+        capture_output=True,
+        text=True,
+        env=_cli_env(),
+    )
+    assert res_bu.returncode == 0, res_bu.stderr
+    assert (tmp_path / "existing.txt.001.bu").read_text(encoding="utf-8") == "old\n"
+    assert dst.read_text(encoding="utf-8") == "a\n"
+
+
+def test_cli_redacts_url_credentials_and_format_bytes_negative(monkeypatch, capsys):
+    """S2-S1 & S2-B9: CLI stdout masks URL passwords/query tokens and format_bytes handles negative values."""
+    import io
+    from unittest.mock import MagicMock, patch
+    from polyopen.polyopen import format_bytes, main as cli_main
+
+    assert format_bytes(-2048) == "-2.0KB"
+
+    mock_resp = MagicMock()
+    mock_resp.headers = {"Content-Length": "3"}
+    mock_resp.raw = io.BytesIO(b"hi\n")
+    with patch("requests.Session.get", return_value=mock_resp):
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            ["polyopen", "-r", "https://alice:supersecret@example.com/log.txt?token=abc123"],
+        )
+        cli_main()
+    out = capsys.readouterr().out
+    assert "supersecret" not in out
+    assert "abc123" not in out
+    assert "alice:***@example.com/log.txt?<redacted>" in out

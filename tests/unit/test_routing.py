@@ -752,3 +752,252 @@ def test_http_decode_content_only_on_uncompressed(mock_get, ext):
     else:
         assert tracked_raw.decode_content is False
     mock_response.close.assert_called_once()
+
+
+class _StrictFTPFileProxy:
+    """Mimics real ftputil.file.FTPFile: lacks readable/writable/seekable/read1/readinto."""
+
+    def __init__(self, initial: bytes = b""):
+        self._buf = io.BytesIO(initial)
+        self.saved_bytes = b""
+        self.closed = False
+
+    def read(self, size=-1):
+        return self._buf.read() if (size is None or size < 0) else self._buf.read(size)
+
+    def write(self, data):
+        self._buf.write(data)
+        return None  # real FTPFile.write delegates to underlying file/socket
+
+    def flush(self):
+        self._buf.flush()
+
+    def close(self):
+        if not self.closed:
+            self.closed = True
+            self.saved_bytes = self._buf.getvalue()
+            self._buf.close()
+
+
+@patch("ftputil.FTPHost")
+@pytest.mark.parametrize("ext", ["", ".gz", ".bz2", ".xz", ".zst"])
+def test_ftp_real_ftpfile_contract_reads_writes_and_append_rejected(mock_host, ext):
+    """S2-B1: Real ftputil.file.FTPFile (without readable/seekable/writable) works across all codecs; FTP append rejected."""
+    from polyopen import UnsupportedProtocolError
+
+    host = MagicMock()
+    mock_host.return_value = host
+    text = f"ftp real contract {ext} café\nline 2\n"
+
+    # Write with strict FTPFile proxy
+    write_proxy = _StrictFTPFileProxy()
+    host.open.return_value = write_proxy
+    with polyopen(f"ftp://user:pass@host:2121/dir/out{ext or '.txt'}", "w", backup=False, timeout=5.0) as w:
+        n = w.write(text)
+        assert n == len(text)
+    assert write_proxy.closed
+    assert mock_host.call_args.kwargs["port"] == 2121
+    assert mock_host.call_args.kwargs["timeout"] == 5.0
+    if ext:
+        assert _decompress_bytes(write_proxy.saved_bytes, ext) == text
+    else:
+        assert write_proxy.saved_bytes.decode("utf-8") == text
+
+    # Read back with strict FTPFile proxy (both show_progress=False and True)
+    for show_progress in (False, True):
+        read_proxy = _StrictFTPFileProxy(write_proxy.saved_bytes)
+        host.open.return_value = read_proxy
+        host.path.getsize.side_effect = OSError("SIZE unsupported")
+        with polyopen(f"ftp://user:pass@host/dir/out{ext or '.txt'}", "r", show_progress=show_progress) as r:
+            assert r.read() == text
+            if show_progress:
+                assert r._progress is not None and r._progress.total is None
+        assert read_proxy.closed
+
+    # FTP append fails fast BEFORE connecting
+    mock_host.reset_mock()
+    with pytest.raises(UnsupportedProtocolError, match="append"):
+        polyopen("ftp://user:pass@host/dir/out.txt", "a")
+    assert not mock_host.called
+
+
+def test_ftp_session_wrapper_port_timeout_and_login_failure_closes_socket(monkeypatch):
+    """S2-MEM1 & S3-T1: FTPSessionWrapper forwards port/timeout and closes socket if login() raises."""
+    import ftplib
+    from polyopen import FTPSessionWrapper
+
+    calls = []
+    closed = []
+
+    def fake_connect(self, host, port=0, timeout=None):
+        calls.append(("connect", host, port, timeout))
+
+    def fake_login(self, user="", passwd=""):
+        calls.append(("login", user, passwd))
+
+    def fake_close(self):
+        closed.append(True)
+
+    monkeypatch.setattr(ftplib.FTP, "connect", fake_connect)
+    monkeypatch.setattr(ftplib.FTP, "login", fake_login)
+    monkeypatch.setattr(ftplib.FTP, "close", fake_close)
+
+    FTPSessionWrapper("ftp.example", "alice", "pw", port=None, timeout=7.5)
+    assert calls == [("connect", "ftp.example", 21, 7.5), ("login", "alice", "pw")]
+
+    calls.clear()
+    closed.clear()
+    monkeypatch.setattr(ftplib.FTP, "login", lambda self, u="", p="": (_ for _ in ()).throw(ftplib.error_perm("530")))
+    with pytest.raises(ftplib.error_perm):
+        FTPSessionWrapper("ftp.example", "alice", "badpw", port=2121)
+    assert closed == [True]
+
+
+@patch("paramiko.SSHClient")
+def test_ssh_connect_leak_fix_percent_decode_timeout_uncompressed_write_int_and_stat_fail_progress(mock_ssh):
+    """S2-MEM1, S2-B3, S2-B5, S2-B6, S2-S2, S2-LIVE3: SSH lifecycle, percent-decoding, timeout, write()->int, progress stat-fail, and backup retry."""
+    client = MagicMock()
+    mock_ssh.return_value = client
+
+    # 1. Failed connect() closes SSHClient (prevents leaked Paramiko Transport thread)
+    client.connect.side_effect = OSError("auth failed")
+    with pytest.raises(OSError, match="auth failed"):
+        PolyReader("sftp://alice:pw@host/a.txt", timeout=4.0).open()
+    assert client.close.call_count == 1
+    assert client.connect.call_args.kwargs["timeout"] == 4.0
+    assert client.connect.call_args.kwargs["banner_timeout"] == 4.0
+    assert client.connect.call_args.kwargs["auth_timeout"] == 4.0
+
+    # 2. Missing hostname raises ValueError before connect
+    client.reset_mock()
+    client.connect.side_effect = None
+    with pytest.raises(ValueError, match="Missing hostname"):
+        PolyReader("sftp:///no_host.txt").open()
+    assert not client.connect.called
+
+    # 3. Percent-decoded credentials/path + uncompressed SFTP write() returns int even when raw write returns None
+    sftp = MagicMock()
+    client.open_sftp.return_value = sftp
+    raw_write = _StrictFTPFileProxy()
+    sftp.file.return_value = raw_write
+    with polyopen("sftp://user%40org:p%3As%2Fw@host/my%20dir/out.txt", "w", backup=False, timeout=9.0) as w:
+        written = w.write("café\n")
+        assert written == 5
+    assert client.connect.call_args.kwargs["username"] == "user@org"
+    assert client.connect.call_args.kwargs["password"] == "p:s/w"
+    assert client.connect.call_args.kwargs["timeout"] == 9.0
+    sftp.file.assert_called_once_with("/my dir/out.txt", "wb")
+    assert raw_write.saved_bytes == "café\n".encode("utf-8")
+
+    # 4. SFTP show_progress=True when stat() raises OSError degrades to total=None instead of crashing
+    class StatFailSFTPFile(io.BytesIO):
+        def stat(self):
+            raise OSError("FSTAT unsupported")
+
+    sftp.file.return_value = StatFailSFTPFile(b"ok\n")
+    with PolyReader("sftp://u:p@host/data.txt", show_progress=True) as r:
+        assert r._progress is not None
+        assert r._progress.total is None
+        assert r.read() == "ok\n"
+
+    # 5. SFTP backup rename collision retries next free slot; missing source is a no-op
+    sftp.reset_mock()
+    sftp.stat.side_effect = FileNotFoundError("no file")
+    PolyWriter("sftp://u:p@host/missing.txt")._ssh_backup_if(sftp, "/missing.txt")
+    assert not sftp.rename.called
+
+    sftp.reset_mock()
+    existing = {"/dir/x.txt"}
+
+    def stat_fn(p):
+        if p in existing:
+            return MagicMock()
+        raise FileNotFoundError(p)
+
+    rename_calls = []
+
+    def rename_fn(src, dst):
+        rename_calls.append((src, dst))
+        if dst.endswith(".001.bu"):
+            existing.add(dst)
+            raise OSError("collision on 001")
+
+    sftp.stat.side_effect = stat_fn
+    sftp.listdir.return_value = ["x.txt", "x.txt.001.bu"]
+    sftp.rename.side_effect = rename_fn
+    PolyWriter("sftp://u:p@host/dir/x.txt")._ssh_backup_if(sftp, "/dir/x.txt")
+    assert rename_calls == [("/dir/x.txt", "/dir/x.txt.001.bu"), ("/dir/x.txt", "/dir/x.txt.002.bu")]
+
+
+@patch("requests.Session.get")
+def test_http_accept_encoding_content_encoding_timeout_and_raw_fallbacks(mock_get):
+    """S2-B7, S2-S2, S3-T1: Compressed HTTP sends Accept-Encoding: identity; Content-Encoding nulls total; raw fallbacks."""
+    gz_bytes = gzip.compress("http gz café\n".encode("utf-8"))
+    resp_gz = MagicMock()
+    resp_gz.headers = {"Content-Length": str(len(gz_bytes))}
+    resp_gz.raw = io.BytesIO(gz_bytes)
+    mock_get.return_value = resp_gz
+
+    with PolyReader("https://example.com/archive.txt.gz", show_progress=True, timeout=6.0) as r:
+        assert r.read() == "http gz café\n"
+    assert mock_get.call_args.kwargs["headers"] == {"Accept-Encoding": "identity"}
+    assert mock_get.call_args.kwargs["timeout"] == 6.0
+
+    # Plain HTTP with Content-Encoding: gzip nulls _http_file_size and works with minimal raw stream (no read1/readinto)
+    class MinimalRaw:
+        def __init__(self, data: bytes):
+            self._buf = io.BytesIO(data)
+            self.decode_content = False
+            self.closed = False
+
+        def read(self, size=-1):
+            return self._buf.read() if (size is None or size < 0) else self._buf.read(size)
+
+        def close(self):
+            self.closed = True
+            self._buf.close()
+
+    minimal = MinimalRaw(b"plain line\n")
+    resp_enc = MagicMock()
+    resp_enc.headers = {"Content-Length": "5", "Content-Encoding": "gzip"}
+    resp_enc.raw = minimal
+    mock_get.return_value = resp_enc
+
+    with PolyReader("https://example.com/plain.txt", show_progress=True) as r:
+        assert r._get_file_size() is None
+        assert r._progress is not None and r._progress.total is None
+        assert r.read() == "plain line\n"
+    assert minimal.decode_content is True
+    assert minimal.closed
+
+
+def test_http_real_server_gzip_stream():
+    """S3-T1: Real local ThreadingHTTPServer serving a .gz file exercises real urllib3.HTTPResponse."""
+    payload_text = "server gz line 1\nserver gz line 2\n"
+    gz_body = gzip.compress(payload_text.encode("utf-8"))
+    seen_accept = []
+
+    class GzHandler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            seen_accept.append(self.headers.get("Accept-Encoding"))
+            self.send_response(200)
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Content-Length", str(len(gz_body)))
+            self.end_headers()
+            self.wfile.write(gz_body)
+
+        def log_message(self, format, *args):  # noqa: A002
+            return
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), GzHandler)
+    port = server.server_address[1]
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        with PolyReader(f"http://127.0.0.1:{port}/data.txt.gz", show_progress=True, timeout=5.0) as r:
+            assert r.read() == payload_text
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+    assert seen_accept == ["identity"]

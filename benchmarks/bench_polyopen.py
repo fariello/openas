@@ -35,6 +35,10 @@ from pathlib import Path
 
 import zstandard as zstd
 
+_REPO_SRC = str(Path(__file__).resolve().parent.parent / "src")
+if _REPO_SRC not in sys.path:
+    sys.path.insert(0, _REPO_SRC)
+
 from polyopen import PolyReader, PolyWriter
 
 REPS = 5
@@ -48,11 +52,10 @@ BACKUP_EXISTING = 500
 
 
 def _subprocess_env() -> dict:
-    """Return environment preserving PYTHONPATH (defaulting to src/)."""
+    """Return environment with checkout src/ prepended to PYTHONPATH."""
     env = os.environ.copy()
-    if not env.get("PYTHONPATH"):
-        repo_src = str(Path(__file__).resolve().parent.parent / "src")
-        env["PYTHONPATH"] = repo_src
+    existing = env.get("PYTHONPATH", "")
+    env["PYTHONPATH"] = f"{_REPO_SRC}{os.pathsep}{existing}" if existing else _REPO_SRC
     return env
 
 
@@ -262,15 +265,22 @@ def bench_write_throughput(tmpdir: Path) -> None:
 
 def _measure_child_rss_and_time(child_code: str, env: dict) -> tuple:
     """Spawn a dedicated wrapper subprocess that runs child_code in a grandchild
-    and reports elapsed seconds and RUSAGE_CHILDREN ru_maxrss in KiB."""
+    and reports elapsed seconds and RUSAGE_CHILDREN ru_maxrss in KiB (0 on non-POSIX)."""
     wrapper = (
-        "import resource, subprocess, sys, time; "
-        "t0 = time.perf_counter(); "
-        "subprocess.run([sys.executable, '-c', sys.argv[1]], check=True); "
-        "elapsed = time.perf_counter() - t0; "
-        "rss = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss; "
-        "rss = rss // 1024 if sys.platform == 'darwin' else rss; "
-        "print(f'{elapsed:.6f} {rss}')"
+        "import subprocess, sys, time\n"
+        "try:\n"
+        "    import resource\n"
+        "except ImportError:\n"
+        "    resource = None\n"
+        "t0 = time.perf_counter()\n"
+        "subprocess.run([sys.executable, '-c', sys.argv[1]], check=True)\n"
+        "elapsed = time.perf_counter() - t0\n"
+        "if resource is not None:\n"
+        "    rss = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss\n"
+        "    rss = rss // 1024 if sys.platform == 'darwin' else rss\n"
+        "else:\n"
+        "    rss = 0\n"
+        "print(f'{elapsed:.6f} {rss}')\n"
     )
     res = subprocess.run(
         [sys.executable, "-c", wrapper, child_code],
