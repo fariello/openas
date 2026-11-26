@@ -473,6 +473,198 @@ class _CountingByteStream:
         return getattr(self._stream, name)
 
 
+_ZSTD_MAGIC = 0xFD2FB528
+_ZSTD_SKIPPABLE_MAGIC_MASK = 0xFFFFFFF0
+_ZSTD_SKIPPABLE_MAGIC_BASE = 0x184D2A50
+_ZSTD_DID_SIZES = (0, 1, 2, 4)
+
+
+class _ZstdFrameValidatingStream:
+    """Zero-copy RFC 8878 frame-boundary validator wrapping a binary stream for ZstdDecompressor.stream_reader().
+
+    python-zstandard's stream_reader() silently returns EOF when the underlying compressed
+    byte stream ends mid-frame. This lightweight state machine tracks Zstandard and skippable
+    frame/block wire lengths without copying payload bytes and raises EOFError if the stream
+    reaches EOF before a frame completes.
+    """
+
+    _S_MAGIC = 0
+    _S_FHD = 1
+    _S_SKIP_LEN = 2
+    _S_BLK_HDR = 3
+    _S_SKIP_BYTES = 4
+    _S_PASSTHROUGH = 5
+
+    def __init__(self, stream):
+        self._stream = stream
+        self._state = self._S_MAGIC
+        self._buf = bytearray()
+        self._need = 4
+        self._skip = 0
+        self._next_state = self._S_MAGIC
+        self._has_checksum = False
+
+    def _feed(self, data) -> None:
+        mv = memoryview(data)
+        pos = 0
+        n = len(mv)
+        while pos < n:
+            st = self._state
+            if st == self._S_PASSTHROUGH:
+                return
+            if st == self._S_SKIP_BYTES:
+                take = min(self._skip, n - pos)
+                self._skip -= take
+                pos += take
+                if self._skip == 0:
+                    self._state = self._next_state
+                    if self._state == self._S_MAGIC:
+                        self._need = 4
+                    elif self._state == self._S_BLK_HDR:
+                        self._need = 3
+                continue
+
+            rem = self._need - len(self._buf)
+            take = min(rem, n - pos)
+            self._buf.extend(mv[pos:pos + take])
+            pos += take
+            if len(self._buf) < self._need:
+                return
+
+            buf = self._buf
+            if st == self._S_MAGIC:
+                magic = int.from_bytes(buf, 'little')
+                buf.clear()
+                if magic == _ZSTD_MAGIC:
+                    self._state = self._S_FHD
+                    self._need = 1
+                elif (magic & _ZSTD_SKIPPABLE_MAGIC_MASK) == _ZSTD_SKIPPABLE_MAGIC_BASE:
+                    self._state = self._S_SKIP_LEN
+                    self._need = 4
+                else:
+                    # Unknown magic: defer to zstandard so it raises ZstdError.
+                    self._state = self._S_PASSTHROUGH
+                    return
+            elif st == self._S_SKIP_LEN:
+                skip_len = int.from_bytes(buf, 'little')
+                buf.clear()
+                if skip_len == 0:
+                    self._state = self._S_MAGIC
+                    self._need = 4
+                else:
+                    self._skip = skip_len
+                    self._next_state = self._S_MAGIC
+                    self._state = self._S_SKIP_BYTES
+            elif st == self._S_FHD:
+                fhd = buf[0]
+                buf.clear()
+                fcs_flag = (fhd >> 6) & 3
+                single_seg = (fhd >> 5) & 1
+                self._has_checksum = bool((fhd >> 2) & 1)
+                did_flag = fhd & 3
+                win_len = 0 if single_seg else 1
+                did_len = _ZSTD_DID_SIZES[did_flag]
+                if fcs_flag == 0:
+                    fcs_len = 1 if single_seg else 0
+                elif fcs_flag == 1:
+                    fcs_len = 2
+                elif fcs_flag == 2:
+                    fcs_len = 4
+                else:
+                    fcs_len = 8
+                rest_len = win_len + did_len + fcs_len
+                if rest_len == 0:
+                    self._state = self._S_BLK_HDR
+                    self._need = 3
+                else:
+                    self._skip = rest_len
+                    self._next_state = self._S_BLK_HDR
+                    self._state = self._S_SKIP_BYTES
+            elif st == self._S_BLK_HDR:
+                hdr = buf[0] | (buf[1] << 8) | (buf[2] << 16)
+                buf.clear()
+                last_block = bool(hdr & 1)
+                btype = (hdr >> 1) & 3
+                bsize = hdr >> 3
+                if btype == 3:
+                    # Reserved block type: defer to zstandard so it raises ZstdError.
+                    self._state = self._S_PASSTHROUGH
+                    return
+                wire_len = 1 if btype == 1 else bsize
+                if last_block:
+                    if self._has_checksum:
+                        wire_len += 4
+                    after = self._S_MAGIC
+                else:
+                    after = self._S_BLK_HDR
+                if wire_len == 0:
+                    self._state = after
+                    self._need = 4 if after == self._S_MAGIC else 3
+                else:
+                    self._skip = wire_len
+                    self._next_state = after
+                    self._state = self._S_SKIP_BYTES
+
+    def _check_eof(self) -> None:
+        if self._state == self._S_PASSTHROUGH:
+            return
+        if self._state != self._S_MAGIC or len(self._buf) > 0:
+            raise EOFError("Truncated zstd stream: unexpected end of file before frame completion.")
+
+    def read(self, size: int = -1):
+        data = self._stream.read(size)
+        if data:
+            self._feed(data)
+        elif size is None or size != 0:
+            self._check_eof()
+        return data
+
+    def read1(self, size: int = -1):
+        read1_fn = getattr(self._stream, 'read1', None)
+        data = read1_fn(size) if read1_fn is not None else self._stream.read(size)
+        if data:
+            self._feed(data)
+        elif size is None or size != 0:
+            self._check_eof()
+        return data
+
+    def readinto(self, b):
+        readinto_fn = getattr(self._stream, 'readinto', None)
+        if readinto_fn is not None:
+            n = readinto_fn(b)
+            if n:
+                self._feed(memoryview(b)[:n])
+            elif len(b) > 0:
+                self._check_eof()
+            return n
+        data = self._stream.read(len(b))
+        n = len(data)
+        if n:
+            b[:n] = data
+            self._feed(data)
+        elif len(b) > 0:
+            self._check_eof()
+        return n
+
+    def readable(self) -> bool:
+        fn = getattr(self._stream, 'readable', None)
+        return fn() if fn is not None else True
+
+    def writable(self) -> bool:
+        return False
+
+    def seekable(self) -> bool:
+        return False
+
+    def close(self):
+        close_fn = getattr(self._stream, 'close', None)
+        if close_fn is not None:
+            close_fn()
+
+    def __getattr__(self, name):
+        return getattr(self._stream, name)
+
+
 def format_bytes(num: float) -> str:
     """Format bytes to human readable sizes."""
     for unit in ['B', 'KB', 'MB', 'GB', 'TB', 'PB', 'EB', 'ZB']:
@@ -620,7 +812,7 @@ def _record_raw_close_attempted(obj, seen: set) -> None:
             if cur._raw_close_attempted:
                 seen.add(id(cur._sftp_file))
             break
-        if isinstance(cur, _CountingByteStream):
+        if isinstance(cur, (_CountingByteStream, _ZstdFrameValidatingStream)):
             cur = cur._stream
         elif isinstance(cur, io.IOBase):
             nxt = getattr(cur, 'buffer', None)
@@ -1176,6 +1368,15 @@ class PolyReader:
             raise StopIteration
         return line
 
+    def _open_zst_reader(self, stream):
+        """Wrap a binary stream with Zstandard multi-frame decompression and truncation detection."""
+        import zstandard as zstd
+        dctx = zstd.ZstdDecompressor(max_window_size=2**31)
+        validated = _ZstdFrameValidatingStream(stream)
+        sr = dctx.stream_reader(validated, read_across_frames=True, read_size=_ZST_BUFFER_SIZE)
+        buffered = io.BufferedReader(sr, buffer_size=_ZST_BUFFER_SIZE)
+        return buffered if self.binary else io.TextIOWrapper(buffered, encoding='utf-8')
+
     def _wrap_ftp(self, parsed: ParseResult):
         """
         Wrap self._fh to handle FTP connections and file operations.
@@ -1212,11 +1413,7 @@ class PolyReader:
 
         norm = _normalized_path(self.filename, parsed)
         if norm.endswith('.zst'):
-            import zstandard as zstd
-            dctx = zstd.ZstdDecompressor(max_window_size=2**31)
-            sr = dctx.stream_reader(stream, read_across_frames=True, read_size=_ZST_BUFFER_SIZE)
-            buffered = io.BufferedReader(sr, buffer_size=_ZST_BUFFER_SIZE)
-            self._fh = buffered if self.binary else io.TextIOWrapper(buffered, encoding='utf-8')
+            self._fh = self._open_zst_reader(stream)
         elif norm.endswith('.bz2'):
             import bz2
             self._fh = (
@@ -1308,12 +1505,8 @@ class PolyReader:
 
         norm = _normalized_path(self.filename, parsed)
         if norm.endswith('.zst'):
-            import zstandard as zstd
             stream = self._make_counted_stream(raw_stream)
-            dctx = zstd.ZstdDecompressor(max_window_size=2**31)
-            sr = dctx.stream_reader(stream, read_across_frames=True, read_size=_ZST_BUFFER_SIZE)
-            buffered = io.BufferedReader(sr, buffer_size=_ZST_BUFFER_SIZE)
-            self._fh = buffered if self.binary else io.TextIOWrapper(buffered, encoding='utf-8')
+            self._fh = self._open_zst_reader(stream)
         elif norm.endswith('.bz2'):
             import bz2
             stream = self._make_counted_stream(raw_stream)
@@ -1392,12 +1585,8 @@ class PolyReader:
             self._http_file_size = None
 
         if norm.endswith('.zst'):
-            import zstandard as zstd
             stream = self._make_counted_stream(response.raw)
-            dctx = zstd.ZstdDecompressor(max_window_size=2**31)
-            sr = dctx.stream_reader(stream, read_across_frames=True, read_size=_ZST_BUFFER_SIZE)
-            buffered = io.BufferedReader(sr, buffer_size=_ZST_BUFFER_SIZE)
-            self._fh = buffered if self.binary else io.TextIOWrapper(buffered, encoding='utf-8')
+            self._fh = self._open_zst_reader(stream)
         elif norm.endswith('.bz2'):
             import bz2
             stream = self._make_counted_stream(response.raw)
@@ -1455,13 +1644,9 @@ class PolyReader:
         """
         norm = _normalized_path(self.filename, parsed)
         if norm.endswith('.zst'):
-            import zstandard as zstd
-            dctx = zstd.ZstdDecompressor(max_window_size=2**31)
             self._raw_fh = open(self.filename, 'rb')
             stream = self._make_counted_stream(self._raw_fh)
-            sr = dctx.stream_reader(stream, read_across_frames=True, read_size=_ZST_BUFFER_SIZE)
-            buffered = io.BufferedReader(sr, buffer_size=_ZST_BUFFER_SIZE)
-            self._fh = buffered if self.binary else io.TextIOWrapper(buffered, encoding='utf-8')
+            self._fh = self._open_zst_reader(stream)
         elif norm.endswith('.bz2'):
             import bz2
             open_kwargs = {'mode': 'rb'} if self.binary else {'mode': 'rt', 'encoding': 'utf-8'}

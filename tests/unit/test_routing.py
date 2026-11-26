@@ -1751,3 +1751,87 @@ def test_keyboard_interrupt_mid_open_cleans_up_remote_handles():
         assert w_sftp._sftp_file is None
         assert w_sftp._sftp_client is None
         assert w_sftp._ssh_client is None
+
+
+@pytest.mark.parametrize("mode", ["r", "rb"])
+def test_remote_truncated_zst_raises_and_closes_handles_across_http_ftp_and_sftp(mode):
+    """hxile6: Truncated .zst streams raise EOFError and close handles cleanly across HTTP, FTP, and SFTP."""
+    sample = ("remote truncated zst payload line 0123456789abcdef\n" * 200).encode("utf-8")
+    full_wire = zstd.ZstdCompressor(write_checksum=True).compress(sample)
+    trunc_wire = full_wire[: max(10, len(full_wire) // 2)]
+
+    # 1. HTTP via real local ThreadingHTTPServer
+    class TruncZstHandler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Content-Length", str(len(trunc_wire)))
+            self.end_headers()
+            self.wfile.write(trunc_wire)
+
+        def log_message(self, format, *args):  # noqa: A002
+            return
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), TruncZstHandler)
+    port = server.server_address[1]
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        reader = PolyReader(f"http://127.0.0.1:{port}/trunc.zst", show_progress=True, binary=(mode == "rb"))
+        with pytest.raises((EOFError, zstd.ZstdError)):
+            with reader:
+                reader.read()
+        assert reader.closed is True
+        assert reader._response is None
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    # 2. FTP via strict FTPFile proxy
+    with patch("ftputil.FTPHost") as mock_ftp:
+        host = MagicMock()
+        read_proxy = _StrictFTPFileProxy(trunc_wire)
+        host.open.return_value = read_proxy
+        host.path.getsize.return_value = len(trunc_wire)
+        mock_ftp.return_value = host
+        reader_ftp = PolyReader("ftp://u:p@host/dir/trunc.zst", show_progress=True, binary=(mode == "rb"))
+        with pytest.raises((EOFError, zstd.ZstdError)):
+            with reader_ftp:
+                reader_ftp.read()
+        assert read_proxy.closed is True
+        assert host.close.call_count == 1
+        assert reader_ftp.closed is True
+
+    # 3. SFTP via both sequential fallback and readv bounded stream
+    class _ReadvSFTPFile(io.BytesIO):
+        def __init__(self, data: bytes):
+            super().__init__(data)
+            self._data = data
+
+        def stat(self):
+            st = MagicMock()
+            st.st_size = len(self._data)
+            return st
+
+        def readv(self, chunks, max_concurrent_prefetch_requests=None):
+            for offset, length in chunks:
+                yield self._data[offset : offset + length]
+
+    with patch("paramiko.SSHClient") as mock_ssh:
+        for make_file in (lambda: _StrictFTPFileProxy(trunc_wire), lambda: _ReadvSFTPFile(trunc_wire)):
+            client = MagicMock()
+            sftp = MagicMock()
+            sftp_file = make_file()
+            mock_ssh.return_value = client
+            client.open_sftp.return_value = sftp
+            sftp.file.return_value = sftp_file
+
+            reader_sftp = PolyReader("sftp://u:p@host/dir/trunc.zst", show_progress=True, binary=(mode == "rb"))
+            with pytest.raises((EOFError, zstd.ZstdError)):
+                with reader_sftp:
+                    reader_sftp.read()
+            assert sftp_file.closed is True
+            assert sftp.close.call_count == 1
+            assert client.close.call_count == 1
+            assert reader_sftp.closed is True

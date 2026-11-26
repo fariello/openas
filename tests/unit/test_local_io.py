@@ -1129,18 +1129,7 @@ def test_polyreader_readlines_hints_binary_and_progress(tmp_path, ext, binary):
         (".xz", "corrupt"),
         (".xz", "truncated"),
         (".zst", "corrupt"),
-        pytest.param(
-            ".zst",
-            "truncated",
-            marks=pytest.mark.xfail(
-                strict=True,
-                reason=(
-                    "Known upstream python-zstandard stream_reader() bug (backlog hxile6): truncated .zst frames "
-                    "silently return EOF instead of raising ZstdError or EOFError; requires "
-                    "out-of-scope production decompression change in src/polyopen/polyopen.py."
-                ),
-            ),
-        ),
+        (".zst", "truncated"),
     ],
 )
 @pytest.mark.parametrize("mode", ["r", "rb"])
@@ -1190,22 +1179,71 @@ def test_corrupt_and_truncated_compressed_streams_raise_and_close_handles(
 
 @pytest.mark.parametrize("mode", ["r", "rb"])
 @pytest.mark.parametrize("show_progress", [False, True])
-def test_truncated_zst_stream_closes_handles_without_resource_warning(tmp_path, mode, show_progress):
-    """was3ig E-03: Even before truncated .zst raises upstream, PolyReader closes every handle cleanly."""
-    sample_bytes = ("truncated zst payload line 0123456789abcdef\n" * 200).encode("utf-8")
-    full_wire = zstd.ZstdCompressor().compress(sample_bytes)
-    fp = tmp_path / f"truncated_cleanup_{mode}_{show_progress}.zst"
-    fp.write_bytes(full_wire[: max(10, len(full_wire) // 2)])
+def test_truncated_zst_stream_raises_and_closes_handles_without_resource_warning(tmp_path, mode, show_progress):
+    """hxile6: Truncated .zst streams raise EOFError across offsets, multi-frame, and skippable frames while closing handles."""
+    import struct
 
-    reader = PolyReader(fp, show_progress=show_progress, binary=(mode == "rb"))
-    with reader:
-        try:
-            reader.read()
-        except (zstd.ZstdError, EOFError):
-            pass
-    assert reader.closed is True
-    assert reader._fh is None
-    assert reader._raw_fh is None
+    # 1. Exhaustive byte-offset truncation across default, checksum, no-content-size, RLE, and empty frames
+    for label, cctx, payload in (
+        ("default", zstd.ZstdCompressor(), b"truncated zst line 0123456789\n" * 20),
+        ("checksum", zstd.ZstdCompressor(write_checksum=True), b"checksum zst line\n" * 20),
+        ("no_fcs", zstd.ZstdCompressor(write_content_size=False), b"no content size\n" * 20),
+        ("rle", zstd.ZstdCompressor(write_checksum=True), b"A" * 8192 + b"\n"),
+        ("empty", zstd.ZstdCompressor(write_checksum=True), b""),
+    ):
+        full_wire = cctx.compress(payload)
+        fp_full = tmp_path / f"valid_{label}_{mode}_{show_progress}.zst"
+        fp_full.write_bytes(full_wire)
+        with PolyReader(fp_full, show_progress=show_progress, binary=(mode == "rb")) as r:
+            expected = payload if mode == "rb" else payload.decode("utf-8")
+            assert r.read() == expected
+
+        # Verify early/mid/last-byte truncation points raise cleanly and close handles
+        cuts = sorted({1, 2, 4, len(full_wire) // 2, len(full_wire) - 1})
+        for cut in cuts:
+            if not (0 < cut < len(full_wire)):
+                continue
+            fp_bad = tmp_path / f"trunc_{label}_{cut}_{mode}_{show_progress}.zst"
+            fp_bad.write_bytes(full_wire[:cut])
+            reader = PolyReader(fp_bad, show_progress=show_progress, binary=(mode == "rb"))
+            with pytest.raises((EOFError, zstd.ZstdError)):
+                with reader:
+                    reader.read()
+            assert reader.closed is True
+            assert reader._fh is None
+            assert reader._raw_fh is None
+
+    # 2. Multi-frame .zst with skippable frame succeeds when intact and raises when 2nd frame or skippable frame is truncated
+    f1 = zstd.ZstdCompressor(write_checksum=True).compress(b"frame1\n")
+    f2 = zstd.ZstdCompressor(write_checksum=False).compress(b"frame2\n")
+    skippable = struct.pack("<II", 0x184D2A50, 5) + b"HELLO"
+    fp_multi = tmp_path / f"multi_skip_{mode}_{show_progress}.zst"
+    fp_multi.write_bytes(skippable + f1 + f2)
+    with PolyReader(fp_multi, show_progress=show_progress, binary=(mode == "rb")) as r:
+        expected = b"frame1\nframe2\n" if mode == "rb" else "frame1\nframe2\n"
+        assert r.read() == expected
+
+    for bad_name, bad_wire in (
+        ("trunc_frame2", skippable + f1 + f2[:-2]),
+        ("trunc_skippable", skippable[:-2]),
+        ("trailing_partial_magic", f1 + b"\x28\xb5"),
+    ):
+        fp_bad = tmp_path / f"{bad_name}_{mode}_{show_progress}.zst"
+        fp_bad.write_bytes(bad_wire)
+        reader = PolyReader(fp_bad, show_progress=show_progress, binary=(mode == "rb"))
+        with pytest.raises((EOFError, zstd.ZstdError)):
+            with reader:
+                reader.read()
+        assert reader.closed is True
+        assert reader._fh is None
+        assert reader._raw_fh is None
+
+    # 3. Early break on a valid multi-line .zst file does NOT falsely raise EOFError
+    fp_early = tmp_path / f"early_break_{mode}_{show_progress}.zst"
+    fp_early.write_bytes(zstd.ZstdCompressor().compress(b"line\n" * 5000))
+    with PolyReader(fp_early, show_progress=show_progress, binary=(mode == "rb")) as r:
+        first = next(iter(r))
+        assert first == (b"line\n" if mode == "rb" else "line\n")
 
 
 @pytest.mark.parametrize("ext", [".txt", ".gz", ".bz2", ".xz", ".zst"])
