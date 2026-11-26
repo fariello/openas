@@ -29,7 +29,7 @@ jobs:
           python-version: "3.12"
 
       - name: Install agent-workflows
-        run: pip install agent-workflows
+        run: pip install "git+https://github.com/fariello/agent-workflows.git@main"
 
       - name: Scan tracked files for local leaks
         run: python -m agent_workflows check-local-leaks .

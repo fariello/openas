@@ -5,6 +5,7 @@ import http.cookiejar
 import http.server
 import io
 import lzma
+import os
 import threading
 from urllib.parse import urlparse
 from unittest.mock import patch, MagicMock
@@ -61,7 +62,7 @@ def test_ssh_routing():
         writer_client.set_missing_host_key_policy.assert_not_called()
         writer_client.connect.assert_called_once()
         writer_client.open_sftp.assert_called_once()
-        assert writer_buf.saved_bytes == b"stub\n"
+        assert writer_buf.saved_bytes == f"stub{os.linesep}".encode("utf-8")
         assert writer_buf.closed
         writer_sftp.close.assert_called_once()
         writer_client.close.assert_called_once()
@@ -453,7 +454,7 @@ def test_remote_compresslevel_default_and_explicit(protocol, ext, compresslevel)
                 assert call_kwargs["preset"] == 2
 
     assert buf.closed
-    assert _decompress_bytes(buf.saved_bytes, ext) == payload
+    assert _decompress_bytes(buf.saved_bytes, ext) == payload.replace("\n", os.linesep)
 
 
 @patch("paramiko.SSHClient")
@@ -684,7 +685,7 @@ def test_sftp_compressed_writes_binary_mode_and_pipelined(mock_ssh, ext, append,
     assert buf.closed
     assert sftp.close.call_count == 1
     assert client.close.call_count == 1
-    assert _decompress_bytes(buf.saved_bytes, ext) == "pipelined line\n"
+    assert _decompress_bytes(buf.saved_bytes, ext) == f"pipelined line{os.linesep}"
 
 
 @patch("paramiko.SSHClient")
@@ -915,10 +916,11 @@ def test_ftp_real_ftpfile_contract_reads_writes_and_append_rejected(mock_host, e
     assert write_proxy.closed
     assert mock_host.call_args.kwargs["port"] == 2121
     assert mock_host.call_args.kwargs["timeout"] == 5.0
+    expected_wire_text = text.replace("\n", os.linesep)
     if ext:
-        assert _decompress_bytes(write_proxy.saved_bytes, ext) == text
+        assert _decompress_bytes(write_proxy.saved_bytes, ext) == expected_wire_text
     else:
-        assert write_proxy.saved_bytes.decode("utf-8") == text
+        assert write_proxy.saved_bytes.decode("utf-8") == expected_wire_text
 
     # Read back with strict FTPFile proxy (both show_progress=False and True)
     for show_progress in (False, True):
@@ -1004,7 +1006,7 @@ def test_ssh_connect_leak_fix_percent_decode_timeout_uncompressed_write_int_and_
     assert client.connect.call_args.kwargs["password"] == "p:s/w"
     assert client.connect.call_args.kwargs["timeout"] == 9.0
     sftp.file.assert_called_once_with("/my dir/out.txt", "wb")
-    assert raw_write.saved_bytes == "café\n".encode("utf-8")
+    assert raw_write.saved_bytes == f"café{os.linesep}".encode("utf-8")
 
     # 4. SFTP show_progress=True when stat() raises OSError degrades to total=None instead of crashing
     class StatFailSFTPFile(io.BytesIO):
@@ -1231,7 +1233,7 @@ def test_percent_encoded_remote_gz_uses_gzip_codec():
             w.write(payload)
         sftp.file.assert_called_once_with("/dir/data.gz", "wb")
         assert write_buf.closed
-        assert gzip.decompress(write_buf.saved_bytes).decode("utf-8") == payload
+        assert gzip.decompress(write_buf.saved_bytes).decode("utf-8") == payload.replace("\n", os.linesep)
 
         sftp.reset_mock()
         read_buf = io.BytesIO(write_buf.saved_bytes)
