@@ -12,12 +12,12 @@ from unittest.mock import patch, MagicMock
 import pytest
 import requests
 import zstandard as zstd
-from polyopen import polyopen, PolyReader, PolyWriter, UnsupportedArchiveError
-from polyopen.polyopen import _get_http_session, _normalized_path
+from openas import openas, OpenAsReader, OpenAsWriter, UnsupportedArchiveError
+from openas.openas import _get_http_session, _normalized_path
 
 def test_ssh_routing():
     """
-    was3ig E-02: Enforce Paramiko RejectPolicy contract for both PolyReader and PolyWriter
+    was3ig E-02: Enforce Paramiko RejectPolicy contract for both OpenAsReader and OpenAsWriter
     (load_system_host_keys called, set_missing_host_key_policy never called) and verify real
     paramiko.SSHClient defaults to RejectPolicy.
     """
@@ -30,14 +30,14 @@ def test_ssh_routing():
         real_client.close()
 
     with patch('paramiko.SSHClient') as mock_ssh:
-        # 1. PolyReader._wrap_ssh
+        # 1. OpenAsReader._wrap_ssh
         reader_client = MagicMock()
         reader_sftp = MagicMock()
         reader_client.open_sftp.return_value = reader_sftp
         reader_sftp.file.return_value = io.BytesIO(b"hello ssh\n")
         mock_ssh.return_value = reader_client
 
-        with polyopen("ssh://user:pass@host/file.txt", 'r') as reader:
+        with openas("ssh://user:pass@host/file.txt", 'r') as reader:
             assert reader.read() == "hello ssh\n"
 
         reader_client.load_system_host_keys.assert_called_once()
@@ -47,7 +47,7 @@ def test_ssh_routing():
         reader_sftp.close.assert_called_once()
         reader_client.close.assert_called_once()
 
-        # 2. PolyWriter._wrap_ssh
+        # 2. OpenAsWriter._wrap_ssh
         writer_client = MagicMock()
         writer_sftp = MagicMock()
         writer_buf = _InspectableBytesIO()
@@ -55,7 +55,7 @@ def test_ssh_routing():
         writer_sftp.file.return_value = writer_buf
         mock_ssh.return_value = writer_client
 
-        with polyopen("ssh://user:pass@host/file.txt", 'w', backup=False) as writer:
+        with openas("ssh://user:pass@host/file.txt", 'w', backup=False) as writer:
             writer.write("stub\n")
 
         writer_client.load_system_host_keys.assert_called_once()
@@ -91,7 +91,7 @@ def test_sftp_backup_five_collision_retry_exhaustion_closes_handles(mock_ssh):
 
     sftp.rename.side_effect = collide_always
 
-    writer = PolyWriter("sftp://u:p@host/dir/file.txt")
+    writer = OpenAsWriter("sftp://u:p@host/dir/file.txt")
     with pytest.raises(OSError, match=r"collision #5 on /dir/file\.txt\.006\.bu"):
         writer.open(backup=True)
 
@@ -104,7 +104,7 @@ def test_sftp_backup_five_collision_retry_exhaustion_closes_handles(mock_ssh):
 @patch('requests.Session.get')
 def test_http_routing(mock_get):
     """
-    Assert polyopen cleanly traps http:// streams, reads via response.raw with preserved newlines,
+    Assert openas cleanly traps http:// streams, reads via response.raw with preserved newlines,
     and explicitly closes the HTTP response.
     """
     mock_response = MagicMock()
@@ -113,7 +113,7 @@ def test_http_routing(mock_get):
     mock_get.return_value = mock_response
     
     lines = []
-    with polyopen("https://example.com/data.txt", 'r') as reader:
+    with openas("https://example.com/data.txt", 'r') as reader:
         for line in reader:
              lines.append(line)
              
@@ -130,7 +130,7 @@ def test_ftp_read_default_port_progress_and_close(mock_host):
 
     raw_plain = io.BytesIO("hello ftp café\n".encode("utf-8"))
     host.open.return_value = raw_plain
-    with polyopen("ftp://user:pass@host/dir/file.txt", "r") as reader:
+    with openas("ftp://user:pass@host/dir/file.txt", "r") as reader:
         assert list(reader) == ["hello ftp café\n"]
     assert mock_host.call_args.kwargs["port"] == 21
     assert raw_plain.closed
@@ -141,7 +141,7 @@ def test_ftp_read_default_port_progress_and_close(mock_host):
     host.reset_mock()
     host.open.return_value = raw_gz
     host.path.getsize.return_value = len(gz_bytes)
-    with polyopen("ftp://user:pass@host/dir/file.txt.gz", "r", show_progress=True) as reader:
+    with openas("ftp://user:pass@host/dir/file.txt.gz", "r", show_progress=True) as reader:
         assert list(reader) == ["compressed ftp\n"]
     assert mock_host.call_args.kwargs["port"] == 21
     host.path.getsize.assert_called_once_with("/dir/file.txt.gz")
@@ -162,7 +162,7 @@ def test_ftp_write_default_port_compressed_close_and_999_cap(mock_host):
     buf = io.BytesIO()
     host.open.return_value = buf
     with patch("time.time_ns", return_value=1700000000000000123):
-        with polyopen("ftp://user:pass@host/dir/out.gz", "w", backup=True) as writer:
+        with openas("ftp://user:pass@host/dir/out.gz", "w", backup=True) as writer:
             writer.write("ftp data\n")
 
     assert mock_host.call_args.kwargs["port"] == 21
@@ -181,7 +181,7 @@ def test_sftp_missing_file_raises_without_exit_or_password_leak(mock_ssh, capsys
     sftp.file.side_effect = FileNotFoundError("missing")
 
     with pytest.raises(FileNotFoundError):
-        PolyReader("ssh://alice:supersecret@host:2222/nope.txt").open()
+        OpenAsReader("ssh://alice:supersecret@host:2222/nope.txt").open()
 
     captured = capsys.readouterr()
     assert "supersecret" not in captured.out
@@ -195,7 +195,7 @@ def test_sftp_missing_file_raises_without_exit_or_password_leak(mock_ssh, capsys
     sftp.reset_mock()
     sftp.file.side_effect = FileNotFoundError("missing")
     with pytest.raises(FileNotFoundError):
-        PolyWriter("sftp://alice:supersecret@host/nope.txt").open(append=False, backup=False)
+        OpenAsWriter("sftp://alice:supersecret@host/nope.txt").open(append=False, backup=False)
 
     captured = capsys.readouterr()
     assert "supersecret" not in captured.out
@@ -228,20 +228,20 @@ def test_sftp_read_port_stat_and_utf8_decompression(mock_ssh):
     plain_bytes = "café 日本語\n".encode("utf-8")
     f_plain = FakeSFTPFile(plain_bytes)
     sftp.file.return_value = f_plain
-    with PolyReader("sftp://u:p@host:2222/a.txt", show_progress=True) as r:
+    with OpenAsReader("sftp://u:p@host:2222/a.txt", show_progress=True) as r:
         assert list(r) == ["café 日本語\n"]
     assert client.connect.call_args.kwargs["port"] == 2222
     assert f_plain.stat_calls == [()]
 
     f_gz = FakeSFTPFile(gzip.compress(plain_bytes))
     sftp.file.return_value = f_gz
-    with PolyReader("sftp://u:p@host/a.txt.gz") as r:
+    with OpenAsReader("sftp://u:p@host/a.txt.gz") as r:
         assert r.read() == "café 日本語\n"
     assert client.connect.call_args.kwargs["port"] == 22
 
     f_bz2 = FakeSFTPFile(bz2.compress(plain_bytes))
     sftp.file.return_value = f_bz2
-    with PolyReader("sftp://u:p@host/a.txt.bz2") as r:
+    with OpenAsReader("sftp://u:p@host/a.txt.bz2") as r:
         assert r.read() == "café 日本語\n"
 
 
@@ -287,41 +287,41 @@ def test_sftp_prefetch_guard_when_stat_fails_or_size_none(mock_ssh):
 
     f_err = ParamikoLikeSFTPFile(b"ok\n", stat_raises=True)
     sftp.file.return_value = f_err
-    with PolyReader("sftp://u:p@host/a.txt") as r:
+    with OpenAsReader("sftp://u:p@host/a.txt") as r:
         assert r.read() == "ok\n"
     assert f_err.prefetch_calls == []
     assert f_err.readv_calls == []
 
     f_none = ParamikoLikeSFTPFile(b"ok\n", st_size_override=None)
     sftp.file.return_value = f_none
-    with PolyReader("sftp://u:p@host/a.txt") as r:
+    with OpenAsReader("sftp://u:p@host/a.txt") as r:
         assert r.read() == "ok\n"
     assert f_none.prefetch_calls == []
     assert f_none.readv_calls == []
 
     f_zero = ParamikoLikeSFTPFile(b"", st_size_override=0)
     sftp.file.return_value = f_zero
-    with PolyReader("sftp://u:p@host/empty.txt") as r:
+    with OpenAsReader("sftp://u:p@host/empty.txt") as r:
         assert r.read() == ""
     assert f_zero.prefetch_calls == []
     assert f_zero.readv_calls == []
 
     f_neg = ParamikoLikeSFTPFile(b"neg\n", st_size_override=-1)
     sftp.file.return_value = f_neg
-    with PolyReader("sftp://u:p@host/neg.txt") as r:
+    with OpenAsReader("sftp://u:p@host/neg.txt") as r:
         assert r.read() == "neg\n"
     assert f_neg.prefetch_calls == []
     assert f_neg.readv_calls == []
 
     f_no_readv = ParamikoLikeSFTPFile(b"seq\n", has_readv=False)
     sftp.file.return_value = f_no_readv
-    with PolyReader("sftp://u:p@host/seq.txt") as r:
+    with OpenAsReader("sftp://u:p@host/seq.txt") as r:
         assert r.read() == "seq\n"
     assert f_no_readv.prefetch_calls == []
 
     f_ok = ParamikoLikeSFTPFile(b"ok\n")
     sftp.file.return_value = f_ok
-    with PolyReader("sftp://u:p@host/a.txt") as r:
+    with OpenAsReader("sftp://u:p@host/a.txt") as r:
         assert r.read() == "ok\n"
     assert f_ok.prefetch_calls == []
     assert f_ok.readv_calls == [([(0, 3)], 64)]
@@ -334,7 +334,7 @@ def test_http_errors_query_extensions_unknown_size_and_file_methods(mock_get):
     resp404.raise_for_status.side_effect = requests.HTTPError("404")
     mock_get.return_value = resp404
     with pytest.raises(requests.HTTPError):
-        PolyReader("https://example.com/missing.txt").open()
+        OpenAsReader("https://example.com/missing.txt").open()
     assert resp404.close.called
 
     gz_data = gzip.compress("query gz\n".encode("utf-8"))
@@ -342,11 +342,11 @@ def test_http_errors_query_extensions_unknown_size_and_file_methods(mock_get):
     resp_gz.headers = {"Content-Length": str(len(gz_data))}
     resp_gz.raw = io.BytesIO(gz_data)
     mock_get.return_value = resp_gz
-    with PolyReader("https://example.com/data.txt.gz?token=1") as r:
+    with OpenAsReader("https://example.com/data.txt.gz?token=1") as r:
         assert list(r) == ["query gz\n"]
 
     with pytest.raises(UnsupportedArchiveError):
-        PolyReader("https://example.com/archive.zip?dl=1").open()
+        OpenAsReader("https://example.com/archive.zip?dl=1").open()
 
     for headers in ({}, {"Content-Length": "invalid"}):
         resp_unknown = MagicMock()
@@ -354,7 +354,7 @@ def test_http_errors_query_extensions_unknown_size_and_file_methods(mock_get):
         resp_unknown.raw = io.BytesIO(b"line1\nline2\nline3\n")
         mock_get.return_value = resp_unknown
         with patch("os.path.getsize", side_effect=AssertionError("os.path.getsize must not be called")):
-            with PolyReader("https://example.com/stream.txt", show_progress=True) as r:
+            with OpenAsReader("https://example.com/stream.txt", show_progress=True) as r:
                 assert r._get_file_size() is None
                 assert r._progress is not None
                 assert r._progress.total is None
@@ -432,7 +432,7 @@ def test_remote_compresslevel_default_and_explicit(protocol, ext, compresslevel)
             mock_transport.return_value = host
             host.open.return_value = buf
 
-        with polyopen(url, "w", backup=False, compresslevel=compresslevel) as writer:
+        with openas(url, "w", backup=False, compresslevel=compresslevel) as writer:
             writer.write(payload)
 
         assert mock_comp.called
@@ -475,7 +475,7 @@ def test_sftp_backup_rotation_fast_path_500_posix_and_999_cap(mock_ssh):
 
     sftp.stat.side_effect = stat_fast
     sftp.file.return_value = _InspectableBytesIO()
-    with PolyWriter("sftp://u:p@host/nested/dir/file.txt").open(backup=True) as w:
+    with OpenAsWriter("sftp://u:p@host/nested/dir/file.txt").open(backup=True) as w:
         w.write("new\n")
     sftp.listdir.assert_not_called()
     sftp.rename.assert_called_once_with("/nested/dir/file.txt", "/nested/dir/file.txt.001.bu")
@@ -489,7 +489,7 @@ def test_sftp_backup_rotation_fast_path_500_posix_and_999_cap(mock_ssh):
         sftp.reset_mock()
         sftp.stat.side_effect = lambda p: MagicMock()
         sftp.listdir.return_value = [basename] + [f"{basename}.{i:03d}.bu" for i in range(1, 501)]
-        writer = PolyWriter("sftp://u:p@host/placeholder")
+        writer = OpenAsWriter("sftp://u:p@host/placeholder")
         writer._ssh_backup_if(sftp, remote_path)
         sftp.listdir.assert_called_once_with(expected_parent)
         sftp.rename.assert_called_once_with(remote_path, f"{remote_path}.501.bu")
@@ -504,7 +504,7 @@ def test_sftp_backup_rotation_fast_path_500_posix_and_999_cap(mock_ssh):
     )
     sftp.file.return_value = _InspectableBytesIO()
     with patch("time.time_ns", return_value=1700000000000000123):
-        with PolyWriter("sftp://u:p@host/sub/cap.txt").open(backup=True) as w:
+        with OpenAsWriter("sftp://u:p@host/sub/cap.txt").open(backup=True) as w:
             w.write("after cap\n")
     sftp.listdir.assert_called_once_with("/sub")
     sftp.rename.assert_called_once_with("/sub/cap.txt", "/sub/cap.txt.1700000000000000124.bu")
@@ -519,7 +519,7 @@ def test_ftp_backup_rotation_fast_path_500_posix_and_999_cap(mock_host):
     # 1. .001.bu fast-path without listdir
     host.path.exists.side_effect = lambda p: p == "/nested/dir/file.txt"
     host.open.return_value = _InspectableBytesIO()
-    with PolyWriter("ftp://u:p@host/nested/dir/file.txt").open(backup=True) as w:
+    with OpenAsWriter("ftp://u:p@host/nested/dir/file.txt").open(backup=True) as w:
         w.write("new\n")
     host.listdir.assert_not_called()
     host.rename.assert_called_once_with("/nested/dir/file.txt", "/nested/dir/file.txt.001.bu")
@@ -534,7 +534,7 @@ def test_ftp_backup_rotation_fast_path_500_posix_and_999_cap(mock_host):
         host.path.exists.return_value = True
         host.listdir.return_value = [basename] + [f"{basename}.{i:03d}.bu" for i in range(1, 501)]
         host.open.return_value = _InspectableBytesIO()
-        with PolyWriter(f"ftp://u:p@host{remote_path}").open(backup=True) as w:
+        with OpenAsWriter(f"ftp://u:p@host{remote_path}").open(backup=True) as w:
             w.write("next\n")
         host.listdir.assert_called_once_with(expected_parent)
         host.rename.assert_called_once_with(remote_path, f"{remote_path}.501.bu")
@@ -550,7 +550,7 @@ def test_ftp_backup_rotation_fast_path_500_posix_and_999_cap(mock_host):
     )
     host.open.return_value = _InspectableBytesIO()
     with patch("time.time_ns", return_value=1700000000000000500):
-        with PolyWriter("ftp://u:p@host/dir/cap.txt").open(backup=True) as w:
+        with OpenAsWriter("ftp://u:p@host/dir/cap.txt").open(backup=True) as w:
             w.write("after cap\n")
     host.listdir.assert_called_once_with("/dir")
     host.rename.assert_called_once_with("/dir/cap.txt", "/dir/cap.txt.1700000000000000501.bu")
@@ -597,7 +597,7 @@ def test_sftp_read_prefetch_fallback_cached_size_and_idempotent_close(mock_ssh):
     # 1. Bounded readv() + cached _get_file_size (no duplicate stat RTT) + idempotent close
     f1 = BoundedSFTPFile(b"row1\nrow2\n")
     sftp.file.return_value = f1
-    reader = PolyReader("sftp://u:p@host/data.txt", show_progress=True).open()
+    reader = OpenAsReader("sftp://u:p@host/data.txt", show_progress=True).open()
     assert f1.prefetch_calls == []
     assert reader._get_file_size() == 10
     assert f1.stat_count == 1
@@ -638,7 +638,7 @@ def test_sftp_read_prefetch_fallback_cached_size_and_idempotent_close(mock_ssh):
     sftp.reset_mock()
     f_legacy = LegacySFTPFile(b"legacy\n")
     sftp.file.return_value = f_legacy
-    with PolyReader("sftp://u:p@host/legacy.txt") as r:
+    with OpenAsReader("sftp://u:p@host/legacy.txt") as r:
         assert r.read() == "legacy\n"
     assert f_legacy.readv_calls == [[(0, 7)]]
 
@@ -647,7 +647,7 @@ def test_sftp_read_prefetch_fallback_cached_size_and_idempotent_close(mock_ssh):
     sftp.reset_mock()
     f_err = BoundedSFTPFile(b"err\n")
     sftp.file.return_value = f_err
-    r_err = PolyReader("sftp://u:p@host/err.txt").open()
+    r_err = OpenAsReader("sftp://u:p@host/err.txt").open()
     r_err._fh.detach()
     failing_fh = MagicMock()
     failing_fh.close.side_effect = OSError("fh close failed")
@@ -677,7 +677,7 @@ def test_sftp_compressed_writes_binary_mode_and_pipelined(mock_ssh, ext, append,
     buf = _InspectableBytesIO()
     sftp.file.return_value = buf
 
-    with PolyWriter(f"sftp://u:p@host/dir/out{ext}").open(append=append, backup=False) as writer:
+    with OpenAsWriter(f"sftp://u:p@host/dir/out{ext}").open(append=append, backup=False) as writer:
         writer.write("pipelined line\n")
 
     sftp.file.assert_called_once_with(f"/dir/out{ext}", expected_mode)
@@ -690,7 +690,7 @@ def test_sftp_compressed_writes_binary_mode_and_pipelined(mock_ssh, ext, append,
 
 @patch("paramiko.SSHClient")
 def test_sftp_writer_close_idempotent_and_error_paths(mock_ssh):
-    """p1f3dc E-01(c): PolyWriter.close() idempotently closes all SFTP/SSH handles including on error paths."""
+    """p1f3dc E-01(c): OpenAsWriter.close() idempotently closes all SFTP/SSH handles including on error paths."""
     client = MagicMock()
     sftp = MagicMock()
     mock_ssh.return_value = client
@@ -699,7 +699,7 @@ def test_sftp_writer_close_idempotent_and_error_paths(mock_ssh):
     # 1. Normal idempotent close
     sftp_file = MagicMock()
     sftp.file.return_value = sftp_file
-    writer = PolyWriter("sftp://u:p@host/plain.txt").open(backup=False)
+    writer = OpenAsWriter("sftp://u:p@host/plain.txt").open(backup=False)
     sftp.file.assert_called_once_with("/plain.txt", "wb")
     sftp_file.set_pipelined.assert_called_once_with(True)
     writer.close()
@@ -713,7 +713,7 @@ def test_sftp_writer_close_idempotent_and_error_paths(mock_ssh):
     sftp.reset_mock()
     buf = _InspectableBytesIO()
     sftp.file.return_value = buf
-    writer_err = PolyWriter("sftp://u:p@host/out.gz").open(backup=False)
+    writer_err = OpenAsWriter("sftp://u:p@host/out.gz").open(backup=False)
     writer_err._fh.close()  # closes gzip wrapper cleanly without closing underlying buf
     assert buf.close_count == 0
     failing_fh = MagicMock()
@@ -738,7 +738,7 @@ def test_sftp_writer_close_idempotent_and_error_paths(mock_ssh):
     bad_file.set_pipelined.side_effect = RuntimeError("pipeline error")
     sftp.file.return_value = bad_file
     with pytest.raises(RuntimeError, match="pipeline error"):
-        PolyWriter("sftp://u:p@host/bad.txt").open(backup=False)
+        OpenAsWriter("sftp://u:p@host/bad.txt").open(backup=False)
     assert bad_file.close.call_count == 1
     assert sftp.close.call_count == 1
     assert client.close.call_count == 1
@@ -797,10 +797,10 @@ def test_http_session_thread_local_reuse_and_cookie_disabled():
     thread.start()
     url = f"http://127.0.0.1:{port}/data.txt"
     try:
-        with PolyReader(url) as r1:
+        with OpenAsReader(url) as r1:
             assert list(r1) == ["hello cookie-free\n"]
         assert len(_get_http_session().cookies) == 0
-        with PolyReader(url) as r2:
+        with OpenAsReader(url) as r2:
             assert list(r2) == ["hello cookie-free\n"]
         assert len(_get_http_session().cookies) == 0
     finally:
@@ -821,7 +821,7 @@ def test_http_early_iteration_exit_closes_response(mock_get):
     mock_get.return_value = mock_response
 
     seen = []
-    with PolyReader("https://example.com/early.txt") as reader:
+    with OpenAsReader("https://example.com/early.txt") as reader:
         for line in reader:
             seen.append(line)
             break
@@ -862,7 +862,7 @@ def test_http_decode_content_only_on_uncompressed(mock_get, ext):
     mock_response.raw = tracked_raw
     mock_get.return_value = mock_response
 
-    with PolyReader(f"https://example.com/file{ext or '.txt'}") as reader:
+    with OpenAsReader(f"https://example.com/file{ext or '.txt'}") as reader:
         assert list(reader) == ["http stream line 1\n", "http stream line 2\n"]
 
     if ext == "":
@@ -901,7 +901,7 @@ class _StrictFTPFileProxy:
 @pytest.mark.parametrize("ext", ["", ".gz", ".bz2", ".xz", ".zst"])
 def test_ftp_real_ftpfile_contract_reads_writes_and_append_rejected(mock_host, ext):
     """S2-B1: Real ftputil.file.FTPFile (without readable/seekable/writable) works across all codecs; FTP append rejected."""
-    from polyopen import UnsupportedProtocolError
+    from openas import UnsupportedProtocolError
 
     host = MagicMock()
     mock_host.return_value = host
@@ -910,7 +910,7 @@ def test_ftp_real_ftpfile_contract_reads_writes_and_append_rejected(mock_host, e
     # Write with strict FTPFile proxy
     write_proxy = _StrictFTPFileProxy()
     host.open.return_value = write_proxy
-    with polyopen(f"ftp://user:pass@host:2121/dir/out{ext or '.txt'}", "w", backup=False, timeout=5.0) as w:
+    with openas(f"ftp://user:pass@host:2121/dir/out{ext or '.txt'}", "w", backup=False, timeout=5.0) as w:
         n = w.write(text)
         assert n == len(text)
     assert write_proxy.closed
@@ -927,7 +927,7 @@ def test_ftp_real_ftpfile_contract_reads_writes_and_append_rejected(mock_host, e
         read_proxy = _StrictFTPFileProxy(write_proxy.saved_bytes)
         host.open.return_value = read_proxy
         host.path.getsize.side_effect = OSError("SIZE unsupported")
-        with polyopen(f"ftp://user:pass@host/dir/out{ext or '.txt'}", "r", show_progress=show_progress) as r:
+        with openas(f"ftp://user:pass@host/dir/out{ext or '.txt'}", "r", show_progress=show_progress) as r:
             assert r.read() == text
             if show_progress:
                 assert r._progress is not None and r._progress.total is None
@@ -936,14 +936,14 @@ def test_ftp_real_ftpfile_contract_reads_writes_and_append_rejected(mock_host, e
     # FTP append fails fast BEFORE connecting
     mock_host.reset_mock()
     with pytest.raises(UnsupportedProtocolError, match="append"):
-        polyopen("ftp://user:pass@host/dir/out.txt", "a")
+        openas("ftp://user:pass@host/dir/out.txt", "a")
     assert not mock_host.called
 
 
 def test_ftp_session_wrapper_port_timeout_and_login_failure_closes_socket(monkeypatch):
     """S2-MEM1 & S3-T1: FTPSessionWrapper forwards port/timeout and closes socket if login() raises."""
     import ftplib
-    from polyopen import FTPSessionWrapper
+    from openas import FTPSessionWrapper
 
     calls = []
     closed = []
@@ -981,7 +981,7 @@ def test_ssh_connect_leak_fix_percent_decode_timeout_uncompressed_write_int_and_
     # 1. Failed connect() closes SSHClient (prevents leaked Paramiko Transport thread)
     client.connect.side_effect = OSError("auth failed")
     with pytest.raises(OSError, match="auth failed"):
-        PolyReader("sftp://alice:pw@host/a.txt", timeout=4.0).open()
+        OpenAsReader("sftp://alice:pw@host/a.txt", timeout=4.0).open()
     assert client.close.call_count == 1
     assert client.connect.call_args.kwargs["timeout"] == 4.0
     assert client.connect.call_args.kwargs["banner_timeout"] == 4.0
@@ -991,7 +991,7 @@ def test_ssh_connect_leak_fix_percent_decode_timeout_uncompressed_write_int_and_
     client.reset_mock()
     client.connect.side_effect = None
     with pytest.raises(ValueError, match="Missing hostname"):
-        PolyReader("sftp:///no_host.txt").open()
+        OpenAsReader("sftp:///no_host.txt").open()
     assert not client.connect.called
 
     # 3. Percent-decoded credentials/path + uncompressed SFTP write() returns int even when raw write returns None
@@ -999,7 +999,7 @@ def test_ssh_connect_leak_fix_percent_decode_timeout_uncompressed_write_int_and_
     client.open_sftp.return_value = sftp
     raw_write = _StrictFTPFileProxy()
     sftp.file.return_value = raw_write
-    with polyopen("sftp://user%40org:p%3As%2Fw@host/my%20dir/out.txt", "w", backup=False, timeout=9.0) as w:
+    with openas("sftp://user%40org:p%3As%2Fw@host/my%20dir/out.txt", "w", backup=False, timeout=9.0) as w:
         written = w.write("café\n")
         assert written == 5
     assert client.connect.call_args.kwargs["username"] == "user@org"
@@ -1014,7 +1014,7 @@ def test_ssh_connect_leak_fix_percent_decode_timeout_uncompressed_write_int_and_
             raise OSError("FSTAT unsupported")
 
     sftp.file.return_value = StatFailSFTPFile(b"ok\n")
-    with PolyReader("sftp://u:p@host/data.txt", show_progress=True) as r:
+    with OpenAsReader("sftp://u:p@host/data.txt", show_progress=True) as r:
         assert r._progress is not None
         assert r._progress.total is None
         assert r.read() == "ok\n"
@@ -1022,7 +1022,7 @@ def test_ssh_connect_leak_fix_percent_decode_timeout_uncompressed_write_int_and_
     # 5. SFTP backup rename collision retries next free slot; missing source is a no-op
     sftp.reset_mock()
     sftp.stat.side_effect = FileNotFoundError("no file")
-    PolyWriter("sftp://u:p@host/missing.txt")._ssh_backup_if(sftp, "/missing.txt")
+    OpenAsWriter("sftp://u:p@host/missing.txt")._ssh_backup_if(sftp, "/missing.txt")
     assert not sftp.rename.called
 
     sftp.reset_mock()
@@ -1044,7 +1044,7 @@ def test_ssh_connect_leak_fix_percent_decode_timeout_uncompressed_write_int_and_
     sftp.stat.side_effect = stat_fn
     sftp.listdir.return_value = ["x.txt", "x.txt.001.bu"]
     sftp.rename.side_effect = rename_fn
-    PolyWriter("sftp://u:p@host/dir/x.txt")._ssh_backup_if(sftp, "/dir/x.txt")
+    OpenAsWriter("sftp://u:p@host/dir/x.txt")._ssh_backup_if(sftp, "/dir/x.txt")
     assert rename_calls == [("/dir/x.txt", "/dir/x.txt.001.bu"), ("/dir/x.txt", "/dir/x.txt.002.bu")]
 
 
@@ -1057,7 +1057,7 @@ def test_http_accept_encoding_content_encoding_timeout_and_raw_fallbacks(mock_ge
     resp_gz.raw = io.BytesIO(gz_bytes)
     mock_get.return_value = resp_gz
 
-    with PolyReader("https://example.com/archive.txt.gz", show_progress=True, timeout=6.0) as r:
+    with OpenAsReader("https://example.com/archive.txt.gz", show_progress=True, timeout=6.0) as r:
         assert r.read() == "http gz café\n"
     assert mock_get.call_args.kwargs["headers"] == {"Accept-Encoding": "identity"}
     assert mock_get.call_args.kwargs["timeout"] == 6.0
@@ -1082,7 +1082,7 @@ def test_http_accept_encoding_content_encoding_timeout_and_raw_fallbacks(mock_ge
     resp_enc.raw = minimal
     mock_get.return_value = resp_enc
 
-    with PolyReader("https://example.com/plain.txt", show_progress=True) as r:
+    with OpenAsReader("https://example.com/plain.txt", show_progress=True) as r:
         assert r._get_file_size() is None
         assert r._progress is not None and r._progress.total is None
         assert r.read() == "plain line\n"
@@ -1113,7 +1113,7 @@ def test_http_real_server_gzip_stream():
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
-        with PolyReader(f"http://127.0.0.1:{port}/data.txt.gz", show_progress=True, timeout=5.0) as r:
+        with OpenAsReader(f"http://127.0.0.1:{port}/data.txt.gz", show_progress=True, timeout=5.0) as r:
             assert r.read() == payload_text
     finally:
         server.shutdown()
@@ -1125,7 +1125,7 @@ def test_http_real_server_gzip_stream():
 @pytest.mark.parametrize("ext", ["", ".gz", ".bz2", ".xz", ".zst"])
 def test_remote_binary_mode_http_ftp_and_sftp(ext):
     """Binary modes (rb/wb/ab) stream exact non-UTF-8 bytes across HTTP, FTP, and SFTP for all codecs."""
-    from polyopen import UnsupportedProtocolError
+    from openas import UnsupportedProtocolError
 
     part1 = [b"\x00\xff\xfeheader\n", b"\x80\x81body1\n"]
     part2 = b"\xde\xad\xbe\xefbody2\n"
@@ -1149,7 +1149,7 @@ def test_remote_binary_mode_http_ftp_and_sftp(ext):
         resp.headers = {"Content-Length": str(len(wire))}
         resp.raw = io.BytesIO(wire)
         mock_get.return_value = resp
-        with polyopen(f"https://example.com/blob{ext or '.bin'}", "rb", show_progress=True) as r:
+        with openas(f"https://example.com/blob{ext or '.bin'}", "rb", show_progress=True) as r:
             assert r.encoding is None
             pbar = r._progress
             assert pbar is not None and pbar.total == len(wire)
@@ -1162,7 +1162,7 @@ def test_remote_binary_mode_http_ftp_and_sftp(ext):
         mock_ftp.return_value = host
         write_proxy = _StrictFTPFileProxy()
         host.open.return_value = write_proxy
-        with polyopen(f"ftp://user:pass@host/dir/blob{ext or '.bin'}", "wb", backup=False) as w:
+        with openas(f"ftp://user:pass@host/dir/blob{ext or '.bin'}", "wb", backup=False) as w:
             assert w.encoding is None
             assert w.write(part1[0]) == len(part1[0])
             w.writelines([part1[1], part2])
@@ -1173,7 +1173,7 @@ def test_remote_binary_mode_http_ftp_and_sftp(ext):
         read_proxy = _StrictFTPFileProxy(write_proxy.saved_bytes)
         host.open.return_value = read_proxy
         host.path.getsize.return_value = len(write_proxy.saved_bytes)
-        with polyopen(f"ftp://user:pass@host/dir/blob{ext or '.bin'}", "rb", show_progress=True) as r:
+        with openas(f"ftp://user:pass@host/dir/blob{ext or '.bin'}", "rb", show_progress=True) as r:
             assert r.encoding is None
             pbar = r._progress
             assert list(r) == part1 + [part2]
@@ -1182,7 +1182,7 @@ def test_remote_binary_mode_http_ftp_and_sftp(ext):
 
         mock_ftp.reset_mock()
         with pytest.raises(UnsupportedProtocolError, match="append"):
-            polyopen(f"ftp://user:pass@host/dir/blob{ext or '.bin'}", "ab")
+            openas(f"ftp://user:pass@host/dir/blob{ext or '.bin'}", "ab")
         assert not mock_ftp.called
 
     # 3. SFTP binary write ('wb'), append ('ab'), and read ('rb') using minimal SFTPFile (no readinto)
@@ -1195,7 +1195,7 @@ def test_remote_binary_mode_http_ftp_and_sftp(ext):
         # Write part1
         w1_proxy = _StrictFTPFileProxy()
         sftp.file.return_value = w1_proxy
-        with polyopen(f"sftp://u:p@host/dir/blob{ext or '.bin'}", "wb", backup=False) as w:
+        with openas(f"sftp://u:p@host/dir/blob{ext or '.bin'}", "wb", backup=False) as w:
             assert w.encoding is None
             w.writelines(part1)
             with pytest.raises(TypeError):
@@ -1204,14 +1204,14 @@ def test_remote_binary_mode_http_ftp_and_sftp(ext):
         # Append part2 (multi-member stream for compressed formats, raw bytes for plain)
         w2_proxy = _StrictFTPFileProxy()
         sftp.file.return_value = w2_proxy
-        with polyopen(f"sftp://u:p@host/dir/blob{ext or '.bin'}", "ab") as w:
+        with openas(f"sftp://u:p@host/dir/blob{ext or '.bin'}", "ab") as w:
             assert w.encoding is None
             assert w.write(part2) == len(part2)
 
         combined_wire = w1_proxy.saved_bytes + w2_proxy.saved_bytes
         r_proxy = _StrictFTPFileProxy(combined_wire)
         sftp.file.return_value = r_proxy
-        with polyopen(f"sftp://u:p@host/dir/blob{ext or '.bin'}", "rb", show_progress=True) as r:
+        with openas(f"sftp://u:p@host/dir/blob{ext or '.bin'}", "rb", show_progress=True) as r:
             assert r.encoding is None
             assert list(r) == part1 + [part2]
         assert r_proxy.closed
@@ -1229,7 +1229,7 @@ def test_percent_encoded_remote_gz_uses_gzip_codec():
 
         write_buf = _InspectableBytesIO()
         sftp.file.return_value = write_buf
-        with polyopen("sftp://u@h/dir/data%2Egz", "w", backup=False) as w:
+        with openas("sftp://u@h/dir/data%2Egz", "w", backup=False) as w:
             w.write(payload)
         sftp.file.assert_called_once_with("/dir/data.gz", "wb")
         assert write_buf.closed
@@ -1238,7 +1238,7 @@ def test_percent_encoded_remote_gz_uses_gzip_codec():
         sftp.reset_mock()
         read_buf = io.BytesIO(write_buf.saved_bytes)
         sftp.file.return_value = read_buf
-        with polyopen("sftp://u@h/dir/data%2Egz", "r") as r:
+        with openas("sftp://u@h/dir/data%2Egz", "r") as r:
             assert r.read() == payload
         sftp.file.assert_called_once_with("/dir/data.gz", "rb")
 
@@ -1248,7 +1248,7 @@ def test_percent_encoded_remote_gz_uses_gzip_codec():
         resp.headers = {"Content-Length": str(len(gz_wire))}
         resp.raw = io.BytesIO(gz_wire)
         mock_get.return_value = resp
-        with polyopen("https://h/dir/data%2Egz", "r") as r:
+        with openas("https://h/dir/data%2Egz", "r") as r:
             assert r.read() == payload
         assert mock_get.call_args.kwargs["headers"] == {"Accept-Encoding": "identity"}
         assert resp.close.called
@@ -1260,8 +1260,8 @@ def test_sftp_backup_rejects_remote_directory_and_closes_handles(mock_ssh):
     import stat
 
     for opener in (
-        lambda url: polyopen(url, "w", backup=True),
-        lambda url: PolyWriter(url).open(backup=True),
+        lambda url: openas(url, "w", backup=True),
+        lambda url: OpenAsWriter(url).open(backup=True),
     ):
         client = MagicMock()
         sftp = MagicMock()
@@ -1285,8 +1285,8 @@ def test_sftp_backup_rejects_remote_directory_and_closes_handles(mock_ssh):
 def test_ftp_backup_rejects_remote_directory_and_closes_handles(mock_host):
     """iev841 E-02: FTP backup=True raises IsADirectoryError on existing remote directories without renaming."""
     for opener in (
-        lambda url: polyopen(url, "w", backup=True),
-        lambda url: PolyWriter(url).open(backup=True),
+        lambda url: openas(url, "w", backup=True),
+        lambda url: OpenAsWriter(url).open(backup=True),
     ):
         host = MagicMock()
         mock_host.return_value = host
@@ -1304,7 +1304,7 @@ def test_ftp_backup_rejects_remote_directory_and_closes_handles(mock_host):
 @patch("paramiko.SSHClient")
 def test_sftp_bounded_readv_multi_window_early_break_truncation_and_compressed_teardown(mock_ssh):
     """a224p3 E-01: Bounded 4 MiB readv windows, sub-chunking, early break, truncation, and compressed close."""
-    from polyopen.polyopen import _BoundedSFTPReadStream
+    from openas.openas import _BoundedSFTPReadStream
 
     window_bytes = 4 * 1024 * 1024
     max_req = 32768
@@ -1360,7 +1360,7 @@ def test_sftp_bounded_readv_multi_window_early_break_truncation_and_compressed_t
 
     f_multi = WindowedSFTPFile(payload)
     sftp.file.return_value = f_multi
-    with PolyReader("sftp://u:p@host/multi.bin", binary=True, show_progress=True) as r:
+    with OpenAsReader("sftp://u:p@host/multi.bin", binary=True, show_progress=True) as r:
         pbar = r._progress
         assert pbar is not None
         assert pbar.total == len(payload)
@@ -1385,7 +1385,7 @@ def test_sftp_bounded_readv_multi_window_early_break_truncation_and_compressed_t
     f_early = WindowedSFTPFile(payload)
     sftp.file.return_value = f_early
     seen = []
-    with PolyReader("sftp://u:p@host/multi.txt") as r:
+    with OpenAsReader("sftp://u:p@host/multi.txt") as r:
         for row in r:
             seen.append(row)
             break
@@ -1402,7 +1402,7 @@ def test_sftp_bounded_readv_multi_window_early_break_truncation_and_compressed_t
     truncated_payload = b"short-line-1\nshort-line-2\n"
     f_trunc = WindowedSFTPFile(truncated_payload, reported_size=window_bytes * 2)
     sftp.file.return_value = f_trunc
-    with PolyReader("sftp://u:p@host/trunc.txt") as r:
+    with OpenAsReader("sftp://u:p@host/trunc.txt") as r:
         assert list(r) == ["short-line-1\n", "short-line-2\n"]
     assert len(f_trunc.readv_windows) == 1
     assert f_trunc.closed and f_trunc.close_count == 1
@@ -1422,7 +1422,7 @@ def test_sftp_bounded_readv_multi_window_early_break_truncation_and_compressed_t
             sftp.reset_mock()
             f_comp = WindowedSFTPFile(wire)
             sftp.file.return_value = f_comp
-            with PolyReader(f"sftp://u:p@host/data{ext}", binary=binary, show_progress=True) as r:
+            with OpenAsReader(f"sftp://u:p@host/data{ext}", binary=binary, show_progress=True) as r:
                 raw_stream = r._raw_fh
                 assert isinstance(raw_stream, _BoundedSFTPReadStream)
                 pbar = r._progress
@@ -1499,7 +1499,7 @@ def test_http_real_server_all_formats_text_and_binary():
     try:
         for ext in (".txt", ".gz", ".bz2", ".xz", ".zst"):
             text_url = f"http://127.0.0.1:{port}/text{ext}"
-            with polyopen(text_url, "r", show_progress=True, timeout=5.0) as r:
+            with openas(text_url, "r", show_progress=True, timeout=5.0) as r:
                 pbar = r._progress
                 assert pbar is not None
                 assert pbar.total == len(routes[f"/text{ext}"])
@@ -1509,7 +1509,7 @@ def test_http_real_server_all_formats_text_and_binary():
             assert pbar.n == len(routes[f"/text{ext}"])
 
             bin_url = f"http://127.0.0.1:{port}/bin{ext}"
-            with polyopen(bin_url, "rb", show_progress=True, timeout=5.0) as r:
+            with openas(bin_url, "rb", show_progress=True, timeout=5.0) as r:
                 pbar = r._progress
                 assert pbar is not None
                 assert pbar.total == len(routes[f"/bin{ext}"])
@@ -1579,7 +1579,7 @@ def test_http_real_server_http11_chunked_gzip_encoding_and_404():
     try:
         # 1. Transfer-Encoding: chunked (total=None) in both 'r' and 'rb'
         for mode, expected in (("r", chunked_full.decode("utf-8")), ("rb", chunked_full)):
-            with polyopen(f"http://127.0.0.1:{port}/chunked.txt", mode, show_progress=True, timeout=5.0) as r:
+            with openas(f"http://127.0.0.1:{port}/chunked.txt", mode, show_progress=True, timeout=5.0) as r:
                 pbar = r._progress
                 assert pbar is not None
                 assert pbar.total is None
@@ -1590,7 +1590,7 @@ def test_http_real_server_http11_chunked_gzip_encoding_and_404():
 
         # 2. Content-Encoding: gzip on plain .txt (decode_content=True, total=None) in 'r' and 'rb'
         for mode, expected in (("r", encoded_plain), ("rb", encoded_plain.encode("utf-8"))):
-            with polyopen(f"http://127.0.0.1:{port}/encoded.txt", mode, show_progress=True, timeout=5.0) as r:
+            with openas(f"http://127.0.0.1:{port}/encoded.txt", mode, show_progress=True, timeout=5.0) as r:
                 pbar = r._progress
                 assert r._response is not None
                 assert r._response.raw.decode_content is True
@@ -1609,7 +1609,7 @@ def test_http_real_server_http11_chunked_gzip_encoding_and_404():
             return orig_resp_close(self)
 
         with patch.object(requests.Response, "close", spy_resp_close):
-            reader_404 = PolyReader(f"http://127.0.0.1:{port}/missing.txt", timeout=5.0)
+            reader_404 = OpenAsReader(f"http://127.0.0.1:{port}/missing.txt", timeout=5.0)
             with pytest.raises(requests.HTTPError):
                 reader_404.open()
             assert reader_404.closed is True
@@ -1625,9 +1625,9 @@ def test_close_registered_http_sessions_isolated_and_exception_safe(monkeypatch)
     """was3ig E-01: _close_registered_http_sessions closes all registered sessions despite close() errors without touching live session."""
     import sys
 
-    poly_mod = sys.modules["polyopen.polyopen"]
+    openas_mod = sys.modules["openas.openas"]
 
-    live_session = poly_mod._get_http_session()
+    live_session = openas_mod._get_http_session()
 
     class FakeSession:
         def __init__(self, *, should_raise: bool = False):
@@ -1645,24 +1645,24 @@ def test_close_registered_http_sessions_isolated_and_exception_safe(monkeypatch)
     s2 = FakeSession(should_raise=True)
     s3 = FakeSession()
 
-    monkeypatch.setattr(poly_mod, "_http_sessions_registry", [s1, s2, s3])
-    poly_mod._close_registered_http_sessions()
+    monkeypatch.setattr(openas_mod, "_http_sessions_registry", [s1, s2, s3])
+    openas_mod._close_registered_http_sessions()
 
     assert s1.closed is True and s1.close_calls == 1
     assert s2.close_calls == 1 and s2.closed is False
     assert s3.closed is True and s3.close_calls == 1
-    assert poly_mod._http_sessions_registry == []
-    assert poly_mod._get_http_session() is live_session
+    assert openas_mod._http_sessions_registry == []
+    assert openas_mod._get_http_session() is live_session
 
 
 def test_keyboard_interrupt_mid_open_cleans_up_remote_handles():
     """was3ig E-03: KeyboardInterrupt (BaseException) mid-open closes acquired HTTP, FTP, and SFTP handles."""
-    # 1. PolyReader HTTP: KeyboardInterrupt in raise_for_status() and in post-wrap _get_file_size()
+    # 1. OpenAsReader HTTP: KeyboardInterrupt in raise_for_status() and in post-wrap _get_file_size()
     with patch("requests.Session.get") as mock_get:
         resp1 = MagicMock()
         resp1.raise_for_status.side_effect = KeyboardInterrupt("ctrl-c status")
         mock_get.return_value = resp1
-        r_http1 = PolyReader("https://example.com/a.txt")
+        r_http1 = OpenAsReader("https://example.com/a.txt")
         with pytest.raises(KeyboardInterrupt, match="ctrl-c status"):
             r_http1.open()
         assert resp1.close.call_count == 1
@@ -1673,7 +1673,7 @@ def test_keyboard_interrupt_mid_open_cleans_up_remote_handles():
         resp2.headers = {"Content-Length": "5"}
         resp2.raw = io.BytesIO(b"data\n")
         mock_get.return_value = resp2
-        r_http2 = PolyReader("https://example.com/b.txt", show_progress=True)
+        r_http2 = OpenAsReader("https://example.com/b.txt", show_progress=True)
         with patch.object(r_http2, "_get_file_size", side_effect=KeyboardInterrupt("ctrl-c progress")):
             with pytest.raises(KeyboardInterrupt, match="ctrl-c progress"):
                 r_http2.open()
@@ -1682,13 +1682,13 @@ def test_keyboard_interrupt_mid_open_cleans_up_remote_handles():
         assert r_http2.closed is True
         assert r_http2._response is None
 
-    # 2. PolyReader FTP: KeyboardInterrupt after FTPHost and FTPFile are acquired
+    # 2. OpenAsReader FTP: KeyboardInterrupt after FTPHost and FTPFile are acquired
     with patch("ftputil.FTPHost") as mock_ftp:
         host = MagicMock()
         raw_ftp = _StrictFTPFileProxy(b"ftp-data\n")
         host.open.return_value = raw_ftp
         mock_ftp.return_value = host
-        r_ftp = PolyReader("ftp://u:p@host/dir/file.txt", show_progress=True)
+        r_ftp = OpenAsReader("ftp://u:p@host/dir/file.txt", show_progress=True)
         with patch.object(r_ftp, "_get_file_size", side_effect=KeyboardInterrupt("ctrl-c ftp reader")):
             with pytest.raises(KeyboardInterrupt, match="ctrl-c ftp reader"):
                 r_ftp.open()
@@ -1698,7 +1698,7 @@ def test_keyboard_interrupt_mid_open_cleans_up_remote_handles():
         assert r_ftp._ftp is None
         assert r_ftp._raw_fh is None
 
-    # 3. PolyReader SFTP: KeyboardInterrupt after client, sftp, and sftp_file are acquired
+    # 3. OpenAsReader SFTP: KeyboardInterrupt after client, sftp, and sftp_file are acquired
     with patch("paramiko.SSHClient") as mock_ssh:
         client = MagicMock()
         sftp = MagicMock()
@@ -1707,7 +1707,7 @@ def test_keyboard_interrupt_mid_open_cleans_up_remote_handles():
         mock_ssh.return_value = client
         client.open_sftp.return_value = sftp
         sftp.file.return_value = sftp_file
-        r_sftp = PolyReader("sftp://u:p@host/dir/file.txt")
+        r_sftp = OpenAsReader("sftp://u:p@host/dir/file.txt")
         with pytest.raises(KeyboardInterrupt, match="ctrl-c sftp reader"):
             r_sftp.open()
         assert sftp_file.close.call_count == 1
@@ -1718,13 +1718,13 @@ def test_keyboard_interrupt_mid_open_cleans_up_remote_handles():
         assert r_sftp._sftp_client is None
         assert r_sftp._ssh_client is None
 
-    # 4. PolyWriter FTP: KeyboardInterrupt after FTPHost and FTPFile are acquired
+    # 4. OpenAsWriter FTP: KeyboardInterrupt after FTPHost and FTPFile are acquired
     with patch("ftputil.FTPHost") as mock_ftp:
         host = MagicMock()
         raw_ftp = _StrictFTPFileProxy()
         host.open.return_value = raw_ftp
         mock_ftp.return_value = host
-        w_ftp = PolyWriter("ftp://u:p@host/dir/out.gz")
+        w_ftp = OpenAsWriter("ftp://u:p@host/dir/out.gz")
         with patch("gzip.open", side_effect=KeyboardInterrupt("ctrl-c ftp writer")):
             with pytest.raises(KeyboardInterrupt, match="ctrl-c ftp writer"):
                 w_ftp.open(backup=False)
@@ -1734,7 +1734,7 @@ def test_keyboard_interrupt_mid_open_cleans_up_remote_handles():
         assert w_ftp._ftp is None
         assert w_ftp._raw_fh is None
 
-    # 5. PolyWriter SFTP: KeyboardInterrupt after client, sftp, and sftp_file are acquired
+    # 5. OpenAsWriter SFTP: KeyboardInterrupt after client, sftp, and sftp_file are acquired
     with patch("paramiko.SSHClient") as mock_ssh:
         client = MagicMock()
         sftp = MagicMock()
@@ -1743,7 +1743,7 @@ def test_keyboard_interrupt_mid_open_cleans_up_remote_handles():
         mock_ssh.return_value = client
         client.open_sftp.return_value = sftp
         sftp.file.return_value = sftp_file
-        w_sftp = PolyWriter("sftp://u:p@host/dir/out.txt")
+        w_sftp = OpenAsWriter("sftp://u:p@host/dir/out.txt")
         with pytest.raises(KeyboardInterrupt, match="ctrl-c sftp writer"):
             w_sftp.open(backup=False)
         assert sftp_file.close.call_count == 1
@@ -1779,7 +1779,7 @@ def test_remote_truncated_zst_raises_and_closes_handles_across_http_ftp_and_sftp
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
-        reader = PolyReader(f"http://127.0.0.1:{port}/trunc.zst", show_progress=True, binary=(mode == "rb"))
+        reader = OpenAsReader(f"http://127.0.0.1:{port}/trunc.zst", show_progress=True, binary=(mode == "rb"))
         with pytest.raises((EOFError, zstd.ZstdError)):
             with reader:
                 reader.read()
@@ -1797,7 +1797,7 @@ def test_remote_truncated_zst_raises_and_closes_handles_across_http_ftp_and_sftp
         host.open.return_value = read_proxy
         host.path.getsize.return_value = len(trunc_wire)
         mock_ftp.return_value = host
-        reader_ftp = PolyReader("ftp://u:p@host/dir/trunc.zst", show_progress=True, binary=(mode == "rb"))
+        reader_ftp = OpenAsReader("ftp://u:p@host/dir/trunc.zst", show_progress=True, binary=(mode == "rb"))
         with pytest.raises((EOFError, zstd.ZstdError)):
             with reader_ftp:
                 reader_ftp.read()
@@ -1829,7 +1829,7 @@ def test_remote_truncated_zst_raises_and_closes_handles_across_http_ftp_and_sftp
             client.open_sftp.return_value = sftp
             sftp.file.return_value = sftp_file
 
-            reader_sftp = PolyReader("sftp://u:p@host/dir/trunc.zst", show_progress=True, binary=(mode == "rb"))
+            reader_sftp = OpenAsReader("sftp://u:p@host/dir/trunc.zst", show_progress=True, binary=(mode == "rb"))
             with pytest.raises((EOFError, zstd.ZstdError)):
                 with reader_sftp:
                     reader_sftp.read()

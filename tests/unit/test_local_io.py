@@ -9,14 +9,14 @@ import types
 from unittest.mock import MagicMock, patch
 import pytest
 import zstandard as zstd
-from polyopen import PolyReader, PolyWriter, polyopen
+from openas import OpenAsReader, OpenAsWriter, openas
 
 def test_plain_text(tmp_path):
     data = ["hello", "world", "this", "is", "a", "test"]
     filepath = str(tmp_path / "test.txt")
 
     # Test writing
-    with PolyWriter(filepath) as writer:
+    with OpenAsWriter(filepath) as writer:
         for line in data:
             writer.write(line + '\n')
     
@@ -26,7 +26,7 @@ def test_plain_text(tmp_path):
 
     # Test reading
     read_data = []
-    with PolyReader(filepath) as reader:
+    with OpenAsReader(filepath) as reader:
         for line in reader:
             read_data.append(line.rstrip('\n'))
             
@@ -38,7 +38,7 @@ def test_compressed_files(tmp_path, ext):
     filepath = str(tmp_path / f"test_data{ext}")
 
     # Write compressed
-    with PolyWriter(filepath) as writer:
+    with OpenAsWriter(filepath) as writer:
         for line in data:
             writer.write(line + '\n')
 
@@ -46,18 +46,18 @@ def test_compressed_files(tmp_path, ext):
     
     # Read compressed
     read_data = []
-    with PolyReader(filepath) as reader:
+    with OpenAsReader(filepath) as reader:
         for line in reader:
             read_data.append(line.rstrip('\n'))
             
     assert read_data == data
 
-def test_polyopen_shorthand(tmp_path):
+def test_openas_shorthand(tmp_path):
     filepath = str(tmp_path / "shorthand_test.zst")
-    data = ["polyopen", "shorthand", "rocks"]
+    data = ["openas", "shorthand", "rocks"]
     
     # Test writing
-    with polyopen(filepath, 'w') as writer:
+    with openas(filepath, 'w') as writer:
         for line in data:
             writer.write(line + '\n')
             
@@ -65,12 +65,12 @@ def test_polyopen_shorthand(tmp_path):
     
     # Test appending
     append_data = ["another", "line"]
-    with polyopen(filepath, 'a') as writer:
+    with openas(filepath, 'a') as writer:
         for line in append_data:
             writer.write(line + '\n')
             
     read_appended = []
-    with polyopen(filepath, 'r') as reader:
+    with openas(filepath, 'r') as reader:
         for line in reader:
             read_appended.append(line.rstrip('\n'))
             
@@ -79,10 +79,10 @@ def test_polyopen_shorthand(tmp_path):
 def test_backup_rotation(tmp_path):
     filepath = str(tmp_path / "backup.txt")
     
-    with polyopen(filepath, 'w', backup=True) as w:
+    with openas(filepath, 'w', backup=True) as w:
         w.write("First.\n")
         
-    with polyopen(filepath, 'w', backup=True) as w:
+    with openas(filepath, 'w', backup=True) as w:
         w.write("Second.\n")
         
     backup_path = f"{filepath}.001.bu"
@@ -119,12 +119,12 @@ def test_rigorous_line_chunking(tmp_path, ext, binary):
     ]
     lines_to_write = [line.encode("utf-8") for line in text_lines] if binary else text_lines
     
-    with PolyWriter(filepath, binary=binary) as writer:
+    with OpenAsWriter(filepath, binary=binary) as writer:
         for line in lines_to_write:
             writer.write(line)
             
     read_data = []
-    with PolyReader(filepath, binary=binary) as reader:
+    with OpenAsReader(filepath, binary=binary) as reader:
         for line in reader:
              read_data.append(line)
              
@@ -138,19 +138,19 @@ def test_rigorous_line_chunking(tmp_path, ext, binary):
 def test_uppercase_extension_local(tmp_path):
     """BUG-03: Uppercase local extensions decompress and compress cleanly."""
     fp = tmp_path / "DATA.GZ"
-    with polyopen(fp, "w") as w:
+    with openas(fp, "w") as w:
         w.write("upper gz\n")
-    with polyopen(fp, "r") as r:
+    with openas(fp, "r") as r:
         assert r.read() == "upper gz\n"
 
 
 def test_close_reopen_idempotency_and_sibling_cleanup(tmp_path):
     """BUG-04: Reopen after close, idempotent close, and cleanup on failing close or partial open."""
     fp = tmp_path / "lifecycle.txt"
-    with polyopen(fp, "w") as w:
+    with openas(fp, "w") as w:
         w.write("line1\nline2\n")
 
-    reader = PolyReader(fp).open()
+    reader = OpenAsReader(fp).open()
     assert next(reader) == "line1\n"
     reader.close()
     reader.close()  # idempotent
@@ -174,7 +174,7 @@ def test_close_reopen_idempotency_and_sibling_cleanup(tmp_path):
     assert reader._ftp is None
 
     # Partial open failure cleans up acquired handles
-    partial_reader = PolyReader(fp, show_progress=True)
+    partial_reader = OpenAsReader(fp, show_progress=True)
     with patch.object(partial_reader, "_get_file_size", side_effect=RuntimeError("stat boom")):
         with pytest.raises(RuntimeError):
             partial_reader.open()
@@ -199,7 +199,7 @@ def test_atomic_backup_race_fallback_post999_and_multiframe_zst(tmp_path):
         return real_link(src, dst)
 
     with patch("os.link", side_effect=racing_link):
-        with polyopen(target, "w", backup=True) as w:
+        with openas(target, "w", backup=True) as w:
             w.write("v2\n")
     assert (tmp_path / "race.txt.001.bu").read_text(encoding="utf-8") == "racer\n"
     assert (tmp_path / "race.txt.002.bu").read_text(encoding="utf-8") == "v1\n"
@@ -209,7 +209,7 @@ def test_atomic_backup_race_fallback_post999_and_multiframe_zst(tmp_path):
         fb = tmp_path / f"fb_{err_code}.txt"
         fb.write_text("old\n", encoding="utf-8")
         with patch("os.link", side_effect=OSError(err_code, "unsupported")):
-            with polyopen(fb, "w", backup=True) as w:
+            with openas(fb, "w", backup=True) as w:
                 w.write("new\n")
         assert (tmp_path / f"fb_{err_code}.txt.001.bu").read_text(encoding="utf-8") == "old\n"
         assert fb.read_text(encoding="utf-8") == "new\n"
@@ -220,9 +220,9 @@ def test_atomic_backup_race_fallback_post999_and_multiframe_zst(tmp_path):
         (tmp_path / f"full.txt.{i:03d}.bu").touch()
     p999.write_text("first\n", encoding="utf-8")
     with patch("time.time_ns", return_value=1700000000000000000):
-        with polyopen(p999, "w", backup=True) as w:
+        with openas(p999, "w", backup=True) as w:
             w.write("second\n")
-        with polyopen(p999, "w", backup=True) as w:
+        with openas(p999, "w", backup=True) as w:
             w.write("third\n")
     assert (tmp_path / "full.txt.1700000000000000000.bu").read_text(encoding="utf-8") == "first\n"
     assert (tmp_path / "full.txt.1700000000000000001.bu").read_text(encoding="utf-8") == "second\n"
@@ -231,7 +231,7 @@ def test_atomic_backup_race_fallback_post999_and_multiframe_zst(tmp_path):
     zpath = tmp_path / "multi.zst"
     cctx = zstd.ZstdCompressor()
     zpath.write_bytes(cctx.compress(b"frame1\n") + cctx.compress(b"frame2\n"))
-    with PolyReader(zpath) as r:
+    with OpenAsReader(zpath) as r:
         assert list(r) == ["frame1\n", "frame2\n"]
 
 
@@ -239,16 +239,16 @@ def test_atomic_backup_race_fallback_post999_and_multiframe_zst(tmp_path):
 def test_pathlike_utf8_and_file_object_methods(tmp_path, ext):
     """BUG-06: PathLike[str]/PathLike[bytes], UTF-8 round-trip, read/readline/readlines/flush, and closed ValueError."""
     fp = tmp_path / f"utf8{ext}"
-    with polyopen(fp, "w") as w:
+    with openas(fp, "w") as w:
         w.write("café 日本語\nsecond line\n")
         w.flush()
     with pytest.raises(ValueError):
         w.flush()
 
-    with polyopen(fp, "r") as r:
+    with openas(fp, "r") as r:
         assert r.readline() == "café 日本語\n"
         assert r.readlines() == ["second line\n"]
-    with polyopen(fp, "r") as r:
+    with openas(fp, "r") as r:
         assert r.read(4) == "café"
         assert r.read() == " 日本語\nsecond line\n"
     for method in ("read", "readline", "readlines"):
@@ -263,9 +263,9 @@ def test_pathlike_utf8_and_file_object_methods(tmp_path, ext):
             return self._raw
 
     bp = BytesPathLike(os.fsencode(str(tmp_path / f"bytes_path{ext}")))
-    with polyopen(bp, "w") as w:
+    with openas(bp, "w") as w:
         w.write("bytes path ok\n")
-    with polyopen(bp, "r") as r:
+    with openas(bp, "r") as r:
         assert r.read() == "bytes path ok\n"
 
 
@@ -274,11 +274,11 @@ def test_compressed_progress_tracks_raw_bytes(tmp_path, ext):
     """BUG-07: show_progress=True tracks exact raw compressed bytes so progress.n == progress.total."""
     payload = ("0123456789abcdef" * 6 + "\n") * 520
     fp = tmp_path / f"progress{ext}"
-    with polyopen(fp, "w") as w:
+    with openas(fp, "w") as w:
         w.write(payload)
 
     raw_size = os.path.getsize(fp)
-    reader = PolyReader(fp, show_progress=True).open()
+    reader = OpenAsReader(fp, show_progress=True).open()
     try:
         content = reader.read()
         assert content == payload
@@ -290,17 +290,17 @@ def test_compressed_progress_tracks_raw_bytes(tmp_path, ext):
 
 
 def test_lazy_imports_and_ftp_session_wrapper_factory():
-    """PERF-06: import polyopen loads no optional stdlib/FTP modules; FTPSessionWrapper is cached."""
+    """PERF-06: import openas loads no optional stdlib/FTP modules; FTPSessionWrapper is cached."""
     script = (
         "import sys; "
         "before = set(sys.modules); "
-        "import polyopen; "
+        "import openas; "
         "added = set(sys.modules) - before; "
         "forbidden = ('argparse', 'ftplib', 'ssl', 'bz2', 'gzip', 'lzma', 'urllib.parse'); "
         "loaded = [m for m in forbidden if m in added]; "
         "assert loaded == [], f'unexpected eager imports: {loaded}'; "
-        "from polyopen import FTPSessionWrapper as A; "
-        "from polyopen import FTPSessionWrapper as B; "
+        "from openas import FTPSessionWrapper as A; "
+        "from openas import FTPSessionWrapper as B; "
         "import ftplib; "
         "assert issubclass(A, ftplib.FTP); "
         "assert A is B; "
@@ -321,18 +321,18 @@ def test_lazy_imports_and_ftp_session_wrapper_factory():
 
 
 @pytest.mark.parametrize("ext", [".txt", ".gz", ".bz2", ".xz", ".zst"])
-def test_polyreader_for_loop_direct_next_and_file_uri(tmp_path, ext):
-    """PERF-02: PolyReader supports for-iteration, direct next(), and file: URLs."""
+def test_openas_reader_for_loop_direct_next_and_file_uri(tmp_path, ext):
+    """PERF-02: OpenAsReader supports for-iteration, direct next(), and file: URLs."""
     expected = [f"row-{i}\n" for i in range(10)]
     fp = tmp_path / f"iter_check{ext}"
-    with PolyWriter(fp) as w:
+    with OpenAsWriter(fp) as w:
         for line in expected:
             w.write(line)
 
-    with PolyReader(fp) as r:
+    with OpenAsReader(fp) as r:
         assert list(r) == expected
 
-    with PolyReader(fp) as r:
+    with OpenAsReader(fp) as r:
         got = []
         while True:
             try:
@@ -342,11 +342,11 @@ def test_polyreader_for_loop_direct_next_and_file_uri(tmp_path, ext):
         assert got == expected
 
     if ext == ".txt":
-        with PolyReader(fp.as_uri()) as r:
+        with OpenAsReader(fp.as_uri()) as r:
             assert list(r) == expected
 
 
-def test_polyreader_progress_batched_full_and_early_break_flush(tmp_path):
+def test_openas_reader_progress_batched_full_and_early_break_flush(tmp_path):
     """PERF-02: show_progress=True flushes exact remainder on EOF and early break + close."""
     # Size: 7,500 * 10 = 75,000 bytes (not a multiple of 65,536).
     lines = [f"{i:09d}\n" for i in range(7500)]
@@ -355,7 +355,7 @@ def test_polyreader_progress_batched_full_and_early_break_flush(tmp_path):
     expected_size = os.path.getsize(fp)
     assert expected_size % 65536 != 0
 
-    reader = PolyReader(fp, show_progress=True).open()
+    reader = OpenAsReader(fp, show_progress=True).open()
     try:
         pbar = reader._progress
         assert pbar is not None
@@ -367,7 +367,7 @@ def test_polyreader_progress_batched_full_and_early_break_flush(tmp_path):
     assert pbar.n == expected_size
 
     # Early break followed by close() flushes exact summed length of yielded lines.
-    reader2 = PolyReader(fp, show_progress=True).open()
+    reader2 = OpenAsReader(fp, show_progress=True).open()
     pbar2 = reader2._progress
     assert pbar2 is not None
     yielded = []
@@ -379,7 +379,7 @@ def test_polyreader_progress_batched_full_and_early_break_flush(tmp_path):
     assert pbar2.n == sum(len(line) for line in yielded)
 
     # Paused iterator still alive when close() runs flushes pending progress before close.
-    reader3 = PolyReader(fp, show_progress=True).open()
+    reader3 = OpenAsReader(fp, show_progress=True).open()
     pbar3 = reader3._progress
     assert pbar3 is not None
     it = iter(reader3)
@@ -388,11 +388,11 @@ def test_polyreader_progress_batched_full_and_early_break_flush(tmp_path):
     assert pbar3.n == sum(len(line) for line in yielded3)
 
 
-def test_polywriter_writelines_subclass_override_and_closed_error(tmp_path):
-    """PERF-08: PolyWriter.writelines(), subclass write() override preservation, and closed ValueError."""
+def test_openas_writer_writelines_subclass_override_and_closed_error(tmp_path):
+    """PERF-08: OpenAsWriter.writelines(), subclass write() override preservation, and closed ValueError."""
     fp = tmp_path / "writelines.txt"
     payload = ["alpha\n", "beta\n", "gamma\n"]
-    writer = PolyWriter(fp).open(append=False, backup=False)
+    writer = OpenAsWriter(fp).open(append=False, backup=False)
     writer.writelines(payload)
     writer.close()
     assert fp.read_text(encoding="utf-8") == "".join(payload)
@@ -402,7 +402,7 @@ def test_polywriter_writelines_subclass_override_and_closed_error(tmp_path):
     with pytest.raises(ValueError):
         writer.writelines(["after close\n"])
 
-    class CountingWriter(PolyWriter):
+    class CountingWriter(OpenAsWriter):
         def __init__(self, filename):
             super().__init__(filename)
             self.calls = []
@@ -457,7 +457,7 @@ def test_ssh_reads_via_fake_paramiko(tmp_path, monkeypatch, ext):
     monkeypatch.setitem(sys.modules, "paramiko", fake_paramiko)
 
     url = f"ssh://user:pass@host/dir/remote_sample{ext}"
-    with PolyReader(url) as r:
+    with OpenAsReader(url) as r:
         got = list(r)
     assert got == expected
     assert all(isinstance(line, str) for line in got)
@@ -483,12 +483,12 @@ def test_http_uncompressed_blank_line_not_truncated(monkeypatch):
         def get(self, url, stream=True):
             return FakeResponse()
 
-    monkeypatch.setattr(sys.modules["polyopen.polyopen"], "_get_http_session", lambda: FakeSession())
+    monkeypatch.setattr(sys.modules["openas.openas"], "_get_http_session", lambda: FakeSession())
 
-    with PolyReader("http://example.invalid/plain.txt") as r:
+    with OpenAsReader("http://example.invalid/plain.txt") as r:
         assert list(r) == ["a\n", "\n", "b\n"]
 
-    with PolyReader("http://example.invalid/plain.txt") as r:
+    with OpenAsReader("http://example.invalid/plain.txt") as r:
         got = []
         while True:
             try:
@@ -516,7 +516,7 @@ def test_local_compresslevel_default_and_explicit_roundtrip(tmp_path, ext):
         comp_patch = patch("lzma.open", wraps=lzma.open)
 
     with comp_patch as mock_comp:
-        with PolyWriter(fp_default).open(backup=False) as w:
+        with OpenAsWriter(fp_default).open(backup=False) as w:
             w.write(payload)
         call_args, call_kwargs = mock_comp.call_args
         if ext == ".zst":
@@ -528,7 +528,7 @@ def test_local_compresslevel_default_and_explicit_roundtrip(tmp_path, ext):
             assert "preset" not in call_kwargs
 
         mock_comp.reset_mock()
-        with PolyWriter(fp_explicit).open(backup=False, compresslevel=2) as w:
+        with OpenAsWriter(fp_explicit).open(backup=False, compresslevel=2) as w:
             w.write(payload)
         _, call_kwargs = mock_comp.call_args
         if ext == ".zst":
@@ -539,7 +539,7 @@ def test_local_compresslevel_default_and_explicit_roundtrip(tmp_path, ext):
             assert call_kwargs["preset"] == 2
 
         mock_comp.reset_mock()
-        with polyopen(fp_shorthand, "w", backup=False, compresslevel=1) as w:
+        with openas(fp_shorthand, "w", backup=False, compresslevel=1) as w:
             w.write(payload)
         _, call_kwargs = mock_comp.call_args
         if ext == ".zst":
@@ -550,7 +550,7 @@ def test_local_compresslevel_default_and_explicit_roundtrip(tmp_path, ext):
             assert call_kwargs["preset"] == 1
 
     for path in (fp_default, fp_explicit, fp_shorthand):
-        with PolyReader(path) as r:
+        with OpenAsReader(path) as r:
             assert r.read() == payload
 
 
@@ -558,11 +558,11 @@ def test_local_backup_fast_path_including_bare_relative_filename(tmp_path, monke
     """p1f3dc E-01: Local .001.bu fast-path avoids os.scandir, including for bare relative filenames."""
     monkeypatch.chdir(tmp_path)
     bare = "bare_relative.txt"
-    with PolyWriter(bare).open(backup=True) as w:
+    with OpenAsWriter(bare).open(backup=True) as w:
         w.write("v1\n")
 
     with patch("os.scandir", wraps=os.scandir) as mock_scandir:
-        with PolyWriter(bare).open(backup=True) as w:
+        with OpenAsWriter(bare).open(backup=True) as w:
             w.write("v2\n")
         mock_scandir.assert_not_called()
 
@@ -571,7 +571,7 @@ def test_local_backup_fast_path_including_bare_relative_filename(tmp_path, monke
 
     # Second overwrite scans "." once and selects .002.bu
     with patch("os.scandir", wraps=os.scandir) as mock_scandir:
-        with PolyWriter(bare).open(backup=True) as w:
+        with OpenAsWriter(bare).open(backup=True) as w:
             w.write("v3\n")
         mock_scandir.assert_called_once_with(".")
 
@@ -587,7 +587,7 @@ def test_local_backup_500_single_scandir_and_exact_slot_matching(tmp_path):
         (tmp_path / f"many.txt.{idx:03d}.bu").touch()
 
     with patch("os.scandir", wraps=os.scandir) as mock_scandir:
-        with PolyWriter(target).open(backup=True) as w:
+        with OpenAsWriter(target).open(backup=True) as w:
             w.write("updated\n")
         mock_scandir.assert_called_once_with(str(tmp_path))
 
@@ -611,7 +611,7 @@ def test_local_backup_500_single_scandir_and_exact_slot_matching(tmp_path):
     (meta_dir / "other.txt.002.bu").touch()
 
     with patch("os.scandir", wraps=os.scandir) as mock_scandir:
-        with PolyWriter(meta_target).open(backup=True) as w:
+        with OpenAsWriter(meta_target).open(backup=True) as w:
             w.write("meta-v3\n")
         mock_scandir.assert_called_once_with(str(meta_dir))
 
@@ -632,7 +632,7 @@ def test_local_backup_999_cap_single_scandir_and_collision_safe_timestamp(tmp_pa
 
     with patch("os.scandir", wraps=os.scandir) as mock_scandir:
         with patch("time.time_ns", return_value=1700000000000000999):
-            with PolyWriter(target).open(backup=True) as w:
+            with OpenAsWriter(target).open(backup=True) as w:
                 w.write("after-cap\n")
         mock_scandir.assert_called_once_with(str(cap_dir))
 
@@ -648,7 +648,7 @@ def test_local_backup_rejects_directory_and_preserves_broken_symlink(tmp_path):
     (existing_dir / "keep.txt").write_text("precious\n", encoding="utf-8")
 
     with pytest.raises(IsADirectoryError):
-        polyopen(existing_dir, "w", backup=True)
+        openas(existing_dir, "w", backup=True)
 
     assert existing_dir.is_dir()
     assert (existing_dir / "keep.txt").read_text(encoding="utf-8") == "precious\n"
@@ -665,7 +665,7 @@ def test_local_backup_rejects_directory_and_preserves_broken_symlink(tmp_path):
             pytest.skip("Windows symlink creation requires Developer Mode or elevated privileges")
         raise
     with patch("os.link", side_effect=OSError(errno.EOPNOTSUPP, "no hard links")):
-        with polyopen(src, "w", backup=True) as w:
+        with openas(src, "w", backup=True) as w:
             w.write("v2\n")
     assert os.path.islink(broken_bu)
     assert (tmp_path / "target.txt.002.bu").read_text(encoding="utf-8") == "v1\n"
@@ -686,14 +686,14 @@ def test_local_backup_rejects_directory_and_preserves_broken_symlink(tmp_path):
 def test_invalid_compresslevel_fails_before_rotating_backup(tmp_path, ext, bad_level, exc_type):
     """S2-LIVE2: Invalid or bool compresslevel fails before rotating the existing file."""
     target = tmp_path / f"keep{ext}"
-    with polyopen(target, "w", backup=False) as w:
+    with openas(target, "w", backup=False) as w:
         w.write("original\n")
 
     with pytest.raises(exc_type):
-        polyopen(target, "w", backup=True, compresslevel=bad_level)
+        openas(target, "w", backup=True, compresslevel=bad_level)
 
     assert not os.path.exists(f"{target}.001.bu")
-    with polyopen(target, "r") as r:
+    with openas(target, "r") as r:
         assert r.read() == "original\n"
 
 
@@ -706,7 +706,7 @@ def test_local_non_ascii_progress_and_mixed_readline_iter_no_double_count(tmp_pa
     expected_bytes = len(payload.encode("utf-8"))
     assert expected_bytes > len(payload)
 
-    with PolyReader(fp, show_progress=True) as r:
+    with OpenAsReader(fp, show_progress=True) as r:
         pbar = r._progress
         assert pbar is not None
         assert pbar.total == expected_bytes
@@ -717,11 +717,11 @@ def test_local_non_ascii_progress_and_mixed_readline_iter_no_double_count(tmp_pa
 
 
 def test_file_like_attributes_repr_redaction_and_unknown_pkg_attr(tmp_path):
-    """S5-F1 & S3-T1: PolyReader/PolyWriter expose closed/readable/writable/seekable/encoding/redacted __repr__."""
-    import polyopen as pkg
+    """S5-F1 & S3-T1: OpenAsReader/OpenAsWriter expose closed/readable/writable/seekable/encoding/redacted __repr__."""
+    import openas as pkg
 
     fp = tmp_path / "attrs.txt"
-    w = PolyWriter(fp)
+    w = OpenAsWriter(fp)
     assert w.closed is True
     assert w.writable() is True and w.readable() is False and w.seekable() is False
     assert w.encoding == "utf-8"
@@ -736,7 +736,7 @@ def test_file_like_attributes_repr_redaction_and_unknown_pkg_attr(tmp_path):
     assert not os.path.exists(f"{fp}.001.bu")
     assert fp.read_text(encoding="utf-8") == "rewritten\n"
 
-    r = PolyReader(fp)
+    r = OpenAsReader(fp)
     assert r.closed is True
     assert r.readable() is True and r.writable() is False and r.seekable() is False
     assert r.encoding == "utf-8"
@@ -745,7 +745,7 @@ def test_file_like_attributes_repr_redaction_and_unknown_pkg_attr(tmp_path):
         assert r.readlines(hint=4) == ["rewritten\n"]
     assert r.closed is True
 
-    secret_reader = PolyReader("sftp://alice:mysecret@host/data.txt?token=tok")
+    secret_reader = OpenAsReader("sftp://alice:mysecret@host/data.txt?token=tok")
     rep = repr(secret_reader)
     assert "mysecret" not in rep and "tok" not in rep and "***" in rep
 
@@ -758,18 +758,18 @@ def test_local_empty_no_newline_multimember_append_file_uri_and_colon_filename(t
     """S3-T1: Empty files, missing trailing newline, multi-member append, file:// writer (with spaces), and colons."""
     # Empty file round-trip (including show_progress=True)
     empty_fp = tmp_path / f"empty{ext or '.txt'}"
-    with polyopen(empty_fp, "w", backup=False):
+    with openas(empty_fp, "w", backup=False):
         pass
-    with polyopen(empty_fp, "r", show_progress=True) as r:
+    with openas(empty_fp, "r", show_progress=True) as r:
         assert r.read() == ""
 
     # Missing trailing newline + multi-member append across all formats
     app_fp = tmp_path / f"append{ext or '.txt'}"
-    with polyopen(app_fp, "w", backup=False) as w:
+    with openas(app_fp, "w", backup=False) as w:
         w.write("part1\n")
-    with polyopen(app_fp, "a") as w:
+    with openas(app_fp, "a") as w:
         w.write("part2_no_nl")
-    with polyopen(app_fp, "r") as r:
+    with openas(app_fp, "r") as r:
         assert r.read() == "part1\npart2_no_nl"
 
     # file:// URI write/append/read with space (%20) and local colon filename
@@ -777,18 +777,18 @@ def test_local_empty_no_newline_multimember_append_file_uri_and_colon_filename(t
     spaced_dir.mkdir()
     spaced_fp = spaced_dir / f"doc{ext or '.txt'}"
     file_uri = spaced_fp.as_uri()
-    with polyopen(file_uri, "w", backup=False) as w:
+    with openas(file_uri, "w", backup=False) as w:
         w.write("uri line 1\n")
-    with polyopen(file_uri, "a") as w:
+    with openas(file_uri, "a") as w:
         w.write("uri line 2\n")
-    with polyopen(file_uri, "r") as r:
+    with openas(file_uri, "r") as r:
         assert r.read() == "uri line 1\nuri line 2\n"
 
     if os.name != "nt":
         colon_fp = tmp_path / f"2026:11:25{ext or '.txt'}"
-        with polyopen(colon_fp, "w", backup=False) as w:
+        with openas(colon_fp, "w", backup=False) as w:
             w.write("colon ok\n")
-        with polyopen(colon_fp, "r") as r:
+        with openas(colon_fp, "r") as r:
             assert r.read() == "colon ok\n"
 
 
@@ -805,7 +805,7 @@ def test_local_binary_mode_all_formats_roundtrip_append_iter_and_progress(tmp_pa
     expected_lines = initial_lines + [appended]
     expected_bytes = b"".join(expected_lines)
 
-    with polyopen(fp, "wb", backup=False) as w:
+    with openas(fp, "wb", backup=False) as w:
         assert w.binary is True
         assert w.encoding is None
         assert "mode='wb'" in repr(w)
@@ -816,13 +816,13 @@ def test_local_binary_mode_all_formats_roundtrip_append_iter_and_progress(tmp_pa
         with pytest.raises(TypeError):
             w.writelines(["str line rejected\n"])
 
-    with polyopen(fp, "ab") as w:
+    with openas(fp, "ab") as w:
         assert w.binary is True
         assert w.encoding is None
         assert w.write(appended) == len(appended)
 
     # Full read(), partial read(size), readline(), next(), readlines(), and for-loop iteration
-    with polyopen(fp, "rb") as r:
+    with openas(fp, "rb") as r:
         assert r.binary is True
         assert r.encoding is None
         assert "mode='rb'" in repr(r)
@@ -830,28 +830,28 @@ def test_local_binary_mode_all_formats_roundtrip_append_iter_and_progress(tmp_pa
         assert isinstance(got, bytes)
         assert got == expected_bytes
 
-    with polyopen(fp, "rb") as r:
+    with openas(fp, "rb") as r:
         got_lines = list(r)
         assert all(isinstance(line, bytes) for line in got_lines)
         assert got_lines == expected_lines
 
-    with polyopen(fp, "rb") as r:
+    with openas(fp, "rb") as r:
         assert r.readline() == initial_lines[0]
         assert next(r) == initial_lines[1]
         assert r.readlines() == [initial_lines[2], appended]
 
-    with polyopen(fp, "rb") as r:
+    with openas(fp, "rb") as r:
         assert r.read(4) == b"\x00\xff\xfe\x80"
         assert r.readline() == b"line1\n"
 
     # Multi-chunk (>128 KiB) binary line streaming with show_progress=True
     big_fp = tmp_path / f"big_binary{ext or '.bin'}"
     big_lines = [bytes([0x80 + (i % 128)]) + b"\xff\x00" + f"row-{i:05d}-".encode("ascii") + (b"X" * 60) + b"\n" for i in range(2200)]
-    with PolyWriter(big_fp, binary=True).open(backup=False) as w:
+    with OpenAsWriter(big_fp, binary=True).open(backup=False) as w:
         w.writelines(big_lines)
 
     raw_size = big_fp.stat().st_size
-    with PolyReader(big_fp, show_progress=True, binary=True) as r:
+    with OpenAsReader(big_fp, show_progress=True, binary=True) as r:
         pbar = r._progress
         assert pbar is not None
         assert pbar.total == raw_size
@@ -868,7 +868,7 @@ def test_local_crlf_and_mixed_newline_progress_reconciliation(tmp_path):
     crlf_size = len(crlf_raw)
 
     # 1. Full iteration reaches pbar.n == pbar.total
-    with PolyReader(crlf_fp, show_progress=True) as r:
+    with OpenAsReader(crlf_fp, show_progress=True) as r:
         pbar = r._progress
         assert pbar is not None
         assert pbar.total == crlf_size
@@ -877,14 +877,14 @@ def test_local_crlf_and_mixed_newline_progress_reconciliation(tmp_path):
     assert pbar.n == crlf_size
 
     # 2. Full read() reaches pbar.n == pbar.total
-    with PolyReader(crlf_fp, show_progress=True) as r:
+    with OpenAsReader(crlf_fp, show_progress=True) as r:
         pbar = r._progress
         assert pbar is not None
         assert r.read() == "alpha\nbeta\ngamma\n"
         assert pbar.n == crlf_size
 
     # 3. readline() loop reaches pbar.n == pbar.total at natural EOF, while readline(0) mid-file does not jump
-    with PolyReader(crlf_fp, show_progress=True) as r:
+    with OpenAsReader(crlf_fp, show_progress=True) as r:
         pbar = r._progress
         assert pbar is not None
         first = r.readline()
@@ -902,7 +902,7 @@ def test_local_crlf_and_mixed_newline_progress_reconciliation(tmp_path):
         assert pbar.n == crlf_size
 
     # 4. Early break on CRLF does not jump pbar.n to pbar.total
-    with PolyReader(crlf_fp, show_progress=True) as r:
+    with OpenAsReader(crlf_fp, show_progress=True) as r:
         pbar = r._progress
         assert pbar is not None
         seen = []
@@ -917,7 +917,7 @@ def test_local_crlf_and_mixed_newline_progress_reconciliation(tmp_path):
     no_nl_fp = tmp_path / "no_newlines.txt"
     no_nl_raw = b"single line without newline"
     no_nl_fp.write_bytes(no_nl_raw)
-    with PolyReader(no_nl_fp, show_progress=True) as r:
+    with OpenAsReader(no_nl_fp, show_progress=True) as r:
         pbar = r._progress
         assert pbar is not None
         assert r.read() == "single line without newline"
@@ -927,7 +927,7 @@ def test_local_crlf_and_mixed_newline_progress_reconciliation(tmp_path):
     mixed_fp = tmp_path / "mixed_newlines.txt"
     mixed_raw = b"line1\nline2\r\nline3\n"
     mixed_fp.write_bytes(mixed_raw)
-    with PolyReader(mixed_fp, show_progress=True) as r:
+    with OpenAsReader(mixed_fp, show_progress=True) as r:
         pbar = r._progress
         assert pbar is not None
         assert list(r) == ["line1\n", "line2\n", "line3\n"]
@@ -937,7 +937,7 @@ def test_local_crlf_and_mixed_newline_progress_reconciliation(tmp_path):
     cr_fp = tmp_path / "cr_only.txt"
     cr_raw = b"one\rtwo\r"
     cr_fp.write_bytes(cr_raw)
-    with PolyReader(cr_fp, show_progress=True) as r:
+    with OpenAsReader(cr_fp, show_progress=True) as r:
         pbar = r._progress
         assert pbar is not None
         assert list(r) == ["one\n", "two\n"]
@@ -965,8 +965,8 @@ def test_local_crlf_and_mixed_newline_progress_reconciliation(tmp_path):
     ],
 )
 def test_repr_redacts_malformed_ipv6_urls_without_raising(bad_url, secret, expected_fragment):
-    """iev841 E-04: repr(PolyReader) and repr(PolyWriter) redact malformed URLs without raising ValueError."""
-    for obj in (PolyReader(bad_url), PolyWriter(bad_url)):
+    """iev841 E-04: repr(OpenAsReader) and repr(OpenAsWriter) redact malformed URLs without raising ValueError."""
+    for obj in (OpenAsReader(bad_url), OpenAsWriter(bad_url)):
         rep = repr(obj)
         assert secret not in rep
         assert "token=1" not in rep
@@ -981,12 +981,12 @@ def test_compressed_progress_eof_before_close_early_break_and_mixed_reads(tmp_pa
     payload_text = "".join(text_lines)
     expected_lines = [line.encode("utf-8") for line in text_lines] if binary else text_lines
     fp = tmp_path / f"counted_prog{ext}"
-    with PolyWriter(fp, binary=True).open(backup=False) as w:
+    with OpenAsWriter(fp, binary=True).open(backup=False) as w:
         w.write(payload_text.encode("utf-8"))
     raw_size = fp.stat().st_size
 
     # 1. Full iteration hits exact raw_size AT EOF BEFORE close() and stays exact after close()
-    reader = PolyReader(fp, show_progress=True, binary=binary).open()
+    reader = OpenAsReader(fp, show_progress=True, binary=binary).open()
     try:
         pbar = reader._progress
         assert pbar is not None
@@ -999,7 +999,7 @@ def test_compressed_progress_eof_before_close_early_break_and_mixed_reads(tmp_pa
     assert pbar.n == raw_size
 
     # 2. Early break flushes pending bytes cleanly on close() without exceeding raw_size
-    reader_early = PolyReader(fp, show_progress=True, binary=binary).open()
+    reader_early = OpenAsReader(fp, show_progress=True, binary=binary).open()
     pbar_early = reader_early._progress
     assert pbar_early is not None
     partial = []
@@ -1012,7 +1012,7 @@ def test_compressed_progress_eof_before_close_early_break_and_mixed_reads(tmp_pa
     assert 0 < pbar_early.n <= raw_size
 
     # 3. Mixed readline() + read(10) + iteration never double-counts
-    reader_mix = PolyReader(fp, show_progress=True, binary=binary).open()
+    reader_mix = OpenAsReader(fp, show_progress=True, binary=binary).open()
     try:
         pbar_mix = reader_mix._progress
         assert pbar_mix is not None
@@ -1036,7 +1036,7 @@ def test_counted_stream_open_header_bytes_not_double_counted(tmp_path):
     raw_payload = b"HDR!line1\nline2\nline3\n"
     raw_size = len(raw_payload)
 
-    class HeaderReadingReader(PolyReader):
+    class HeaderReadingReader(OpenAsReader):
         def _wrap_local(self, parsed=None):
             self._raw_fh = _io.BytesIO(raw_payload)
             stream = self._make_counted_stream(self._raw_fh)
@@ -1062,19 +1062,19 @@ def test_counted_stream_open_header_bytes_not_double_counted(tmp_path):
 
 @pytest.mark.parametrize("ext", [".txt", ".gz", ".bz2", ".xz", ".zst"])
 @pytest.mark.parametrize("binary", [False, True])
-def test_polyreader_readlines_hints_binary_and_progress(tmp_path, ext, binary):
+def test_openas_reader_readlines_hints_binary_and_progress(tmp_path, ext, binary):
     """a224p3 E-05: readlines() handles hint=-1/0/None/positive, binary mode, and show_progress=True without double-counting."""
     lines = [f"line-{i:03d}-café-payload\n" for i in range(40)]
     expected = [line.encode("utf-8") for line in lines] if binary else lines
     fp = tmp_path / f"readlines_sample{ext}"
-    with PolyWriter(fp, binary=True).open(backup=False) as w:
+    with OpenAsWriter(fp, binary=True).open(backup=False) as w:
         w.writelines([line.encode("utf-8") for line in lines])
     raw_size = fp.stat().st_size
 
     # Unbounded hints (-1, 0, None) with show_progress=False and show_progress=True
     for show_progress in (False, True):
         for hint in (-1, 0, None):
-            with PolyReader(fp, show_progress=show_progress, binary=binary) as r:
+            with OpenAsReader(fp, show_progress=show_progress, binary=binary) as r:
                 pbar = r._progress
                 got = r.readlines() if hint == -1 else r.readlines(hint)
                 assert got == expected
@@ -1086,7 +1086,7 @@ def test_polyreader_readlines_hints_binary_and_progress(tmp_path, ext, binary):
 
     # Positive hint followed by remaining readlines()
     for show_progress in (False, True):
-        with PolyReader(fp, show_progress=show_progress, binary=binary) as r:
+        with OpenAsReader(fp, show_progress=show_progress, binary=binary) as r:
             pbar = r._progress
             first_batch = r.readlines(50)
             assert 0 < len(first_batch) < len(expected)
@@ -1103,12 +1103,12 @@ def test_polyreader_readlines_hints_binary_and_progress(tmp_path, ext, binary):
         crlf_fp = tmp_path / "readlines_crlf.txt"
         crlf_raw = b"alpha\r\nbeta\r\ngamma\r\n"
         crlf_fp.write_bytes(crlf_raw)
-        with PolyReader(crlf_fp, show_progress=True) as r:
+        with OpenAsReader(crlf_fp, show_progress=True) as r:
             pbar = r._progress
             assert pbar is not None
             assert r.readlines() == ["alpha\n", "beta\n", "gamma\n"]
             assert pbar.n == len(crlf_raw)
-        with PolyReader(crlf_fp, show_progress=True) as r:
+        with OpenAsReader(crlf_fp, show_progress=True) as r:
             pbar = r._progress
             assert pbar is not None
             head = r.readlines(2)
@@ -1166,7 +1166,7 @@ def test_corrupt_and_truncated_compressed_streams_raise_and_close_handles(
     else:
         expected_exc = (zstd.ZstdError, EOFError)
 
-    reader = PolyReader(fp, show_progress=show_progress, binary=(mode == "rb"))
+    reader = OpenAsReader(fp, show_progress=show_progress, binary=(mode == "rb"))
     try:
         with pytest.raises(expected_exc):
             with reader:
@@ -1194,7 +1194,7 @@ def test_truncated_zst_stream_raises_and_closes_handles_without_resource_warning
         full_wire = cctx.compress(payload)
         fp_full = tmp_path / f"valid_{label}_{mode}_{show_progress}.zst"
         fp_full.write_bytes(full_wire)
-        with PolyReader(fp_full, show_progress=show_progress, binary=(mode == "rb")) as r:
+        with OpenAsReader(fp_full, show_progress=show_progress, binary=(mode == "rb")) as r:
             expected = payload if mode == "rb" else payload.decode("utf-8")
             assert r.read() == expected
 
@@ -1205,7 +1205,7 @@ def test_truncated_zst_stream_raises_and_closes_handles_without_resource_warning
                 continue
             fp_bad = tmp_path / f"trunc_{label}_{cut}_{mode}_{show_progress}.zst"
             fp_bad.write_bytes(full_wire[:cut])
-            reader = PolyReader(fp_bad, show_progress=show_progress, binary=(mode == "rb"))
+            reader = OpenAsReader(fp_bad, show_progress=show_progress, binary=(mode == "rb"))
             with pytest.raises((EOFError, zstd.ZstdError)):
                 with reader:
                     reader.read()
@@ -1219,7 +1219,7 @@ def test_truncated_zst_stream_raises_and_closes_handles_without_resource_warning
     skippable = struct.pack("<II", 0x184D2A50, 5) + b"HELLO"
     fp_multi = tmp_path / f"multi_skip_{mode}_{show_progress}.zst"
     fp_multi.write_bytes(skippable + f1 + f2)
-    with PolyReader(fp_multi, show_progress=show_progress, binary=(mode == "rb")) as r:
+    with OpenAsReader(fp_multi, show_progress=show_progress, binary=(mode == "rb")) as r:
         expected = b"frame1\nframe2\n" if mode == "rb" else "frame1\nframe2\n"
         assert r.read() == expected
 
@@ -1230,7 +1230,7 @@ def test_truncated_zst_stream_raises_and_closes_handles_without_resource_warning
     ):
         fp_bad = tmp_path / f"{bad_name}_{mode}_{show_progress}.zst"
         fp_bad.write_bytes(bad_wire)
-        reader = PolyReader(fp_bad, show_progress=show_progress, binary=(mode == "rb"))
+        reader = OpenAsReader(fp_bad, show_progress=show_progress, binary=(mode == "rb"))
         with pytest.raises((EOFError, zstd.ZstdError)):
             with reader:
                 reader.read()
@@ -1241,7 +1241,7 @@ def test_truncated_zst_stream_raises_and_closes_handles_without_resource_warning
     # 3. Early break on a valid multi-line .zst file does NOT falsely raise EOFError
     fp_early = tmp_path / f"early_break_{mode}_{show_progress}.zst"
     fp_early.write_bytes(zstd.ZstdCompressor().compress(b"line\n" * 5000))
-    with PolyReader(fp_early, show_progress=show_progress, binary=(mode == "rb")) as r:
+    with OpenAsReader(fp_early, show_progress=show_progress, binary=(mode == "rb")) as r:
         first = next(iter(r))
         assert first == (b"line\n" if mode == "rb" else "line\n")
 
@@ -1251,10 +1251,10 @@ def test_non_utf8_bytes_raise_unicode_decode_error_in_text_and_succeed_in_binary
     """was3ig E-03: Non-UTF-8 bytes raise UnicodeDecodeError in 'r' mode (closing handles) and return raw bytes in 'rb'."""
     raw_bytes = b"valid prefix\n\xff\xfe\x80\x81invalid-utf8\n"
     fp = tmp_path / f"non_utf8{ext}"
-    with polyopen(fp, "wb", backup=False) as w:
+    with openas(fp, "wb", backup=False) as w:
         w.write(raw_bytes)
 
-    reader = PolyReader(fp, show_progress=True)
+    reader = OpenAsReader(fp, show_progress=True)
     with pytest.raises(UnicodeDecodeError):
         with reader:
             reader.read()
@@ -1262,18 +1262,18 @@ def test_non_utf8_bytes_raise_unicode_decode_error_in_text_and_succeed_in_binary
     assert reader._fh is None
     assert reader._raw_fh is None
 
-    with polyopen(fp, "rb") as r:
+    with openas(fp, "rb") as r:
         assert r.read() == raw_bytes
 
 
 def test_keyboard_interrupt_mid_open_cleans_up_local_handles(tmp_path):
     """was3ig E-03: KeyboardInterrupt (BaseException) mid-open closes acquired local reader and writer handles."""
     zst_fp = tmp_path / "ki_sample.zst"
-    with polyopen(zst_fp, "w", backup=False) as w:
+    with openas(zst_fp, "w", backup=False) as w:
         w.write("hello interrupt\n")
 
-    # 1. PolyReader local open interrupted after _raw_fh and _fh are acquired
-    r_local = PolyReader(zst_fp, show_progress=True)
+    # 1. OpenAsReader local open interrupted after _raw_fh and _fh are acquired
+    r_local = OpenAsReader(zst_fp, show_progress=True)
     captured = {}
 
     def interrupt_size():
@@ -1290,9 +1290,9 @@ def test_keyboard_interrupt_mid_open_cleans_up_local_handles(tmp_path):
     assert r_local._fh is None
     assert r_local._raw_fh is None
 
-    # 2. PolyWriter local open interrupted after _raw_fh is opened
+    # 2. OpenAsWriter local open interrupted after _raw_fh is opened
     out_zst = tmp_path / "ki_out.zst"
-    w_local = PolyWriter(out_zst)
+    w_local = OpenAsWriter(out_zst)
     captured_writer = {}
 
     def interrupt_stream_writer(self, writer_fh, *args, **kwargs):
@@ -1310,13 +1310,13 @@ def test_keyboard_interrupt_mid_open_cleans_up_local_handles(tmp_path):
     assert w_local._raw_fh is None
 
 
-def test_polyreader_close_flush_progress_error_alone_and_with_handle_close_error(tmp_path):
-    """was3ig E-03: PolyReader.close() closes every handle and propagates the primary _flush_progress error."""
+def test_openas_reader_close_flush_progress_error_alone_and_with_handle_close_error(tmp_path):
+    """was3ig E-03: OpenAsReader.close() closes every handle and propagates the primary _flush_progress error."""
     fp = tmp_path / "flush_err.txt"
     fp.write_bytes(b"line 1\nline 2\nline 3\n")
 
     # 1. _flush_progress raises alone: all handles still close and primary flush error propagates
-    reader1 = PolyReader(fp, show_progress=True).open()
+    reader1 = OpenAsReader(fp, show_progress=True).open()
     orig_fh1 = reader1._fh
     pbar1 = reader1._progress
     assert orig_fh1 is not None and pbar1 is not None
@@ -1344,7 +1344,7 @@ def test_polyreader_close_flush_progress_error_alone_and_with_handle_close_error
     assert reader1._progress is None
 
     # 2. Both _flush_progress and a handle close raise: every handle still closes and primary flush error wins
-    reader2 = PolyReader(fp, show_progress=True).open()
+    reader2 = OpenAsReader(fp, show_progress=True).open()
     orig_fh2 = reader2._fh
     pbar2 = reader2._progress
     assert orig_fh2 is not None and pbar2 is not None
@@ -1395,7 +1395,7 @@ def test_streaming_memory_bound_o1_tracemalloc(tmp_path, ext):
     expected_bytes_16m = lines_16m * len(line_bytes)
 
     fp16 = tmp_path / f"mem16m{ext}"
-    with PolyWriter(fp16, binary=True).open(backup=False) as w:
+    with OpenAsWriter(fp16, binary=True).open(backup=False) as w:
         block = line_bytes * 1024
         full_blocks, rem = divmod(lines_16m, 1024)
         for _ in range(full_blocks):
@@ -1408,7 +1408,7 @@ def test_streaming_memory_bound_o1_tracemalloc(tmp_path, ext):
     expected_bytes_32m = lines_32m * len(line_bytes)
     if ext == ".xz":
         fp32 = tmp_path / "mem32m.xz"
-        with PolyWriter(fp32, binary=True).open(backup=False) as w:
+        with OpenAsWriter(fp32, binary=True).open(backup=False) as w:
             block = line_bytes * 1024
             full_blocks, rem = divmod(lines_32m, 1024)
             for _ in range(full_blocks):
@@ -1418,14 +1418,14 @@ def test_streaming_memory_bound_o1_tracemalloc(tmp_path, ext):
 
     def _measure_peak(path, mode: str, expected_lines: int, expected_len: int) -> int:
         # Warm up lazy codec imports before measuring streaming heap.
-        with polyopen(path, mode) as warm:
+        with openas(path, mode) as warm:
             warm.readline()
         gc.collect()
         tracemalloc.start()
         try:
             count = 0
             total_len = 0
-            with polyopen(path, mode) as reader:
+            with openas(path, mode) as reader:
                 for line in reader:
                     count += 1
                     total_len += len(line)

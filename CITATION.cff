@@ -1,12 +1,12 @@
 cff-version: 1.2.0
-message: "If you use polyopen in academic work, reports, or publications, please cite it using the metadata below."
+message: "If you use openas in academic work, reports, or publications, please cite it using the metadata below."
 type: software
-title: "polyopen"
+title: "openas"
 version: "0.1.0"
 date-released: "2026-11-25"
 license: Apache-2.0
-repository-code: "https://github.com/fariello/polyopen"
-url: "https://github.com/fariello/polyopen"
+repository-code: "https://github.com/fariello/openas"
+url: "https://github.com/fariello/openas"
 authors:
   - family-names: "Fariello"
     given-names: "Gabriele"

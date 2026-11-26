@@ -1,6 +1,6 @@
-# Contributing to polyopen
+# Contributing to openas
 
-Thank you for contributing to `polyopen`.
+Thank you for contributing to `openas`.
 
 ## Local development setup
 
@@ -31,4 +31,4 @@ Tests should verify observable behavior (outputs, exceptions, and side effects) 
 
 ## License
 
-Contributions to `polyopen` are licensed under the Apache License, Version 2.0 (see `LICENSE` and `NOTICE`).
+Contributions to `openas` are licensed under the Apache License, Version 2.0 (see `LICENSE` and `NOTICE`).

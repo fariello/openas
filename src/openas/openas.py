@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-polyopen - Unified streaming I/O across local files, remote protocols, and compression formats.
+openas - Unified streaming I/O across local files, remote protocols, and compression formats.
 
 Supports plain, `.gz`, `.bz2`, `.xz`, and `.zst` streams over local files (`file://` or plain
 paths), `http://` and `https://` (read-only), `ftp://` (read and write), and `ssh://` / `sftp://`
@@ -9,29 +9,29 @@ paths), `http://` and `https://` (read-only), `ftp://` (read and write), and `ss
 
 Public API
 ----------
-- `polyopen(filename, mode='r', backup=None, show_progress=False, compresslevel=None, timeout=None)`:
-  Unified factory returning an opened `PolyReader` or `PolyWriter`.
-- `PolyReader`: Stream reader supporting `read()`, `readline()`, `readlines()`, line-by-line
+- `openas(filename, mode='r', backup=None, show_progress=False, compresslevel=None, timeout=None)`:
+  Unified factory returning an opened `OpenAsReader` or `OpenAsWriter`.
+- `OpenAsReader`: Stream reader supporting `read()`, `readline()`, `readlines()`, line-by-line
   iteration (`str` in text mode, `bytes` in binary mode), and optional raw-byte `tqdm` progress bars.
-- `PolyWriter`: Stream writer supporting `write()`, `writelines()`, `flush()`, `compresslevel`,
+- `OpenAsWriter`: Stream writer supporting `write()`, `writelines()`, `flush()`, `compresslevel`,
   and collision-safe sequential `.NNN.bu` backups on overwrite.
-- `PolyopenError`, `UnsupportedArchiveError`, `ReadOnlyProtocolError`, `UnsupportedProtocolError`:
+- `OpenAsError`, `UnsupportedArchiveError`, `ReadOnlyProtocolError`, `UnsupportedProtocolError`:
   Exception hierarchy for unsupported archive containers and protocols.
 
 Usage
 -----
 Read a local or remote compressed stream:
-    >>> from polyopen import polyopen
-    >>> with polyopen("path/to/data.gz", "r") as reader:
+    >>> from openas import openas
+    >>> with openas("path/to/data.gz", "r") as reader:
     ...     for line in reader:
     ...         process(line)
 
 Read over SSH/SFTP using SSH keys (preferred over inline passwords):
-    >>> with polyopen("sftp://user@hostname/path/to/remote.zst", "r") as reader:
+    >>> with openas("sftp://user@hostname/path/to/remote.zst", "r") as reader:
     ...     content = reader.read()
 
 Write a compressed file with optional sequential .bu backup on overwrite:
-    >>> with polyopen("path/to/output.bz2", "w", compresslevel=6) as writer:
+    >>> with openas("path/to/output.bz2", "w", compresslevel=6) as writer:
     ...     writer.write("Hello, world!\\n")
 
 Author
@@ -48,16 +48,16 @@ from __future__ import annotations
 __version__ = "0.1.0"
 __author__ = "Gabriele Fariello"
 
-class PolyopenError(Exception):
-    """Base exception for all polyopen-specific errors."""
+class OpenAsError(Exception):
+    """Base exception for all openas-specific errors."""
 
-class UnsupportedArchiveError(PolyopenError):
-    """Raised when a container archive format (such as .zip or .tar.gz) is passed to polyopen."""
+class UnsupportedArchiveError(OpenAsError):
+    """Raised when a container archive format (such as .zip or .tar.gz) is passed to openas."""
 
-class ReadOnlyProtocolError(PolyopenError):
+class ReadOnlyProtocolError(OpenAsError):
     """Raised when attempting to write or append to a read-only protocol (http:// or https://)."""
 
-class UnsupportedProtocolError(PolyopenError):
+class UnsupportedProtocolError(OpenAsError):
     """Raised when an unsupported protocol or operation (such as s3:// or FTP append) is requested."""
 
 UNSUPPORTED_ARCHIVES = (
@@ -764,7 +764,7 @@ def _resolve_target(filename: str):
         return local_path, None, ''
     if scheme in _CLOUD_SCHEMES:
         raise UnsupportedProtocolError(
-            f"polyopen does not support cloud object stores ('{parsed.scheme}://'). "
+            f"openas does not support cloud object stores ('{parsed.scheme}://'). "
             f"Use 'smart_open' or a dedicated cloud SDK (such as boto3) instead."
         )
     if scheme in _SUPPORTED_SCHEMES:
@@ -938,7 +938,7 @@ def _ftp_session_wrapper_class():
             A wrapper around ftplib.FTP for handling FTP connections with a specified port.
 
             This class extends ftplib.FTP to allow connections to FTP servers on non-standard ports.
-            It is primarily intended for internal use within the PolyReader and PolyWriter classes
+            It is primarily intended for internal use within the OpenAsReader and OpenAsWriter classes
             and not for direct use by end users.
 
             Attributes
@@ -1015,7 +1015,7 @@ def __getattr__(name: str):
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
-class PolyReader:
+class OpenAsReader:
     """
     Streaming reader supporting `.gz`, `.bz2`, `.xz`, and `.zst` decompression
     over local files (`file://` or plain paths), HTTP/HTTPS, FTP, and SSH/SFTP.
@@ -1039,7 +1039,7 @@ class PolyReader:
 
     Methods
     -------
-    open() -> PolyReader
+    open() -> OpenAsReader
         Open the stream for reading.
     read(size=-1) -> str or bytes, readline(size=-1) -> str or bytes, readlines(hint=-1) -> list
         Standard stream read operations (`str` in text mode, `bytes` in binary mode).
@@ -1060,21 +1060,21 @@ class PolyReader:
         return self._fh is None
 
     def readable(self) -> bool:
-        """Return True (PolyReader is a read-only stream)."""
+        """Return True (OpenAsReader is a read-only stream)."""
         return True
 
     def writable(self) -> bool:
-        """Return False (PolyReader is a read-only stream)."""
+        """Return False (OpenAsReader is a read-only stream)."""
         return False
 
     def seekable(self) -> bool:
-        """Return False (PolyReader does not support random-access seeking)."""
+        """Return False (OpenAsReader does not support random-access seeking)."""
         return False
 
     def __repr__(self) -> str:
         state = "closed" if self.closed else "open"
         mode = "rb" if self.binary else "r"
-        return f"PolyReader({_redact_url(self.filename)!r}, mode={mode!r}, state={state!r})"
+        return f"OpenAsReader({_redact_url(self.filename)!r}, mode={mode!r}, state={state!r})"
 
     def __init__(
         self,
@@ -1084,7 +1084,7 @@ class PolyReader:
         binary: bool = False,
     ):
         """
-        Initialize PolyReader with a filename.
+        Initialize OpenAsReader with a filename.
 
         Parameters
         ----------
@@ -1178,7 +1178,7 @@ class PolyReader:
         if remaining > 0:
             self._progress.update(remaining)
 
-    def __enter__(self) -> 'PolyReader':
+    def __enter__(self) -> 'OpenAsReader':
         """
         Open the file when entering the context.
 
@@ -1186,8 +1186,8 @@ class PolyReader:
 
         Returns
         -------
-        PolyReader
-            The PolyReader instance with the file opened for reading.
+        OpenAsReader
+            The OpenAsReader instance with the file opened for reading.
         """
         self.open()
         return self
@@ -1677,7 +1677,7 @@ class PolyReader:
         else:
             self._fh = open(self.filename, 'rb') if self.binary else open(self.filename, 'r', encoding='utf-8')
 
-    def open(self) -> 'PolyReader':
+    def open(self) -> 'OpenAsReader':
         """
         Open the file for reading, decompressing it on the fly if necessary.
 
@@ -1686,8 +1686,8 @@ class PolyReader:
 
         Returns
         -------
-        PolyReader
-            The PolyReader instance with the file opened for reading.
+        OpenAsReader
+            The OpenAsReader instance with the file opened for reading.
         """
         if self._fh is not None:
             return self
@@ -1696,7 +1696,7 @@ class PolyReader:
 
         if _normalized_path(self.filename, parsed).endswith(UNSUPPORTED_ARCHIVES):
             raise UnsupportedArchiveError(
-                f"polyopen does not support reading archive formats directly: {_redact_url(self.filename)}. "
+                f"openas does not support reading archive formats directly: {_redact_url(self.filename)}. "
                 f"Use Python's zipfile or tarfile module instead."
             )
 
@@ -1811,7 +1811,7 @@ class PolyReader:
             raise flush_err
 
 
-class PolyWriter:
+class OpenAsWriter:
     """
     Streaming writer supporting `.gz`, `.bz2`, `.xz`, and `.zst` compression
     over local files (`file://` or plain paths), FTP (write only), and SSH/SFTP (write/append),
@@ -1834,7 +1834,7 @@ class PolyWriter:
 
     Methods
     -------
-    open(append=False, backup=True, compresslevel=None) -> PolyWriter
+    open(append=False, backup=True, compresslevel=None) -> OpenAsWriter
         Open the stream for writing or appending.
     write(data) -> int, writelines(lines) -> None, flush() -> None
         Standard stream write operations (`str` in text mode, `bytes`-like in binary mode).
@@ -1855,21 +1855,21 @@ class PolyWriter:
         return self._fh is None
 
     def readable(self) -> bool:
-        """Return False (PolyWriter is a write-only stream)."""
+        """Return False (OpenAsWriter is a write-only stream)."""
         return False
 
     def writable(self) -> bool:
-        """Return True (PolyWriter is a write-only stream)."""
+        """Return True (OpenAsWriter is a write-only stream)."""
         return True
 
     def seekable(self) -> bool:
-        """Return False (PolyWriter does not support random-access seeking)."""
+        """Return False (OpenAsWriter does not support random-access seeking)."""
         return False
 
     def __repr__(self) -> str:
         state = "closed" if self.closed else "open"
         mode = "wb" if self.binary else "w"
-        return f"PolyWriter({_redact_url(self.filename)!r}, mode={mode!r}, state={state!r})"
+        return f"OpenAsWriter({_redact_url(self.filename)!r}, mode={mode!r}, state={state!r})"
 
     def __init__(
         self,
@@ -1879,7 +1879,7 @@ class PolyWriter:
         binary: bool = False,
     ):
         """
-        Initialize PolyWriter with a filename.
+        Initialize OpenAsWriter with a filename.
 
         Parameters
         ----------
@@ -1905,7 +1905,7 @@ class PolyWriter:
         self._sftp_client = None
         self._sftp_file = None
 
-    def __enter__(self) -> 'PolyWriter':
+    def __enter__(self) -> 'OpenAsWriter':
         """
         Open the file for writing when entering the context.
 
@@ -1913,8 +1913,8 @@ class PolyWriter:
 
         Returns
         -------
-        PolyWriter
-            The PolyWriter instance with the file opened for writing.
+        OpenAsWriter
+            The OpenAsWriter instance with the file opened for writing.
         """
         self.open()
         return self
@@ -1964,7 +1964,7 @@ class PolyWriter:
         """
         if append:
             raise UnsupportedProtocolError(
-                "Protocol 'ftp' does not support append mode in polyopen (ftputil does not support FTP append)."
+                "Protocol 'ftp' does not support append mode in openas (ftputil does not support FTP append)."
             )
         import ftputil
         port = 21 if parsed.port is None else parsed.port
@@ -2320,7 +2320,7 @@ class PolyWriter:
         else:
             self._fh = open(self.filename, mode) if self.binary else open(self.filename, 'a' if append else 'w', encoding='utf-8')
 
-    def open(self, append: bool = False, backup: bool = True, compresslevel: Optional[int] = None) -> 'PolyWriter':
+    def open(self, append: bool = False, backup: bool = True, compresslevel: Optional[int] = None) -> 'OpenAsWriter':
         """
         Open the file for writing, compressing it on the fly if necessary.
 
@@ -2339,8 +2339,8 @@ class PolyWriter:
 
         Returns
         -------
-        PolyWriter
-            The PolyWriter instance with the file opened for writing.
+        OpenAsWriter
+            The OpenAsWriter instance with the file opened for writing.
 
         Raises
         ------
@@ -2355,7 +2355,7 @@ class PolyWriter:
 
         if norm.endswith(UNSUPPORTED_ARCHIVES):
             raise UnsupportedArchiveError(
-                f"polyopen does not support writing or appending to archive formats safely: {_redact_url(self.filename)}. "
+                f"openas does not support writing or appending to archive formats safely: {_redact_url(self.filename)}. "
                 f"Use Python's zipfile or tarfile module instead."
             )
 
@@ -2363,7 +2363,7 @@ class PolyWriter:
             raise ValueError("Cannot have both append and backup set to True.")
 
         if scheme in ('http', 'https'):
-            raise ReadOnlyProtocolError(f"Protocol '{parsed.scheme}' does not support write/append operations in polyopen.")
+            raise ReadOnlyProtocolError(f"Protocol '{parsed.scheme}' does not support write/append operations in openas.")
 
         _validate_write_options(norm, compresslevel)
 
@@ -2378,7 +2378,7 @@ class PolyWriter:
             self.close()
             raise
 
-        if type(self).write is PolyWriter.write:
+        if type(self).write is OpenAsWriter.write:
             self.write = self._fh.write
 
         return self
@@ -2446,14 +2446,14 @@ class PolyWriter:
         _close_handles(fh, raw_fh, sftp_file, sftp_client, ssh_client, ftp)
 
 
-def polyopen(
+def openas(
     filename: Union[str, os.PathLike],
     mode: str = 'r',
     backup: Optional[bool] = None,
     show_progress: bool = False,
     compresslevel: Optional[int] = None,
     timeout: Optional[float] = None,
-) -> Union[PolyReader, PolyWriter]:
+) -> Union[OpenAsReader, OpenAsWriter]:
     """
     Open a local or remote stream with transparent compression in text (`str`) or binary (`bytes`) mode.
 
@@ -2486,7 +2486,7 @@ def polyopen(
 
     Returns
     -------
-    PolyReader or PolyWriter
+    OpenAsReader or OpenAsWriter
         An opened reader or writer context manager.
 
     Raises
@@ -2504,28 +2504,28 @@ def polyopen(
 
     Examples
     --------
-    >>> with polyopen("data.gz", "w", compresslevel=6) as f:
+    >>> with openas("data.gz", "w", compresslevel=6) as f:
     ...     f.write("hello\\n")
-    >>> with polyopen("data.gz", "r") as f:
+    >>> with openas("data.gz", "r") as f:
     ...     print(f.read())
-    >>> with polyopen("data.zst", "rb") as f:
+    >>> with openas("data.zst", "rb") as f:
     ...     raw_line = f.readline()
     """
     filename = os.fsdecode(filename)
     if show_progress and mode in ('w', 'wt', 'wb', 'a', 'at', 'ab'):
         raise NotImplementedError('Progress tracking is currently isolated to reader paths. Write implementations are deferred.')
     if mode in ('r', 'rt', 'rb'):
-        return PolyReader(filename, show_progress=show_progress, timeout=timeout, binary=(mode == 'rb')).open()
+        return OpenAsReader(filename, show_progress=show_progress, timeout=timeout, binary=(mode == 'rb')).open()
     elif mode in ('w', 'wt', 'wb'):
         effective_backup = True if backup is None else backup
-        return PolyWriter(filename, show_progress=show_progress, timeout=timeout, binary=(mode == 'wb')).open(
+        return OpenAsWriter(filename, show_progress=show_progress, timeout=timeout, binary=(mode == 'wb')).open(
             append=False,
             backup=effective_backup,
             compresslevel=compresslevel,
         )
     elif mode in ('a', 'at', 'ab'):
         effective_backup = False if backup is None else backup
-        return PolyWriter(filename, show_progress=show_progress, timeout=timeout, binary=(mode == 'ab')).open(
+        return OpenAsWriter(filename, show_progress=show_progress, timeout=timeout, binary=(mode == 'ab')).open(
             append=True,
             backup=effective_backup,
             compresslevel=compresslevel,
@@ -2538,7 +2538,7 @@ def polyopen(
 
 def main():
     """
-    CLI entry point for `polyopen` (`python -m polyopen` or `polyopen`).
+    CLI entry point for `openas` (`python -m openas` or `openas`).
 
     Streams 64 KiB binary chunks for `--read` (with newline-delimited line and byte
     throughput reporting) and single-pass multi-target `--write` across plain, `.gz`,
@@ -2563,7 +2563,7 @@ def main():
 
     import argparse
     parser = argparse.ArgumentParser(
-        prog="polyopen",
+        prog="openas",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         description=(
             "Read or broadcast binary and text streams across plain, .gz, .bz2, .xz, and .zst files "
@@ -2571,9 +2571,9 @@ def main():
         ),
         epilog=(
             "Examples:\n"
-            "  python -m polyopen --read data.txt.gz https://example.com/log.zst\n"
-            "  python -m polyopen --write source.gz copy.txt backup.bz2\n"
-            "  python -m polyopen --write -i source.gz copy.txt sftp://user@host/dest.zst"
+            "  python -m openas --read data.txt.gz https://example.com/log.zst\n"
+            "  python -m openas --write source.gz copy.txt backup.bz2\n"
+            "  python -m openas --write -i source.gz copy.txt sftp://user@host/dest.zst"
         ),
     )
 
@@ -2621,10 +2621,10 @@ def main():
         if args.input_file is not None:
             parser.error("--input-file/-i is only valid with --write")
         if len(args.files) < 1:
-            parser.error("Read mode requires at least one file (e.g., 'python -m polyopen -r path/to/file.gz')")
+            parser.error("Read mode requires at least one file (e.g., 'python -m openas -r path/to/file.gz')")
         for input_file in args.files:
             print(f"TESTING reading {_redact_url(input_file)}")
-            with PolyReader(input_file, binary=True) as reader:
+            with OpenAsReader(input_file, binary=True) as reader:
                 line_count = 0
                 bytes_count = 0
                 last_byte = None
@@ -2648,7 +2648,7 @@ def main():
             output_files = args.files
         else:
             if len(args.files) < 2:
-                parser.error("Write mode requires at least one source file and one destination file (e.g., 'python -m polyopen -w src dest')")
+                parser.error("Write mode requires at least one source file and one destination file (e.g., 'python -m openas -w src dest')")
             source_file = args.files[0]
             output_files = args.files[1:]
 
@@ -2657,11 +2657,11 @@ def main():
             resolved_out, parsed_out, scheme_out = _resolve_target(output_file)
             if _normalized_path(resolved_out, parsed_out).endswith(UNSUPPORTED_ARCHIVES):
                 raise UnsupportedArchiveError(
-                    f"polyopen does not support writing or appending to archive formats safely: {_redact_url(output_file)}. "
+                    f"openas does not support writing or appending to archive formats safely: {_redact_url(output_file)}. "
                     f"Use Python's zipfile or tarfile module instead."
                 )
             if scheme_out in ('http', 'https'):
-                raise ReadOnlyProtocolError(f"Protocol '{parsed_out.scheme}' does not support write/append operations in polyopen.")
+                raise ReadOnlyProtocolError(f"Protocol '{parsed_out.scheme}' does not support write/append operations in openas.")
 
         import contextlib
         print(f"Will Read from {_redact_url(source_file)}")
@@ -2671,10 +2671,10 @@ def main():
         dest_names = []
         t0 = time.monotonic()
         with contextlib.ExitStack() as stack:
-            reader = stack.enter_context(PolyReader(source_file, binary=True))
+            reader = stack.enter_context(OpenAsReader(source_file, binary=True))
             writers = []
             for output_file in output_files:
-                writer = stack.enter_context(PolyWriter(output_file, binary=True))
+                writer = stack.enter_context(OpenAsWriter(output_file, binary=True))
                 print(f"Writing {_redact_url(writer.filename)}")
                 writers.append(writer)
                 dest_names.append(_redact_url(writer.filename))

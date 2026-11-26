@@ -3,7 +3,7 @@ requires = ["setuptools>=77.0.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "polyopen"
+name = "openas"
 version = "0.1.0"
 description = "Line-by-line and chunked streaming I/O for plain and compressed files (.gz, .bz2, .xz, .zst) in text or binary mode across local paths, HTTP/HTTPS, FTP, and SSH/SFTP."
 readme = "README.md"
@@ -39,14 +39,14 @@ dev = [
 ]
 
 [project.scripts]
-polyopen = "polyopen.polyopen:main"
+openas = "openas.openas:main"
 
 [project.urls]
-Homepage = "https://github.com/fariello/polyopen"
-Repository = "https://github.com/fariello/polyopen"
-Issues = "https://github.com/fariello/polyopen/issues"
-Documentation = "https://github.com/fariello/polyopen/blob/main/docs/API.md"
-Changelog = "https://github.com/fariello/polyopen/blob/main/CHANGELOG.md"
+Homepage = "https://github.com/fariello/openas"
+Repository = "https://github.com/fariello/openas"
+Issues = "https://github.com/fariello/openas/issues"
+Documentation = "https://github.com/fariello/openas/blob/main/docs/API.md"
+Changelog = "https://github.com/fariello/openas/blob/main/CHANGELOG.md"
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]

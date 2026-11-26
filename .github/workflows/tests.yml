@@ -65,18 +65,18 @@ jobs:
           SMOKE_DIR="$(mktemp -d)"
           trap 'rm -rf "$SMOKE_DIR"' EXIT
           cd "$SMOKE_DIR"
-          polyopen --version
-          python -m polyopen --help
+          openas --version
+          python -m openas --help
           CHECKOUT_SRC="$CHECKOUT_SRC" python - <<'PY'
           import os
           import pathlib
           import subprocess
           import sys
-          import polyopen
-          from polyopen import polyopen as open_stream
+          import openas
+          from openas import openas as open_stream
 
           checkout_src = os.path.realpath(os.environ["CHECKOUT_SRC"])
-          imported_file = os.path.realpath(polyopen.__file__)
+          imported_file = os.path.realpath(openas.__file__)
           assert os.path.commonpath([checkout_src, imported_file]) != checkout_src, (
               f"Expected installed wheel, got checkout source: {imported_file}"
           )
@@ -101,14 +101,14 @@ jobs:
           cli_src = work / "smoke_text.gz"
           cli_dst = work / "cli_out.zst"
           res_r = subprocess.run(
-              [sys.executable, "-m", "polyopen", "--read", str(cli_src)],
+              [sys.executable, "-m", "openas", "--read", str(cli_src)],
               capture_output=True,
               text=True,
               check=True,
           )
           assert "FINISHED Reading." in res_r.stdout
           res_w = subprocess.run(
-              [sys.executable, "-m", "polyopen", "--write", str(cli_src), str(cli_dst)],
+              [sys.executable, "-m", "openas", "--write", str(cli_src), str(cli_dst)],
               capture_output=True,
               text=True,
               check=True,

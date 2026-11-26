@@ -1,13 +1,13 @@
-# polyopen
+# openas
 
 A lightweight Python library and CLI for streaming plain and compressed files (`.gz`, `.bz2`, `.xz`, `.zst`) line-by-line or in chunks across local paths and remote protocols (`http://`, `https://`, `ftp://`, `ssh://`, `sftp://`), in both UTF-8 text (`str`) and binary (`bytes`) modes.
 
 ## Background and Philosophy
 
-`polyopen` started around 2007 as an internal utility to read and write compressed files (such as logs, CSVs, and JSONL) line-by-line without decompressing full files into memory or writing separate boilerplate for each codec and transport. It has now been extracted into a standalone Apache-2.0 package.
+`openas` started around 2007 as an internal utility to read and write compressed files (such as logs, CSVs, and JSONL) line-by-line without decompressing full files into memory or writing separate boilerplate for each codec and transport. It has now been extracted into a standalone Apache-2.0 package.
 
-**How `polyopen` compares to `smart_open` and `fsspec`:**
-`smart_open` and `fsspec` also support streaming compressed files line-by-line and excel at cloud object stores (`s3://`, `gs://`, Azure) or full virtual filesystem APIs. `polyopen` focuses on a smaller, self-contained scope:
+**How `openas` compares to `smart_open` and `fsspec`:**
+`smart_open` and `fsspec` also support streaming compressed files line-by-line and excel at cloud object stores (`s3://`, `gs://`, Azure) or full virtual filesystem APIs. `openas` focuses on a smaller, self-contained scope:
 
 - **Unified line-by-line compressed streaming across local and POSIX/network transports:** Reads and writes plain, `.gz`, `.bz2`, `.xz`, and multi-frame `.zst` streams line-by-line in both UTF-8 text (`str`) and raw binary (`bytes`) modes, without requiring manual `io.TextIOWrapper` or `io.BufferedReader` glue (including for `zstandard`, whose raw `stream_reader` does not support `readline()` directly).
 - **No cloud SDKs and fast startup:** Explicitly excludes cloud object stores (`s3://`, `gs://`, `az://`, `hdfs://`) so it never pulls in cloud SDKs (`boto3`, GCS, Azure). Optional standard-library codecs (`gzip`, `bz2`, `lzma`, `ftplib`, `argparse`, `urllib.parse`) and runtime transport libraries (`paramiko`, `ftputil`, `requests`, `zstandard`, `tqdm`) are imported lazily on first use, while all five runtime dependencies install by default so every documented protocol and codec works immediately.
@@ -28,45 +28,45 @@ See [GUIDING_PRINCIPLES.md](GUIDING_PRINCIPLES.md) and [DECISIONS.md](DECISIONS.
 Requires Python 3.9 or newer:
 
 ```bash
-pip install polyopen
+pip install openas
 ```
 
 *Runtime dependencies installed automatically:* `paramiko`, `zstandard`, `requests`, `tqdm`, and `ftputil` (imported lazily on first use).
 
 ## Quick Start
 
-Use the unified `polyopen()` function for local or remote compressed streams in text (`str`) or binary (`bytes`) mode.
+Use the unified `openas()` function for local or remote compressed streams in text (`str`) or binary (`bytes`) mode.
 
 ### Basic Usage
 
 ```python
-from polyopen import polyopen
+from openas import openas
 
 # 1. Write a compressed text file (optional compresslevel tunes speed vs ratio)
-with polyopen("events.jsonl.zst", "w", compresslevel=3) as f:
+with openas("events.jsonl.zst", "w", compresslevel=3) as f:
     f.write('{"event": "start"}\n')
 
 # 2. Append to the compressed file without creating a .bu backup
-with polyopen("events.jsonl.zst", "a") as f:
+with openas("events.jsonl.zst", "a") as f:
     f.writelines(['{"event": "tick"}\n', '{"event": "stop"}\n'])
 
 # 3. Stream the compressed text file back line-by-line
-with polyopen("events.jsonl.zst", "r") as f:
+with openas("events.jsonl.zst", "r") as f:
     for line in f:
         print(line.strip())
 
 # 4. Write and stream back a raw binary compressed file (including non-UTF-8 bytes)
-with polyopen("payload.bin.gz", "wb", backup=False) as f:
+with openas("payload.bin.gz", "wb", backup=False) as f:
     f.write(b"\x00\xffrecord1\nrecord2\n")
 
-with polyopen("payload.bin.gz", "rb") as f:
+with openas("payload.bin.gz", "rb") as f:
     for raw_line in f:
         print(raw_line)
 ```
 
 ## Capabilities and Support Matrix
 
-`polyopen` handles single-file plain and compressed streams and rejects multi-file container archives to prevent corruption.
+`openas` handles single-file plain and compressed streams and rejects multi-file container archives to prevent corruption.
 
 ### Supported Stream Formats and Protocols
 
@@ -94,37 +94,37 @@ Container archives embed directory tables and multi-file headers rather than a s
 
 ### Remote Streaming Examples
 
-Pass remote URLs directly; `polyopen` detects `.gz`, `.bz2`, `.xz`, and `.zst` from the URL path (ignoring query strings):
+Pass remote URLs directly; `openas` detects `.gz`, `.bz2`, `.xz`, and `.zst` from the URL path (ignoring query strings):
 
 ```python
-from polyopen import polyopen
+from openas import openas
 
 # Write over SSH/SFTP using SSH agent / ~/.ssh keys (preferred over inline passwords)
-with polyopen("sftp://user@hostname/data.csv.zst", "w", backup=True, timeout=30) as f:
+with openas("sftp://user@hostname/data.csv.zst", "w", backup=True, timeout=30) as f:
     f.write("id,name\n1,alice\n")
 
 # Stream a remote compressed HTTP file line-by-line
-with polyopen("https://example.com/data.jsonl.gz", "r", timeout=30) as f:
+with openas("https://example.com/data.jsonl.gz", "r", timeout=30) as f:
     for line in f:
         print(line.strip())
 ```
 
-> **Credential safety:** Prefer SSH agent or `~/.ssh` key authentication (`sftp://user@host/path`) over inline passwords (`user:pass@host`). Avoid putting plaintext passwords on command lines where they can appear in shell history or process listings. `polyopen` redacts URL passwords and query strings in CLI output, `__repr__()`, and archive error messages.
+> **Credential safety:** Prefer SSH agent or `~/.ssh` key authentication (`sftp://user@host/path`) over inline passwords (`user:pass@host`). Avoid putting plaintext passwords on command lines where they can appear in shell history or process listings. `openas` redacts URL passwords and query strings in CLI output, `__repr__()`, and archive error messages.
 
 ## Command-Line Interface
 
-Run the built-in CLI via `polyopen` (installed console script) or `python -m polyopen`:
+Run the built-in CLI via `openas` (installed console script) or `python -m openas`:
 
 ```bash
 # Show help and version
-python -m polyopen --help
-python -m polyopen --version
+python -m openas --help
+python -m openas --version
 
 # Stream compressed files and report line/byte throughput
-python -m polyopen --read path/to/large.zst
+python -m openas --read path/to/large.zst
 
 # Single-pass broadcast (reads source once and writes to one or more destinations)
-python -m polyopen --write https://example.com/data.csv.gz local_copy.txt sftp://user@host/dest.csv.zst
+python -m openas --write https://example.com/data.csv.gz local_copy.txt sftp://user@host/dest.csv.zst
 ```
 
 ## Development and Benchmarks
@@ -132,8 +132,8 @@ python -m polyopen --write https://example.com/data.csv.gz local_copy.txt sftp:/
 Set up a local development environment (Python 3.9+):
 
 ```bash
-git clone https://github.com/fariello/polyopen.git
-cd polyopen
+git clone https://github.com/fariello/openas.git
+cd openas
 pip install -e ".[dev]"
 python -m pytest -v
 ```
@@ -141,7 +141,7 @@ python -m pytest -v
 Run the optional standalone performance benchmark suite (all temporary files stay inside `tempfile.TemporaryDirectory()`):
 
 ```bash
-python benchmarks/bench_polyopen.py
+python benchmarks/bench_openas.py
 ```
 
 ## Documentation
@@ -151,22 +151,22 @@ python benchmarks/bench_polyopen.py
 - [Architecture Overview](ARCHITECTURE.md): Stream layering, transport wrappers, sequential `.bu` backups, and test structure.
 - [Functional Specification](FUNCTIONAL_SPEC.md): Behavioral contracts, edge cases, non-goals, and security boundaries.
 - [Design Decisions](DECISIONS.md): Rationale and trade-offs behind load-bearing invariants.
-- [Guiding Principles](GUIDING_PRINCIPLES.md): Core engineering boundaries of `polyopen`.
+- [Guiding Principles](GUIDING_PRINCIPLES.md): Core engineering boundaries of `openas`.
 - [Changelog](CHANGELOG.md): Release history.
 - [Contributing](CONTRIBUTING.md): Development workflow and testing expectations.
 
 ## Troubleshooting and Tips
 
-- **SSH `known_hosts` / `RejectPolicy` errors:** `polyopen` loads system host keys (`load_system_host_keys()`) and enforces Paramiko's `RejectPolicy` to protect against Man-in-the-Middle attacks. If a connection fails because the host key is unknown, verify the server's fingerprint out of band and add the verified host key to `~/.ssh/known_hosts` (for example via an interactive `ssh` check or `ssh-keyscan` after verifying the fingerprint). Do not disable host-key verification.
-- **Special characters in URL credentials or paths:** Percent-encode reserved characters (`@` as `%40`, `:` as `%3A`, `/` as `%2F`, space as `%20`, `%` as `%25`) in `ftp://`, `ssh://`, and `sftp://` URLs (for example `sftp://user@host/logs%202026/data.gz`, or if inline credentials cannot be avoided, `ftp://user:p%40ss@host/data.txt`). `polyopen` decodes FTP/SSH/SFTP credentials and paths automatically via `urllib.parse.unquote()`. Prefer SSH agent or `~/.ssh` key authentication over inline passwords.
-- **`UnsupportedArchiveError` on `.zip` or `.tar.*` files:** `polyopen` handles single-file streams and rejects multi-file container archives to prevent corrupting archive headers or directory tables. Use Python's `zipfile` module for `.zip` archives and `tarfile` for `.tar` and `.tar.*` archives.
-- **Streaming multi-GB `.zst` and `.gz` corpora in `'rb'` mode:** When downstream parsers accept `bytes` directly (for example JSON or byte-level log parsers), open large compressed files with `'rb'` instead of `'r'`. Binary mode avoids per-line UTF-8 decoding overhead and uses C-level `io.BufferedReader` line scanning; benchmark your own environment with `benchmarks/bench_polyopen.py`.
+- **SSH `known_hosts` / `RejectPolicy` errors:** `openas` loads system host keys (`load_system_host_keys()`) and enforces Paramiko's `RejectPolicy` to protect against Man-in-the-Middle attacks. If a connection fails because the host key is unknown, verify the server's fingerprint out of band and add the verified host key to `~/.ssh/known_hosts` (for example via an interactive `ssh` check or `ssh-keyscan` after verifying the fingerprint). Do not disable host-key verification.
+- **Special characters in URL credentials or paths:** Percent-encode reserved characters (`@` as `%40`, `:` as `%3A`, `/` as `%2F`, space as `%20`, `%` as `%25`) in `ftp://`, `ssh://`, and `sftp://` URLs (for example `sftp://user@host/logs%202026/data.gz`, or if inline credentials cannot be avoided, `ftp://user:p%40ss@host/data.txt`). `openas` decodes FTP/SSH/SFTP credentials and paths automatically via `urllib.parse.unquote()`. Prefer SSH agent or `~/.ssh` key authentication over inline passwords.
+- **`UnsupportedArchiveError` on `.zip` or `.tar.*` files:** `openas` handles single-file streams and rejects multi-file container archives to prevent corrupting archive headers or directory tables. Use Python's `zipfile` module for `.zip` archives and `tarfile` for `.tar` and `.tar.*` archives.
+- **Streaming multi-GB `.zst` and `.gz` corpora in `'rb'` mode:** When downstream parsers accept `bytes` directly (for example JSON or byte-level log parsers), open large compressed files with `'rb'` instead of `'r'`. Binary mode avoids per-line UTF-8 decoding overhead and uses C-level `io.BufferedReader` line scanning; benchmark your own environment with `benchmarks/bench_openas.py`.
 
 ## Known Limitations
 
 - **Sequential Streaming Only:** Streams do not support random-access `seek()`/`tell()`, read-write modes (`r+`, `w+`, `x`), or asynchronous (`async`/`await`) I/O.
 - **Cloud Object Store Exclusions:** Cloud schemes (`s3://`, `gs://`, `az://`, `hdfs://`) raise `UnsupportedProtocolError`. Use `smart_open`, `fsspec`, or dedicated cloud SDKs instead.
-- **Write Progress Tracking (v0.1.0):** `show_progress=True` is implemented for `PolyReader` only; passing `show_progress=True` to `PolyWriter` or write/append modes raises `NotImplementedError`.
+- **Write Progress Tracking (v0.1.0):** `show_progress=True` is implemented for `OpenAsReader` only; passing `show_progress=True` to `OpenAsWriter` or write/append modes raises `NotImplementedError`.
 - **FTP Append Not Supported:** `ftp://` supports read and write only; append mode raises `UnsupportedProtocolError` because `ftputil` does not support FTP append.
 - **Synchronous CLI Fan-Out:** Multi-target `--write` reads the source once in 64 KiB binary chunks via `contextlib.ExitStack` and writes exact bytes synchronously to each destination. Use the Python API with threads or processes for concurrent remote uploads.
 
@@ -174,4 +174,4 @@ python benchmarks/bench_polyopen.py
 
 Licensed under the Apache License, Version 2.0. See [LICENSE](LICENSE) and [NOTICE](NOTICE).
 
-If you use `polyopen` in academic work, technical reports, or publications, please cite it using [CITATION.cff](CITATION.cff).
+If you use `openas` in academic work, technical reports, or publications, please cite it using [CITATION.cff](CITATION.cff).

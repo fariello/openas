@@ -1,22 +1,22 @@
 #!/usr/bin/env python3
-"""Reproducible performance benchmark suite for polyopen.
+"""Reproducible performance benchmark suite for openas.
 
-Measures nine workloads using only the Python standard library and polyopen
+Measures nine workloads using only the Python standard library and openas
 dependencies:
-  1. Subprocess import latency (`import polyopen`)
+  1. Subprocess import latency (`import openas`)
   2. 200,000-line text read throughput across .txt, .gz, .bz2, .xz, .zst
      (show_progress=False and show_progress=True vs native iteration)
-  3. 200,000-line local write throughput (PolyWriter vs native fh.write)
+  3. 200,000-line local write throughput (OpenAsWriter vs native fh.write)
   4. Compression time and peak RSS for .zst and .xz writes vs idle child
   5. HTTP read throughput from a local 127.0.0.1 ephemeral-port server
   6. Local backup rotation latency with 500 existing .bu files
-  7. CLI 3-target broadcast time via `python3 -m polyopen.polyopen -w`
+  7. CLI 3-target broadcast time via `python3 -m openas.openas -w`
   8. 200,000-line binary ('rb') read throughput across .txt, .gz, .bz2, .xz, .zst
-  9. 200,000-line PolyReader.readlines() throughput vs native fh.readlines()
+  9. 200,000-line OpenAsReader.readlines() throughput vs native fh.readlines()
 
 Every generated file lives inside a `tempfile.TemporaryDirectory()`.
 Run via:
-    PYTHONPATH=src python3 benchmarks/bench_polyopen.py
+    PYTHONPATH=src python3 benchmarks/bench_openas.py
 """
 
 import bz2
@@ -41,7 +41,7 @@ _REPO_SRC = str(Path(__file__).resolve().parent.parent / "src")
 if _REPO_SRC not in sys.path:
     sys.path.insert(0, _REPO_SRC)
 
-from polyopen import PolyReader, PolyWriter
+from openas import OpenAsReader, OpenAsWriter
 
 REPS = 5
 IMPORT_REPS = 7
@@ -66,16 +66,16 @@ def _median(values: list) -> float:
 
 
 def bench_import_time(env: dict) -> dict:
-    """Workload 1: fresh-subprocess `import polyopen` latency."""
+    """Workload 1: fresh-subprocess `import openas` latency."""
     code = (
         "import time; "
         "t0 = time.perf_counter(); "
-        "import polyopen; "
+        "import openas; "
         "print(f'{(time.perf_counter() - t0) * 1000.0:.4f}')"
     )
     # Warm OS page cache with one discarded invocation.
     subprocess.run(
-        [sys.executable, "-c", "import polyopen"],
+        [sys.executable, "-c", "import openas"],
         check=True,
         env=env,
         stdout=subprocess.DEVNULL,
@@ -96,7 +96,7 @@ def bench_import_time(env: dict) -> dict:
 
         t0 = time.perf_counter()
         subprocess.run(
-            [sys.executable, "-c", "import polyopen"],
+            [sys.executable, "-c", "import openas"],
             check=True,
             env=env,
             stdout=subprocess.DEVNULL,
@@ -107,7 +107,7 @@ def bench_import_time(env: dict) -> dict:
     med_import_ms = _median(import_ms_samples)
     med_wall_ms = _median(wall_ms_samples)
     print(
-        f"[1/9] import_polyopen: median={med_import_ms:.2f} ms "
+        f"[1/9] import_openas: median={med_import_ms:.2f} ms "
         f"(subprocess_wall={med_wall_ms:.2f} ms, reps={IMPORT_REPS})"
     )
     return {"import_ms": med_import_ms, "wall_ms": med_wall_ms}
@@ -198,12 +198,12 @@ def bench_read_throughput(files: dict) -> None:
         for _ in range(REPS):
             t0 = time.perf_counter()
             n = 0
-            with PolyReader(path, show_progress=False) as reader:
+            with OpenAsReader(path, show_progress=False) as reader:
                 for _ in reader:
                     n += 1
             plain_times.append(time.perf_counter() - t0)
             if n != READ_LINES:
-                raise RuntimeError(f"PolyReader {ext} line mismatch: {n} != {READ_LINES}")
+                raise RuntimeError(f"OpenAsReader {ext} line mismatch: {n} != {READ_LINES}")
 
         prog_times = []
         with open(os.devnull, "w", encoding="utf-8") as devnull:
@@ -211,13 +211,13 @@ def bench_read_throughput(files: dict) -> None:
                 t0 = time.perf_counter()
                 n = 0
                 with contextlib.redirect_stderr(devnull):
-                    with PolyReader(path, show_progress=True) as reader:
+                    with OpenAsReader(path, show_progress=True) as reader:
                         for _ in reader:
                             n += 1
                 prog_times.append(time.perf_counter() - t0)
                 if n != READ_LINES:
                     raise RuntimeError(
-                        f"PolyReader(progress) {ext} line mismatch: {n} != {READ_LINES}"
+                        f"OpenAsReader(progress) {ext} line mismatch: {n} != {READ_LINES}"
                     )
 
         med_native = _median(native_times)
@@ -227,12 +227,12 @@ def bench_read_throughput(files: dict) -> None:
         ratio_prog = med_prog / med_native if med_native > 0 else float("inf")
         print(
             f"[2/9] read_200k {ext:4s} (progress=False): "
-            f"polyopen={med_plain:.4f}s native={med_native:.4f}s "
+            f"openas={med_plain:.4f}s native={med_native:.4f}s "
             f"ratio={ratio_plain:.2f}x (reps={REPS})"
         )
         print(
             f"[2/9] read_200k {ext:4s} (progress=True ): "
-            f"polyopen={med_prog:.4f}s native={med_native:.4f}s "
+            f"openas={med_prog:.4f}s native={med_native:.4f}s "
             f"ratio={ratio_prog:.2f}x (reps={REPS})"
         )
 
@@ -241,7 +241,7 @@ def bench_write_throughput(tmpdir: Path) -> None:
     """Workload 3: 200,000-line local write throughput."""
     lines = [f"line-{i:06d} payload=0123456789abcdef\n" for i in range(WRITE_LINES)]
     native_out = str(tmpdir / "write_native.txt")
-    poly_out = str(tmpdir / "write_poly.txt")
+    openas_out = str(tmpdir / "write_openas.txt")
 
     native_times = []
     for _ in range(REPS):
@@ -251,19 +251,19 @@ def bench_write_throughput(tmpdir: Path) -> None:
                 fh.write(line)
         native_times.append(time.perf_counter() - t0)
 
-    poly_times = []
+    openas_times = []
     for _ in range(REPS):
         t0 = time.perf_counter()
-        with PolyWriter(poly_out).open(append=False, backup=False) as writer:
+        with OpenAsWriter(openas_out).open(append=False, backup=False) as writer:
             for line in lines:
                 writer.write(line)
-        poly_times.append(time.perf_counter() - t0)
+        openas_times.append(time.perf_counter() - t0)
 
     med_native = _median(native_times)
-    med_poly = _median(poly_times)
-    ratio = med_poly / med_native if med_native > 0 else float("inf")
+    med_openas = _median(openas_times)
+    ratio = med_openas / med_native if med_native > 0 else float("inf")
     print(
-        f"[3/9] write_200k .txt: polyopen={med_poly:.4f}s native={med_native:.4f}s "
+        f"[3/9] write_200k .txt: openas={med_openas:.4f}s native={med_native:.4f}s "
         f"ratio={ratio:.2f}x (reps={REPS})"
     )
 
@@ -300,7 +300,7 @@ def _measure_child_rss_and_time(child_code: str, env: dict) -> tuple:
 
 def bench_compression_rss(tmpdir: Path, env: dict) -> None:
     """Workload 4: .zst and .xz write compression time and peak RSS vs idle child."""
-    idle_code = "import polyopen"
+    idle_code = "import openas"
     idle_times = []
     idle_rss_samples = []
     for _ in range(REPS):
@@ -316,9 +316,9 @@ def bench_compression_rss(tmpdir: Path, env: dict) -> None:
     for ext in (".zst", ".xz"):
         out_path = str(tmpdir / f"compress_bench{ext}")
         child_code = (
-            "from polyopen import PolyWriter\n"
+            "from openas import OpenAsWriter\n"
             f"lines = [f'record-{{i:06d}} ' + ('abcdefghij' * 8) + '\\n' for i in range({COMPRESS_LINES})]\n"
-            f"w = PolyWriter({out_path!r}).open(append=False, backup=False)\n"
+            f"w = OpenAsWriter({out_path!r}).open(append=False, backup=False)\n"
             "try:\n"
             "    for line in lines:\n"
             "        w.write(line)\n"
@@ -368,7 +368,7 @@ def bench_http_read(tmpdir: Path) -> None:
         for _ in range(REPS):
             t0 = time.perf_counter()
             n = 0
-            with PolyReader(url) as reader:
+            with OpenAsReader(url) as reader:
                 for _ in reader:
                     n += 1
             times.append(time.perf_counter() - t0)
@@ -402,7 +402,7 @@ def bench_backup_rotation(tmpdir: Path) -> None:
             expected_backup.unlink()
         target.write_text("previous\n", encoding="utf-8")
         t0 = time.perf_counter()
-        with PolyWriter(str(target)).open(append=False, backup=True) as writer:
+        with OpenAsWriter(str(target)).open(append=False, backup=True) as writer:
             writer.write("updated\n")
         times_ms.append((time.perf_counter() - t0) * 1000.0)
         if not expected_backup.exists():
@@ -416,7 +416,7 @@ def bench_backup_rotation(tmpdir: Path) -> None:
 
 
 def bench_cli_broadcast(tmpdir: Path, env: dict) -> None:
-    """Workload 7: CLI 3-target broadcast via `python3 -m polyopen.polyopen -w`."""
+    """Workload 7: CLI 3-target broadcast via `python3 -m openas.openas -w`."""
     src_path = tmpdir / "cli_src.txt.gz"
     payload = "".join(
         f"cli-line-{i:06d} 0123456789abcdef0123456789abcdef\n"
@@ -438,7 +438,7 @@ def bench_cli_broadcast(tmpdir: Path, env: dict) -> None:
             [
                 sys.executable,
                 "-m",
-                "polyopen.polyopen",
+                "openas.openas",
                 "-w",
                 str(src_path),
                 *(str(d) for d in dests),
@@ -501,30 +501,30 @@ def bench_binary_read_throughput(files: dict) -> None:
             if n != READ_LINES:
                 raise RuntimeError(f"Native rb {ext} line mismatch: {n} != {READ_LINES}")
 
-        poly_times = []
+        openas_times = []
         for _ in range(REPS):
             t0 = time.perf_counter()
             n = 0
-            with PolyReader(path, binary=True) as reader:
+            with OpenAsReader(path, binary=True) as reader:
                 for _ in reader:
                     n += 1
-            poly_times.append(time.perf_counter() - t0)
+            openas_times.append(time.perf_counter() - t0)
             if n != READ_LINES:
-                raise RuntimeError(f"PolyReader rb {ext} line mismatch: {n} != {READ_LINES}")
+                raise RuntimeError(f"OpenAsReader rb {ext} line mismatch: {n} != {READ_LINES}")
 
         med_native = _median(native_times)
-        med_poly = _median(poly_times)
-        ratio = med_poly / med_native if med_native > 0 else float("inf")
-        speedup = med_native / med_poly if med_poly > 0 else float("inf")
+        med_openas = _median(openas_times)
+        ratio = med_openas / med_native if med_native > 0 else float("inf")
+        speedup = med_native / med_openas if med_openas > 0 else float("inf")
         print(
             f"[8/9] read_200k_rb {ext:4s}: "
-            f"polyopen={med_poly:.4f}s native={med_native:.4f}s "
+            f"openas={med_openas:.4f}s native={med_native:.4f}s "
             f"ratio={ratio:.2f}x (speedup={speedup:.2f}x, reps={REPS})"
         )
 
 
 def bench_readlines_throughput(files: dict) -> None:
-    """Workload 9: 200,000-line PolyReader.readlines() vs native fh.readlines()."""
+    """Workload 9: 200,000-line OpenAsReader.readlines() vs native fh.readlines()."""
     for ext in (".txt", ".gz"):
         path = files[ext]
 
@@ -541,29 +541,29 @@ def bench_readlines_throughput(files: dict) -> None:
             if len(lines) != READ_LINES:
                 raise RuntimeError(f"Native readlines {ext} mismatch: {len(lines)} != {READ_LINES}")
 
-        poly_times = []
+        openas_times = []
         for _ in range(REPS):
             t0 = time.perf_counter()
-            with PolyReader(path) as reader:
+            with OpenAsReader(path) as reader:
                 lines = reader.readlines()
-            poly_times.append(time.perf_counter() - t0)
+            openas_times.append(time.perf_counter() - t0)
             if len(lines) != READ_LINES:
-                raise RuntimeError(f"PolyReader readlines {ext} mismatch: {len(lines)} != {READ_LINES}")
+                raise RuntimeError(f"OpenAsReader readlines {ext} mismatch: {len(lines)} != {READ_LINES}")
 
         med_native = _median(native_times)
-        med_poly = _median(poly_times)
-        ratio = med_poly / med_native if med_native > 0 else float("inf")
+        med_openas = _median(openas_times)
+        ratio = med_openas / med_native if med_native > 0 else float("inf")
         print(
             f"[9/9] readlines_200k {ext:4s}: "
-            f"polyopen={med_poly:.4f}s native={med_native:.4f}s "
+            f"openas={med_openas:.4f}s native={med_native:.4f}s "
             f"ratio={ratio:.2f}x (reps={REPS})"
         )
 
 
 def main() -> int:
     env = _subprocess_env()
-    print(f"polyopen benchmark (Python {sys.version.split()[0]}, reps={REPS})")
-    with tempfile.TemporaryDirectory(prefix="polyopen-bench-") as raw_dir:
+    print(f"openas benchmark (Python {sys.version.split()[0]}, reps={REPS})")
+    with tempfile.TemporaryDirectory(prefix="openas-bench-") as raw_dir:
         tmpdir = Path(raw_dir)
         bench_import_time(env)
         read_files = _build_read_fixtures(tmpdir)

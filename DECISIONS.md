@@ -2,25 +2,25 @@
 
 *[Return to Main README](README.md)*
 
-This document records the rationale and trade-offs behind load-bearing design choices in `polyopen` so contributors and reviewers can understand why current invariants exist before changing them.
+This document records the rationale and trade-offs behind load-bearing design choices in `openas` so contributors and reviewers can understand why current invariants exist before changing them.
 
 ## ADR-001: Distinct UTF-8 text and binary `bytes` modes (2026-11-25)
 
-- **Context:** `polyopen` was built primarily to stream compressed files (logs, CSV, JSONL, and binary records) line-by-line or in chunks across local and remote locations. Earlier versions accepted `'rb'`, `'wb'`, and `'ab'` as aliases for UTF-8 text mode, which contradicted Python's `builtins.open()` semantics and prevented handling non-UTF-8 binary streams.
-- **Decision:** Match standard Python mode semantics before the initial v0.1.0 release: `'r'`/`'rt'`, `'w'`/`'wt'`, and `'a'`/`'at'` (and `binary=False` on `PolyReader`/`PolyWriter`) operate on UTF-8 `str` (`encoding == 'utf-8'`), while `'rb'`, `'wb'`, and `'ab'` (and `binary=True`) operate on raw `bytes` (`encoding is None`). Wrap binary `.gz`, `.bz2`, `.xz`, and plain binary network readers in 64 KiB `io.BufferedReader` (`buffer_size=65536`) for C-level line scanning across chunk boundaries, and wrap `.zst` stream readers (`read_size=131072`) in 128 KiB `io.BufferedReader` (`buffer_size=131072`) in both text and binary modes (which also supplies `readline()` over `ZstdDecompressionReader`, whose raw `readline()` raises `io.UnsupportedOperation`). Implement binary `PolyWriter.writelines()` by calling `write()` per item so `ZstdCompressionWriter` matches stdlib binary writers.
+- **Context:** `openas` was built primarily to stream compressed files (logs, CSV, JSONL, and binary records) line-by-line or in chunks across local and remote locations. Earlier versions accepted `'rb'`, `'wb'`, and `'ab'` as aliases for UTF-8 text mode, which contradicted Python's `builtins.open()` semantics and prevented handling non-UTF-8 binary streams.
+- **Decision:** Match standard Python mode semantics before the initial v0.1.0 release: `'r'`/`'rt'`, `'w'`/`'wt'`, and `'a'`/`'at'` (and `binary=False` on `OpenAsReader`/`OpenAsWriter`) operate on UTF-8 `str` (`encoding == 'utf-8'`), while `'rb'`, `'wb'`, and `'ab'` (and `binary=True`) operate on raw `bytes` (`encoding is None`). Wrap binary `.gz`, `.bz2`, `.xz`, and plain binary network readers in 64 KiB `io.BufferedReader` (`buffer_size=65536`) for C-level line scanning across chunk boundaries, and wrap `.zst` stream readers (`read_size=131072`) in 128 KiB `io.BufferedReader` (`buffer_size=131072`) in both text and binary modes (which also supplies `readline()` over `ZstdDecompressionReader`, whose raw `readline()` raises `io.UnsupportedOperation`). Implement binary `OpenAsWriter.writelines()` by calling `write()` per item so `ZstdCompressionWriter` matches stdlib binary writers.
 - **Consequences:** Callers get predictable `builtins.open()` behavior in both text and binary modes without breaking default text usage (`'r'`, `'w'`, `'a'`).
 
 ## ADR-002: Reject cloud object stores and container archives explicitly (2026-11-21)
 
 - **Context:** Cloud object stores (`s3://`, `gs://`, `az://`, `hdfs://`) require heavy SDKs (`boto3`, GCS/Azure libraries), and container archives (`.zip`, `.tar`, `.tar.*`, `.rar`, `.7z`) embed internal directory headers that stream writes corrupt.
 - **Decision:** Fail fast with `UnsupportedProtocolError` (recommending `smart_open` or cloud SDKs) and `UnsupportedArchiveError` (recommending `zipfile`/`tarfile`). Unknown multi-letter `scheme://` URLs also raise `UnsupportedProtocolError` instead of falling through to local file opening.
-- **Consequences:** Keeps `polyopen` small and prevents silent archive corruption or confusing local `FileNotFoundError` messages on URL typos.
+- **Consequences:** Keeps `openas` small and prevents silent archive corruption or confusing local `FileNotFoundError` messages on URL typos.
 
 ## ADR-003: Lazy imports with batteries-included install dependencies (2026-11-21, reaffirmed 2026-11-25)
 
-- **Context:** Importing `paramiko`, `requests`, `ftputil`, `zstandard`, `tqdm`, and optional stdlib codecs eagerly slows CLI startup and local-file scripts. Conversely, splitting dependencies into optional extras breaks `pip install polyopen` for users who expect documented remote and `.zst` features immediately.
+- **Context:** Importing `paramiko`, `requests`, `ftputil`, `zstandard`, `tqdm`, and optional stdlib codecs eagerly slows CLI startup and local-file scripts. Conversely, splitting dependencies into optional extras breaks `pip install openas` for users who expect documented remote and `.zst` features immediately.
 - **Decision:** Keep all five third-party packages in `[project.dependencies]` for v0.1.0, while deferring every optional import until first use (including PEP 562 lazy resolution for `FTPSessionWrapper`).
-- **Consequences:** Fast `import polyopen` latency (verified by subprocess tests) with zero-flag installation. Optional extras (`[ssh]`, `[ftp]`, etc.) may be evaluated for v0.2.
+- **Consequences:** Fast `import openas` latency (verified by subprocess tests) with zero-flag installation. Optional extras (`[ssh]`, `[ftp]`, etc.) may be evaluated for v0.2.
 
 ## ADR-004: Codec defaults via `compresslevel=None` (2026-11-21)
 
@@ -31,7 +31,7 @@ This document records the rationale and trade-offs behind load-bearing design ch
 ## ADR-005: Fast-path, bounded, atomic local sequential `.bu` backups (2026-11-21, hardened 2026-11-25)
 
 - **Context:** Probing `.001.bu`, `.002.bu`, ... sequentially becomes O(N) on directories with hundreds of backups and causes high RTT overhead over SFTP/FTP. Naive `os.rename` can silently overwrite existing backups or rename an existing directory on Linux `EPERM`.
-- **Decision:** Check `<path>.001.bu` first in O(1); if occupied, scan the parent directory once (`os.scandir` locally, `listdir` remotely), select the lowest free 3-digit ASCII slot up to `.999.bu`, and fall back to nanosecond timestamps (`time.time_ns()`). Locally, reject existing directories (`IsADirectoryError`), use `os.link()` + `os.unlink()`, and check `os.path.lexists` before any rename fallback. Remotely, both SFTP (`PolyWriter._ssh_backup_if` via `stat.S_ISDIR`) and FTP (`PolyWriter._wrap_ftp` via `isdir`) reject existing remote directories with `IsADirectoryError` before calling `rename()`, and SFTP retries `rename()` collisions across free slots. Existing `.bu` files are never pruned or rotated out.
+- **Decision:** Check `<path>.001.bu` first in O(1); if occupied, scan the parent directory once (`os.scandir` locally, `listdir` remotely), select the lowest free 3-digit ASCII slot up to `.999.bu`, and fall back to nanosecond timestamps (`time.time_ns()`). Locally, reject existing directories (`IsADirectoryError`), use `os.link()` + `os.unlink()`, and check `os.path.lexists` before any rename fallback. Remotely, both SFTP (`OpenAsWriter._ssh_backup_if` via `stat.S_ISDIR`) and FTP (`OpenAsWriter._wrap_ftp` via `isdir`) reject existing remote directories with `IsADirectoryError` before calling `rename()`, and SFTP retries `rename()` collisions across free slots. Existing `.bu` files are never pruned or rotated out.
 - **Consequences:** O(1) common case and single-scan scaling up to 999 backups without risking directory renames or broken-symlink overwrites. Local sequential backups remain designed for non-concurrent writers; FTP rename atomicity depends on the remote server.
 
 ## ADR-006: SSH host-key verification and bounded SFTP streaming/pipelining (2026-11-21, updated 2026-11-25)

@@ -1,4 +1,4 @@
-# Functional Specification: `polyopen`
+# Functional Specification: `openas`
 
 *[Return to Main README](README.md)*
 
@@ -7,7 +7,7 @@
 
 ## 1. Purpose, Audience, and Scope
 
-`polyopen` is a lightweight Python library and CLI for streaming plain and compressed files (`.gz`, `.bz2`, `.xz`, `.zst`) line-by-line or in chunks across local files and remote protocols (`http://`, `https://`, `ftp://`, `ssh://`, `sftp://`), in both UTF-8 text (`str`) and binary (`bytes`) modes, with optional sequential `.bu` overwrite backups.
+`openas` is a lightweight Python library and CLI for streaming plain and compressed files (`.gz`, `.bz2`, `.xz`, `.zst`) line-by-line or in chunks across local files and remote protocols (`http://`, `https://`, `ftp://`, `ssh://`, `sftp://`), in both UTF-8 text (`str`) and binary (`bytes`) modes, with optional sequential `.bu` overwrite backups.
 
 - **Target audience:** Python developers, data engineers, and operators streaming local or remote compressed files (such as logs, CSV, JSONL, or binary records) without pulling in cloud object-store SDKs.
 - **Explicit non-goals (v0.1.0):**
@@ -21,9 +21,9 @@
 
 ## 2. Core Concepts
 
-- **Unified Streaming Wrapper:** `polyopen()` routes text and binary read, write, and append modes to `PolyReader` or `PolyWriter`. Optional standard library and third-party modules are imported lazily on first use.
+- **Unified Streaming Wrapper:** `openas()` routes text and binary read, write, and append modes to `OpenAsReader` or `OpenAsWriter`. Optional standard library and third-party modules are imported lazily on first use.
 - **Line-by-Line Transparent Compression:** Uses Python's `gzip`, `bz2`, `lzma`, `zstandard`, `io.TextIOWrapper` (text mode), and `io.BufferedReader` (`64 KiB` buffers for binary `.gz`, `.bz2`, `.xz`, and plain binary network streams; `128 KiB` `read_size` and `io.BufferedReader` for `.zst` text and binary streams) to stream decompressed and compressed data across chunk boundaries in O(1) memory without buffering entire files.
-- **Sequential `.bu` Overwrite Backups:** On overwrite (`backup=True`, default for write modes), `polyopen` validates `compresslevel` and imports required codecs first, then checks `<path>.001.bu` in O(1); if occupied, it lists the parent directory once (`os.scandir` locally, single `listdir` on SFTP/FTP) to select the lowest free 3-digit slot up to `.999.bu`, falling back to nanosecond timestamps (`time.time_ns()`) past 999. Existing `.bu` files are never deleted or pruned automatically.
+- **Sequential `.bu` Overwrite Backups:** On overwrite (`backup=True`, default for write modes), `openas` validates `compresslevel` and imports required codecs first, then checks `<path>.001.bu` in O(1); if occupied, it lists the parent directory once (`os.scandir` locally, single `listdir` on SFTP/FTP) to select the lowest free 3-digit slot up to `.999.bu`, falling back to nanosecond timestamps (`time.time_ns()`) past 999. Existing `.bu` files are never deleted or pruned automatically.
 
 ## 3. Supported Protocols and Codecs
 
@@ -48,36 +48,36 @@ All supported write/append codecs accept optional `compresslevel: Optional[int] 
 
 ## 4. Public API
 
-### `polyopen(filename, mode='r', backup=None, show_progress=False, compresslevel=None, timeout=None) -> Union[PolyReader, PolyWriter]`
+### `openas(filename, mode='r', backup=None, show_progress=False, compresslevel=None, timeout=None) -> Union[OpenAsReader, OpenAsWriter]`
 
 - **`filename`** (`Union[str, os.PathLike]`): Normalized via `os.fsdecode()`. Extension matching is case-insensitive and ignores URL query strings.
 - **`mode`** (`str`):
-  - `'r'`, `'rt'`: `PolyReader(..., binary=False)` returning UTF-8 `str`.
-  - `'rb'`: `PolyReader(..., binary=True)` returning raw `bytes`.
-  - `'w'`, `'wt'`: `PolyWriter(..., binary=False).open(append=False, ...)` accepting UTF-8 `str` (rejecting `bytes` with `TypeError`).
-  - `'wb'`: `PolyWriter(..., binary=True).open(append=False, ...)` accepting `bytes`-like objects (rejecting `str` with `TypeError`).
-  - `'a'`, `'at'`: `PolyWriter(..., binary=False).open(append=True, ...)` accepting UTF-8 `str`.
-  - `'ab'`: `PolyWriter(..., binary=True).open(append=True, ...)` accepting `bytes`-like objects.
+  - `'r'`, `'rt'`: `OpenAsReader(..., binary=False)` returning UTF-8 `str`.
+  - `'rb'`: `OpenAsReader(..., binary=True)` returning raw `bytes`.
+  - `'w'`, `'wt'`: `OpenAsWriter(..., binary=False).open(append=False, ...)` accepting UTF-8 `str` (rejecting `bytes` with `TypeError`).
+  - `'wb'`: `OpenAsWriter(..., binary=True).open(append=False, ...)` accepting `bytes`-like objects (rejecting `str` with `TypeError`).
+  - `'a'`, `'at'`: `OpenAsWriter(..., binary=False).open(append=True, ...)` accepting UTF-8 `str`.
+  - `'ab'`: `OpenAsWriter(..., binary=True).open(append=True, ...)` accepting `bytes`-like objects.
   - Any other mode raises `ValueError`.
 - **`backup`** (`Optional[bool]`): Defaults to `None` (`True` on write, `False` on append). Passing `backup=True` with append raises `ValueError`.
-- **`show_progress`** (`bool`): Enables a `tqdm` progress bar on `PolyReader` tracking raw bytes read (batched at 64 KiB, exact flush on EOF/exit/`close()`, `total=None` when stream size is unknown or `Content-Encoding` transforms plain HTTP). Passing `show_progress=True` to `PolyWriter` or write/append modes raises `NotImplementedError`.
+- **`show_progress`** (`bool`): Enables a `tqdm` progress bar on `OpenAsReader` tracking raw bytes read (batched at 64 KiB, exact flush on EOF/exit/`close()`, `total=None` when stream size is unknown or `Content-Encoding` transforms plain HTTP). Passing `show_progress=True` to `OpenAsWriter` or write/append modes raises `NotImplementedError`.
 - **`compresslevel`** (`Optional[int]`): Forwarded to write/append codecs; ignored on read.
 - **`timeout`** (`Optional[float]`): Optional positive timeout in seconds forwarded to HTTP (`requests.Session.get`), SSH/SFTP (`timeout`, `banner_timeout`, `auth_timeout`), and FTP (`connect`). Non-positive or boolean values raise `ValueError`.
 
-Both `PolyReader` and `PolyWriter` expose `binary`, `closed`, `readable()`, `writable()`, `seekable()`, `encoding` (`'utf-8'` in text mode, `None` in binary mode), credential-redacted `__repr__()`, context management, and deterministic idempotent `close()`. Operations on closed handles raise `ValueError`.
+Both `OpenAsReader` and `OpenAsWriter` expose `binary`, `closed`, `readable()`, `writable()`, `seekable()`, `encoding` (`'utf-8'` in text mode, `None` in binary mode), credential-redacted `__repr__()`, context management, and deterministic idempotent `close()`. Operations on closed handles raise `ValueError`.
 
 ## 5. Command-Line Interface
 
-Available via `polyopen`, `python -m polyopen`, and `python -m polyopen.polyopen` (streams 64 KiB binary chunks, preserving exact bytes including CRLF and non-UTF-8 payloads, and counts `b'\n'`-delimited lines, including a final non-empty line without a trailing newline):
+Available via `openas`, `python -m openas`, and `python -m openas.openas` (streams 64 KiB binary chunks, preserving exact bytes including CRLF and non-UTF-8 payloads, and counts `b'\n'`-delimited lines, including a final non-empty line without a trailing newline):
 
 - `--read` (`-r`): Requires at least one positional file; reads sequentially in 64 KiB binary chunks and prints line count, exact byte size (`B` through `YB`), throughput, and elapsed time.
 - `--write` (`-w`): Pre-validates destination guards, opens the source and all destinations in binary mode inside `contextlib.ExitStack`, reads the source once in 64 KiB chunks, broadcasts exact bytes synchronously to all destinations (moving existing destinations to sequential `.bu` backups), prints redacted status/summary lines, and closes all handles on error.
 - `--input-file` (`-i`): Source file for `--write` mode (all positional arguments become destinations). Rejected via `parser.error` if combined with `--read` or without at least one destination.
-- `--version`: Prints `polyopen <version>` and exits 0.
+- `--version`: Prints `openas <version>` and exits 0.
 
 ## 6. Edge Cases and Boundary Conditions
 
-1. **Append and Backup Conflict:** `polyopen(path, 'a', backup=True)`, `polyopen(path, 'ab', backup=True)`, and `PolyWriter(path).open(append=True, backup=True)` raise `ValueError`.
+1. **Append and Backup Conflict:** `openas(path, 'a', backup=True)`, `openas(path, 'ab', backup=True)`, and `OpenAsWriter(path).open(append=True, backup=True)` raise `ValueError`.
 2. **Local Backup Safety:** Existing local directories raise `IsADirectoryError` rather than being renamed to `.001.bu`. Broken symlinks are detected via `os.path.lexists` and never silently overwritten on rename fallback. Local sequential backups are intended for non-concurrent writers; `os.link`/`os.unlink` prevents overwrite of existing `.bu` slots on POSIX filesystems supporting hard links.
 3. **Remote Backup Semantics:** SFTP and FTP `.bu` backups also reject existing remote directories with `IsADirectoryError` without calling `rename()`, and close acquired transport handles on error. SFTP retries `rename()` collisions up to 5 times across free slots. FTP rename atomicity depends on the remote FTP server; additionally, `ftputil.file.FTPFile.close()` ignores FTP `426`/`450`/`451` transfer-abort responses.
 4. **Pre-Validation Ordering:** `compresslevel` validation and optional codec imports execute before any `.bu` backup move so invalid arguments do not displace existing files.

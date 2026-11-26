@@ -70,7 +70,7 @@ scratch/
 *.swp
 *.swo
 
-# polyopen automatic backup files
+# openas automatic backup files
 *.bu
 
 # Credentials and keys
