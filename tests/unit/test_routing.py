@@ -2434,3 +2434,78 @@ def test_zstd_close_does_not_double_close_failing_raw_handle_on_ftp_and_sftp():
         assert raw_sw.close_calls == 1
         assert sftp.close.call_count == 1
         assert client.close.call_count == 1
+
+
+def test_sftp_append_encoding_key_filename_ftp_read_timeout_and_remote_textiowrapper(tmp_path):
+    """S7-X9: SFTP append forwards encoding/key_filename, FTP read forwards timeout, and HTTP/SFTP compose with TextIOWrapper."""
+    key_path = tmp_path / "deploy_ed25519"
+
+    # 1. SFTP append ('a') with encoding='latin-1' and key_filename
+    with patch("paramiko.SSHClient") as mock_ssh:
+        client = MagicMock()
+        sftp = MagicMock()
+        buf = _InspectableBytesIO()
+        client.open_sftp.return_value = sftp
+        sftp.file.return_value = buf
+        mock_ssh.return_value = client
+
+        with openas(
+            "sftp://user@host/dir/log.txt",
+            "a",
+            encoding="latin-1",
+            newline="\n",
+            key_filename=key_path,
+        ) as w:
+            w.write("café\n")
+
+        assert client.connect.call_args.kwargs["key_filename"] == str(key_path)
+        sftp.file.assert_called_once_with("/dir/log.txt", "ab")
+        assert buf.saved_bytes == "café\n".encode("latin-1")
+
+    # 2. FTP read forwards timeout=15.0 to ftputil.FTPHost
+    with patch("ftputil.FTPHost") as mock_ftp:
+        host = MagicMock()
+        raw_ftp = _StrictFTPFileProxy(b"ftp timeout line\n")
+        host.open.return_value = raw_ftp
+        mock_ftp.return_value = host
+
+        with openas("ftp://u:p@host/dir/in.txt", "r", timeout=15.0) as r:
+            assert r.read() == "ftp timeout line\n"
+
+        assert mock_ftp.call_args.kwargs["timeout"] == 15.0
+        assert raw_ftp.closed is True
+
+    # 3. io.TextIOWrapper composition over remote binary SFTP and HTTP readers
+    sample_text = "remote wrap café\nsecond line\n"
+    sample_gz = gzip.compress(sample_text.encode("utf-8"))
+
+    with patch("paramiko.SSHClient") as mock_ssh:
+        client = MagicMock()
+        sftp = MagicMock()
+        sftp_file = io.BytesIO(sample_gz)
+        client.open_sftp.return_value = sftp
+        sftp.file.return_value = sftp_file
+        mock_ssh.return_value = client
+
+        with openas("sftp://user@host/dir/data.gz", "rb") as raw_sftp:
+            wrapper = io.TextIOWrapper(raw_sftp, encoding="utf-8", newline="")
+            try:
+                assert wrapper.read() == sample_text
+            finally:
+                wrapper.close()
+        assert raw_sftp.closed is True
+
+    with patch("requests.Session.get") as mock_get:
+        resp = MagicMock()
+        resp.headers = {"Content-Length": str(len(sample_gz))}
+        resp.raw = io.BytesIO(sample_gz)
+        mock_get.return_value = resp
+
+        with openas("https://example.com/data.gz", "rb") as raw_http:
+            wrapper = io.TextIOWrapper(raw_http, encoding="utf-8", newline="")
+            try:
+                assert wrapper.read() == sample_text
+            finally:
+                wrapper.close()
+        assert raw_http.closed is True
+        assert resp.close.call_count == 1

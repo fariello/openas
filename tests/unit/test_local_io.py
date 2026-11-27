@@ -2336,3 +2336,140 @@ def test_typing_get_type_hints_resolves_public_and_helper_signatures():
     assert "headers" in typing.get_type_hints(openas)
     assert "key_filename" in typing.get_type_hints(OpenAsReader.__init__)
     assert "key_filename" in typing.get_type_hints(OpenAsWriter.__init__)
+
+
+def test_text_write_errors_newlines_valid_local_key_filename_and_textiowrapper_bz2_xz(tmp_path):
+    """S7-X9: Cover errors='replace'/'ignore' writes, newline='\\r'/'\\r\\n', local key_filename, and TextIOWrapper over .bz2/.xz."""
+    import io as _io
+
+    # 1. errors='replace' and errors='ignore' on text writes across plain and compressed codecs
+    for ext in (".txt", ".gz", ".zst"):
+        fp_rep = tmp_path / f"err_replace{ext}"
+        with openas(fp_rep, "w", backup=False, encoding="ascii", errors="replace", newline="\n") as w:
+            w.write("café\n")
+        with openas(fp_rep, "r", encoding="ascii", newline="") as r:
+            assert r.read() == "caf?\n"
+
+        fp_ign = tmp_path / f"err_ignore{ext}"
+        with openas(fp_ign, "w", backup=False, encoding="ascii", errors="ignore", newline="\n") as w:
+            w.write("café\n")
+        with openas(fp_ign, "r", encoding="ascii", newline="") as r:
+            assert r.read() == "caf\n"
+
+    # 2. Explicit newline='\r' and newline='\r\n' on writes and reads
+    for ext in (".txt", ".gz", ".zst"):
+        for nl, expected_raw in (("\r", b"a\rb\r"), ("\r\n", b"a\r\nb\r\n")):
+            fp_nl = tmp_path / f"nl_{len(nl)}{ext}"
+            with openas(fp_nl, "w", backup=False, newline=nl) as w:
+                w.write("a\nb\n")
+            with openas(fp_nl, "rb") as rb:
+                assert rb.read() == expected_raw
+            with openas(fp_nl, "r", newline=nl) as rt:
+                assert rt.readlines() == [f"a{nl}", f"b{nl}"]
+
+    # 3. Valid key_filename is ignored on local read and write targets
+    local_fp = tmp_path / "local_with_key.txt"
+    fake_key = tmp_path / "nonexistent_deploy_key"
+    with openas(local_fp, "w", backup=False, key_filename=fake_key) as w:
+        w.write("local ok\n")
+    with openas(local_fp, "r", key_filename=[fake_key]) as r:
+        assert r.read() == "local ok\n"
+
+    # 4. io.TextIOWrapper composition over binary .bz2 and .xz readers
+    sample_text = "line 1 café\nline 2 日本語\n"
+    for ext in (".bz2", ".xz"):
+        fp_comp = tmp_path / f"wrap{ext}"
+        with openas(fp_comp, "w", backup=False, newline="\n") as w:
+            w.write(sample_text)
+        with openas(fp_comp, "rb") as raw_reader:
+            wrapper = _io.TextIOWrapper(raw_reader, encoding="utf-8", newline="")
+            try:
+                assert wrapper.read() == sample_text
+            finally:
+                wrapper.close()
+        assert raw_reader.closed is True
+
+
+def test_zstd_frame_validator_read1_multibyte_fcs_and_zero_length_skippable(tmp_path):
+    """S7-X9: _ZstdFrameValidatingStream handles read1(), 2/4/8-byte FCS headers, and 0-byte skippable frames."""
+    import io
+    import struct
+    from openas.openas import _ZstdFrameValidatingStream
+
+    # 1. Zero-length skippable frame followed by a real zstd frame
+    zero_skip = struct.pack("<II", 0x184D2A50, 0)
+    real_frame = zstd.ZstdCompressor().compress(b"after-zero-skippable\n")
+    fp_skip = tmp_path / "zero_skip.zst"
+    fp_skip.write_bytes(zero_skip + real_frame)
+    with openas(fp_skip, "rb") as r:
+        assert r.read() == b"after-zero-skippable\n"
+
+    # 2. 2-byte FCS (~300B) and 4-byte FCS (~70KiB) frames
+    for size in (300, 70000):
+        payload = (b"fcs-data-" * ((size // 9) + 1))[:size]
+        frame = zstd.ZstdCompressor(write_content_size=True).compress(payload)
+        fp_fcs = tmp_path / f"fcs_{size}.zst"
+        fp_fcs.write_bytes(frame)
+        with openas(fp_fcs, "rb") as r:
+            assert r.read() == payload
+
+    # 3. Hand-crafted RFC 8878 8-byte FCS valid raw-block frame (magic + FHD=0xC0 + win=0x00 + 8B FCS + 3B raw block + b"hi")
+    fcs8_frame = (
+        b"\x28\xb5\x2f\xfd"
+        + b"\xc0\x00"
+        + struct.pack("<Q", 2)
+        + struct.pack("<I", (2 << 3) | 1)[:3]
+        + b"hi"
+    )
+    fp_fcs8 = tmp_path / "fcs8.zst"
+    fp_fcs8.write_bytes(fcs8_frame)
+    with openas(fp_fcs8, "rb") as r:
+        assert r.read() == b"hi"
+
+    # 4. Direct read1() through _ZstdFrameValidatingStream (both valid and truncated)
+    valid_stream = _ZstdFrameValidatingStream(io.BytesIO(fcs8_frame))
+    collected = bytearray()
+    while True:
+        chunk = valid_stream.read1(5)
+        if not chunk:
+            break
+        collected.extend(chunk)
+    assert bytes(collected) == fcs8_frame
+
+    trunc_stream = _ZstdFrameValidatingStream(io.BytesIO(fcs8_frame[:-1]))
+    with pytest.raises(EOFError):
+        while trunc_stream.read1(5):
+            pass
+
+
+def test_openas_writer_close_dual_error_precedence(tmp_path):
+    """S7-X9: OpenAsWriter.close() preserves primary fh.close() error when progress flush and raw close also fail."""
+    fp = tmp_path / "dual_err.gz"
+    writer = OpenAsWriter(fp, show_progress=True).open(backup=False)
+    orig_fh = writer._fh
+    orig_raw = writer._raw_fh
+    pbar = writer._progress
+    assert orig_fh is not None and orig_raw is not None and pbar is not None
+
+    writer.write("payload\n")
+    orig_fh.close()
+
+    failing_fh = MagicMock()
+    failing_fh.closed = False
+    failing_fh.close.side_effect = OSError("primary fh close error")
+    writer._fh = failing_fh
+
+    writer._counting_stream._on_progress = MagicMock(side_effect=RuntimeError("secondary flush error"))
+
+    failing_sibling = MagicMock()
+    failing_sibling.closed = False
+    failing_sibling.close.side_effect = OSError("tertiary raw close error")
+    writer._ssh_client = failing_sibling
+
+    with pytest.raises(OSError, match="primary fh close error"):
+        writer.close()
+
+    assert orig_raw.closed is True
+    assert failing_sibling.close.call_count == 1
+    assert writer.closed is True
+    assert writer._ssh_client is None

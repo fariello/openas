@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Reproducible performance benchmark suite for openas.
 
 Measures nine workloads using only the Python standard library and openas
@@ -10,7 +9,7 @@ dependencies:
   4. Compression time and peak RSS for .zst and .xz writes vs idle child
   5. HTTP read throughput from a local 127.0.0.1 ephemeral-port server
   6. Local backup rotation latency with 500 existing .bu files
-  7. CLI 3-target broadcast time via `python3 -m openas.openas -w`
+  7. CLI 3-target broadcast time via `python3 -m openas -w`
   8. 200,000-line binary ('rb') read throughput across .txt, .gz, .bz2, .xz, .zst
   9. 200,000-line OpenAsReader.readlines() throughput vs native fh.readlines()
 
@@ -416,7 +415,7 @@ def bench_backup_rotation(tmpdir: Path) -> None:
 
 
 def bench_cli_broadcast(tmpdir: Path, env: dict) -> None:
-    """Workload 7: CLI 3-target broadcast via `python3 -m openas.openas -w`."""
+    """Workload 7: CLI 3-target broadcast via `python3 -m openas -w`."""
     src_path = tmpdir / "cli_src.txt.gz"
     payload = "".join(
         f"cli-line-{i:06d} 0123456789abcdef0123456789abcdef\n"
@@ -438,7 +437,7 @@ def bench_cli_broadcast(tmpdir: Path, env: dict) -> None:
             [
                 sys.executable,
                 "-m",
-                "openas.openas",
+                "openas",
                 "-w",
                 str(src_path),
                 *(str(d) for d in dests),

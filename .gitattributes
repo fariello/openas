@@ -1,0 +1,5 @@
+tests/fixtures/gold.txt text eol=lf
+*.gz binary
+*.bz2 binary
+*.xz binary
+*.zst binary

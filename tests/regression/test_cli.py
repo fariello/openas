@@ -22,7 +22,7 @@ def _is_inside(directory, path):
 
 def run_cli(*args):
     """Utility to spawn subprocess commands targeting openas module structurally."""
-    cmd = [sys.executable, "-m", "openas.openas"] + list(args)
+    cmd = [sys.executable, "-m", "openas"] + list(args)
     result = subprocess.run(cmd, capture_output=True, text=True, env=_cli_env())
     return result
 
@@ -70,8 +70,9 @@ def test_cli_read_execution(tmp_path):
     result = run_cli("--read", target)
     
     assert result.returncode == 0
-    # main() prints the file stats
+    # main() prints the file stats with zero runpy RuntimeWarning on stderr
     assert "FINISHED Reading." in result.stdout
+    assert "RuntimeWarning" not in result.stderr
 
 def test_cli_write_execution(tmp_path):
     source = str(tmp_path / "mock.txt")
@@ -80,10 +81,11 @@ def test_cli_write_execution(tmp_path):
 
     target = str(tmp_path / "write_mock.txt")
     
-    cmd = [sys.executable, "-m", "openas.openas", "--write", source, target]
+    cmd = [sys.executable, "-m", "openas", "--write", source, target]
     result = subprocess.run(cmd, text=True, capture_output=True, env=_cli_env())
     
     assert result.returncode == 0
+    assert "RuntimeWarning" not in result.stderr
     assert os.path.exists(target)
     
     with open(target, 'r', encoding='utf-8') as f:
@@ -100,7 +102,7 @@ def test_cli_input_file_flag_utf8_bytes_and_errors(tmp_path):
     source.write_bytes(content.encode("utf-8"))
 
     res_ok = subprocess.run(
-        [sys.executable, "-m", "openas.openas", "--write", "-i", str(source), str(target)],
+        [sys.executable, "-m", "openas", "--write", "-i", str(source), str(target)],
         capture_output=True,
         text=True,
         env=_cli_env(),
@@ -110,7 +112,7 @@ def test_cli_input_file_flag_utf8_bytes_and_errors(tmp_path):
     assert f"{expected_bytes:.1f}B" in res_ok.stdout
 
     res_read = subprocess.run(
-        [sys.executable, "-m", "openas.openas", "--read", str(source)],
+        [sys.executable, "-m", "openas", "--read", str(source)],
         capture_output=True,
         text=True,
         env=_cli_env(),
@@ -119,7 +121,7 @@ def test_cli_input_file_flag_utf8_bytes_and_errors(tmp_path):
     assert f"{expected_bytes:.1f}B" in res_read.stdout
 
     res_missing_dst = subprocess.run(
-        [sys.executable, "-m", "openas.openas", "--write", "-i", str(source)],
+        [sys.executable, "-m", "openas", "--write", "-i", str(source)],
         capture_output=True,
         text=True,
         env=_cli_env(),
@@ -128,7 +130,7 @@ def test_cli_input_file_flag_utf8_bytes_and_errors(tmp_path):
     assert "destination" in res_missing_dst.stderr.lower()
 
     res_read_i = subprocess.run(
-        [sys.executable, "-m", "openas.openas", "--read", "-i", str(source)],
+        [sys.executable, "-m", "openas", "--read", "-i", str(source)],
         capture_output=True,
         text=True,
         env=_cli_env(),
@@ -209,7 +211,7 @@ def test_cli_write_broadcast_single_read_identical_outputs_and_messages(tmp_path
         [
             sys.executable,
             "-m",
-            "openas.openas",
+            "openas",
             "--write",
             "-i",
             str(src),
@@ -1304,3 +1306,113 @@ def test_cli_operational_urllib3_and_http_client_errors_redacted(monkeypatch, ca
         assert "pw456" not in err
         assert "k2" not in err
         assert "Traceback (most recent call last):" not in err
+
+
+def test_cli_observable_compresslevel_timeout_progress_and_ipv6_multi_url_redaction(tmp_path):
+    """S7-X8 & S7-X9: Verify observable -c size delta, real HTTP --timeout expiry, --progress stderr, and multi-URL/IPv6 redaction."""
+    import http.server
+    import importlib
+    import threading
+    import time
+    from openas import OpenAsReader
+
+    # 1. Observable -c 0 vs -c 9 .gz size difference
+    payload = b"highly-compressible-pattern-0123456789abcdef\n" * 1000
+    src = tmp_path / "compressible.txt"
+    src.write_bytes(payload)
+    gz_store = tmp_path / "level0.gz"
+    gz_max = tmp_path / "level9.gz"
+
+    res_c0 = subprocess.run(
+        [sys.executable, "-m", "openas", "--write", "-c", "0", str(src), str(gz_store)],
+        capture_output=True,
+        text=True,
+        env=_cli_env(),
+    )
+    res_c9 = subprocess.run(
+        [sys.executable, "-m", "openas", "--write", "-c", "9", str(src), str(gz_max)],
+        capture_output=True,
+        text=True,
+        env=_cli_env(),
+    )
+    assert res_c0.returncode == 0, res_c0.stderr
+    assert res_c9.returncode == 0, res_c9.stderr
+    assert gz_store.stat().st_size > gz_max.stat().st_size * 5
+    for out_path in (gz_store, gz_max):
+        with OpenAsReader(out_path, binary=True) as r:
+            assert r.read() == payload
+
+    # 2. Observable --progress renders progress output on stderr vs empty stderr without --progress
+    res_no_prog = subprocess.run(
+        [sys.executable, "-m", "openas", "--read", str(gz_max)],
+        capture_output=True,
+        text=True,
+        env=_cli_env(),
+    )
+    res_prog = subprocess.run(
+        [sys.executable, "-m", "openas", "--read", "--progress", str(gz_max)],
+        capture_output=True,
+        text=True,
+        env=_cli_env(),
+    )
+    assert res_no_prog.returncode == 0
+    assert res_no_prog.stderr == ""
+    assert res_prog.returncode == 0
+    assert res_prog.stderr.strip() != ""
+    assert "B" in res_prog.stderr
+
+    # 3. Observable delayed loopback HTTP --timeout 0.05 fails cleanly with exit 1 and redacted query token
+    stop_event = threading.Event()
+
+    class SlowHandler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            stop_event.wait(timeout=1.0)
+            try:
+                self.send_response(200)
+                self.send_header("Content-Length", "3")
+                self.end_headers()
+                self.wfile.write(b"ok\n")
+            except OSError:
+                pass
+
+        def log_message(self, format, *args):  # noqa: A002
+            return
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), SlowHandler)
+    port = server.server_address[1]
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        slow_url = f"http://127.0.0.1:{port}/slow.txt?api_key=super_secret_timeout_token"
+        t0 = time.monotonic()
+        res_to = subprocess.run(
+            [sys.executable, "-m", "openas", "--read", "--timeout", "0.05", slow_url],
+            capture_output=True,
+            text=True,
+            env=_cli_env(),
+        )
+        elapsed = time.monotonic() - t0
+        assert res_to.returncode == 1, res_to.stderr
+        assert "openas: error (" in res_to.stderr
+        assert "super_secret_timeout_token" not in res_to.stderr
+        assert "Traceback (most recent call last):" not in res_to.stderr
+        assert elapsed < 5.0
+    finally:
+        stop_event.set()
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    # 4. Multi-URL and bracketed IPv6 credential/query redaction in _redact_urls_in_text
+    mod = importlib.import_module("openas.openas")
+    msg = (
+        "Failed transfer from https://alice:pw1@[::1]:8443/in.gz?tok=t1 "
+        "to sftp://bob:pw2@[2001:db8::1]:2222/out.zst?sig=s2."
+    )
+    redacted = mod._redact_urls_in_text(msg)
+    assert "pw1" not in redacted
+    assert "pw2" not in redacted
+    assert "t1" not in redacted
+    assert "s2" not in redacted
+    assert "https://alice:***@[::1]:8443/in.gz?<redacted>" in redacted
+    assert "sftp://bob:***@[2001:db8::1]:2222/out.zst?<redacted>." in redacted

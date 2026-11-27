@@ -28,7 +28,7 @@ def test_append_backup_conflict(tmp_path):
     with pytest.raises(ValueError):
         OpenAsWriter(str(tmp_path / "data.zst")).open(append=True, backup=True)
 
-def test_writer_progress_exception(tmp_path):
+def test_writer_progress_succeeds(tmp_path):
     """va1pd2 E-01: openas(..., 'w', show_progress=True) now succeeds and tracks exact compressed bytes."""
     target = tmp_path / "testing.zst"
     with openas(str(target), 'w', show_progress=True) as w:
