@@ -3,7 +3,7 @@
 *[Return to Main README](README.md)*
 
 **Version:** 0.1.0
-**Last Updated:** 2026-11-25
+**Last Updated:** 2026-11-27
 
 ## 1. Purpose, Audience, and Scope
 
@@ -30,19 +30,19 @@
 ### 3.1 Transports
 
 - **Local (`file://` or plain path):** Read, write, and append in text and binary modes. `file://` URIs require an empty host or `localhost` (remote `file://` hosts raise `UnsupportedProtocolError`) and decode percent-encoded paths via `url2pathname`.
-- **FTP (`ftp://`):** Read and write in text and binary modes via `ftputil` (`FTPSessionWrapper`, default port 21, custom ports and optional `timeout` forwarded, credentials and paths percent-decoded). Append mode (`'a'`, `'at'`, `'ab'`) raises `UnsupportedProtocolError` before connecting.
-- **SSH / SFTP (`ssh://`, `sftp://`):** Read, write, and append in text and binary modes via `paramiko` (`load_system_host_keys()`, default `RejectPolicy`, default port 22, custom ports and optional `timeout` forwarded, credentials and paths percent-decoded). Reads cache `stat().st_size` once and, when `file_size > 0` and `readv` is available, stream through `_BoundedSFTPReadStream` in bounded 4 MiB sliding `readv()` windows split into `MAX_REQUEST_SIZE` sub-chunks with `max_concurrent_prefetch_requests=64` (falling back to single-argument `readv(sub_chunks)` on Paramiko `<3.3`, and falling back to sequential `sftp_file.read()` when `readv` is absent or `file_size` is unknown or `<= 0`). Writes open binary SFTP handles with `set_pipelined(True)` and wrap uncompressed streams in `_BinaryStreamAdapter` (plus `io.TextIOWrapper` in text mode).
+- **FTP (`ftp://`):** Read and write in text and binary modes via `ftputil` (`FTPSessionWrapper`, default port 21, custom ports and optional `timeout` forwarded, credentials and paths percent-decoded). The percent-decoded URL path (`urlparse(url).path`) is passed directly to `ftputil.FTPHost.open()`, and omitted credentials fall back to anonymous FTP login. Append mode (`'a'`, `'at'`, `'ab'`) raises `UnsupportedProtocolError` before connecting.
+- **SSH / SFTP (`ssh://`, `sftp://`):** Read, write, and append in text and binary modes via `paramiko` (`load_system_host_keys()`, default `RejectPolicy`, default port 22, custom ports and optional `timeout` forwarded, credentials and paths percent-decoded). The percent-decoded URL path (`urlparse(url).path`) is passed verbatim as an absolute remote path with no `~/` expansion; `~/.ssh/config` is not parsed; an omitted SSH username defaults to the local OS user authenticating via the SSH agent or `~/.ssh/id_*` keys. Reads cache `stat().st_size` once and, when `file_size > 0` and `readv` is available, stream through `_BoundedSFTPReadStream` in bounded 4 MiB sliding `readv()` windows split into `MAX_REQUEST_SIZE` sub-chunks with `max_concurrent_prefetch_requests=64` (falling back to single-argument `readv(sub_chunks)` on Paramiko `<3.3`, and falling back to sequential `sftp_file.read()` when `readv` is absent or `file_size` is unknown or `<= 0`). Writes open binary SFTP handles with `set_pipelined(True)` and wrap uncompressed streams in `_BinaryStreamAdapter` (plus `io.TextIOWrapper` in text mode).
 - **HTTP / HTTPS (`http://`, `https://`):** Read-only streaming in text and binary modes via lock-initialized, thread-local, cookie-free `requests.Session` reuse (`DefaultCookiePolicy(allowed_domains=[])`) with optional `timeout` forwarding. Compressed extensions send `Accept-Encoding: identity`; uncompressed responses set `response.raw.decode_content = True`. Write/append raises `ReadOnlyProtocolError`.
 - **Rejected schemes:** Cloud schemes (`s3://`, `gs://`, `az://`, `hdfs://`) and unrecognized multi-letter `scheme://` URLs raise `UnsupportedProtocolError`.
 
 ### 3.2 Compression Formats
 
-All supported write/append codecs accept optional `compresslevel: Optional[int] = None` (boolean values raise `TypeError`; out-of-range integers raise `ValueError` before any backup is created):
+All supported write/append codecs accept optional `compresslevel: Optional[int] = None` (boolean or non-integer values raise `TypeError`, including on plain files; out-of-range integers raise `ValueError` before any backup is created):
 
 1. `.bz2` (`bz2`; range 1..9; default 9)
 2. `.gz` (`gzip`; range 0..9; default 9)
 3. `.xz` (`lzma`; preset 0..9, optionally OR'd with `lzma.PRESET_EXTREME`; default 6)
-4. `.zst` (`zstandard`; default level 3; multi-frame reads via `read_across_frames=True`)
+4. `.zst` (`zstandard`; integers up to `zstandard.MAX_COMPRESSION_LEVEL` (`22`), including negative fast levels; default level 3; multi-frame reads via `read_across_frames=True`; truncated `.zst` streams raise `EOFError` across local, HTTP, FTP, and SFTP reads via zero-copy RFC 8878 frame validation in `_ZstdFrameValidatingStream`)
 
 **Container Archives Rejected:** `.zip`, `.tar`, `.tgz`, `.rar`, `.7z`, `.tar.gz`, `.tar.bz2`, `.tar.xz`, `.tar.zst`, `.tar.lzma`, `.tbz`, `.tbz2`, `.txz`, `.tzst`, `.tlz`, `.gz.tar`, `.bz2.tar`, `.xz.tar`, and `.zst.tar` raise `UnsupportedArchiveError`.
 
@@ -59,6 +59,7 @@ All supported write/append codecs accept optional `compresslevel: Optional[int] 
   - `'a'`, `'at'`: `OpenAsWriter(..., binary=False).open(append=True, ...)` accepting UTF-8 `str`.
   - `'ab'`: `OpenAsWriter(..., binary=True).open(append=True, ...)` accepting `bytes`-like objects.
   - Any other mode raises `ValueError`.
+  - Text modes (`'r'`, `'rt'`, `'w'`, `'wt'`, `'a'`, `'at'`) use Python's default `newline=None` across both local and remote streams: reads perform universal newline translation to `\n`, and writes translate `\n` to `os.linesep` (`\n` on POSIX, `\r\n` on Windows). Callers needing exact wire bytes or LF preservation across platforms should use binary modes (`'rb'`, `'wb'`, `'ab'`).
 - **`backup`** (`Optional[bool]`): Defaults to `None` (`True` on write, `False` on append). Passing `backup=True` with append raises `ValueError`.
 - **`show_progress`** (`bool`): Enables a `tqdm` progress bar on `OpenAsReader` tracking raw bytes read (batched at 64 KiB, exact flush on EOF/exit/`close()`, `total=None` when stream size is unknown or `Content-Encoding` transforms plain HTTP). Passing `show_progress=True` to `OpenAsWriter` or write/append modes raises `NotImplementedError`.
 - **`compresslevel`** (`Optional[int]`): Forwarded to write/append codecs; ignored on read.
@@ -70,7 +71,7 @@ Both `OpenAsReader` and `OpenAsWriter` expose `binary`, `closed`, `readable()`, 
 
 Available via `openas`, `python -m openas`, and `python -m openas.openas` (streams 64 KiB binary chunks, preserving exact bytes including CRLF and non-UTF-8 payloads, and counts `b'\n'`-delimited lines, including a final non-empty line without a trailing newline):
 
-- `--read` (`-r`): Requires at least one positional file; reads sequentially in 64 KiB binary chunks and prints line count, exact byte size (`B` through `YB`), throughput, and elapsed time.
+- `--read` (`-r`): Requires at least one positional file; reads sequentially in 64 KiB binary chunks and prints line count, 1-decimal base-1024 human-readable byte size (`B` through `YB`), throughput, and elapsed time.
 - `--write` (`-w`): Pre-validates destination guards, opens the source and all destinations in binary mode inside `contextlib.ExitStack`, reads the source once in 64 KiB chunks, broadcasts exact bytes synchronously to all destinations (moving existing destinations to sequential `.bu` backups), prints redacted status/summary lines, and closes all handles on error.
 - `--input-file` (`-i`): Source file for `--write` mode (all positional arguments become destinations). Rejected via `parser.error` if combined with `--read` or without at least one destination.
 - `--version`: Prints `openas <version>` and exits 0.
@@ -81,12 +82,12 @@ Available via `openas`, `python -m openas`, and `python -m openas.openas` (strea
 2. **Local Backup Safety:** Existing local directories raise `IsADirectoryError` rather than being renamed to `.001.bu`. Broken symlinks are detected via `os.path.lexists` and never silently overwritten on rename fallback. Local sequential backups are intended for non-concurrent writers; `os.link`/`os.unlink` prevents overwrite of existing `.bu` slots on POSIX filesystems supporting hard links.
 3. **Remote Backup Semantics:** SFTP and FTP `.bu` backups also reject existing remote directories with `IsADirectoryError` without calling `rename()`, and close acquired transport handles on error. SFTP retries `rename()` collisions up to 5 times across free slots. FTP rename atomicity depends on the remote FTP server; additionally, `ftputil.file.FTPFile.close()` ignores FTP `426`/`450`/`451` transfer-abort responses.
 4. **Pre-Validation Ordering:** `compresslevel` validation and optional codec imports execute before any `.bu` backup move so invalid arguments do not displace existing files.
-5. **Multi-Frame Zstandard and Large Lines:** Multi-frame concatenated `.zst` streams (`read_across_frames=True`) and lines exceeding 128 KiB work consistently in both text and binary modes across local, FTP, SFTP, and HTTP transports.
+5. **Multi-Frame Zstandard, Truncation Detection, and Large Lines:** Multi-frame concatenated `.zst` streams (`read_across_frames=True`) and lines exceeding 128 KiB work consistently in both text and binary modes across local, FTP, SFTP, and HTTP transports. Truncated `.zst` streams raise `EOFError` across all transports via zero-copy RFC 8878 frame-boundary validation (`_ZstdFrameValidatingStream`) instead of silently returning early EOF.
 
 ## 7. Security and Resource Boundaries
 
 1. **SSH Host-Key Verification:** `paramiko.SSHClient()` calls `load_system_host_keys()` and preserves Paramiko's default `RejectPolicy` (unknown host keys are rejected rather than auto-accepted to prevent Man-in-the-Middle attacks).
-2. **Credential Redaction:** URL passwords and query parameters are masked by `_redact_url()` in CLI stdout, `__repr__()`, and `UnsupportedArchiveError` messages. Inline URL passwords in shell commands remain visible to OS process tables; prefer SSH keys (`sftp://user@host/path`).
+2. **Credential Redaction:** URL passwords and query parameters are masked by `_redact_url()` in CLI stdout, `__repr__()`, and `UnsupportedArchiveError` messages. Inline URL passwords in shell commands remain visible to OS process tables; prefer SSH keys (`sftp://user@host/path/to/file`).
 3. **Archive Corruption Prevention:** Container archive extensions fail fast before opening streams for reading or writing.
 4. **Bounded SFTP Prefetch and Zstandard Window Boundaries (v0.1.0):**
    - SFTP reads stream in bounded 4 MiB sliding `readv()` windows (`<= 4 MiB` active prefetch buffer per stream, O(1) memory on multi-gigabyte files, early exit stops requesting further windows).

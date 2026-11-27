@@ -100,7 +100,7 @@ Pass remote URLs directly; `openas` detects `.gz`, `.bz2`, `.xz`, and `.zst` fro
 from openas import openas
 
 # Write over SSH/SFTP using SSH agent / ~/.ssh keys (preferred over inline passwords)
-with openas("sftp://user@hostname/data.csv.zst", "w", backup=True, timeout=30) as f:
+with openas("sftp://user@hostname/path/to/data.csv.zst", "w", backup=True, timeout=30) as f:
     f.write("id,name\n1,alice\n")
 
 # Stream a remote compressed HTTP file line-by-line
@@ -109,7 +109,9 @@ with openas("https://example.com/data.jsonl.gz", "r", timeout=30) as f:
         print(line.strip())
 ```
 
-> **Credential safety:** Prefer SSH agent or `~/.ssh` key authentication (`sftp://user@host/path`) over inline passwords (`user:pass@host`). Avoid putting plaintext passwords on command lines where they can appear in shell history or process listings. `openas` redacts URL passwords and query strings in CLI output, `__repr__()`, and archive error messages.
+> **Credential safety:** Prefer SSH agent or `~/.ssh` key authentication (`sftp://user@host/path/to/file`) over inline passwords (`user:pass@host`). Avoid putting plaintext passwords on command lines where they can appear in shell history or process listings. `openas` redacts URL passwords and query strings in CLI output, `__repr__()`, and archive error messages.
+
+> **Remote URL paths, authentication, and environment variables:** `sftp://` and `ssh://` URLs pass the URL path verbatim as an absolute remote path (for example `/path/to/data.csv.zst`) with no `~/` expansion and do not parse `~/.ssh/config`. Omitting the SSH username defaults to the local OS user authenticating via the SSH agent or `~/.ssh/id_*` keys; omitting FTP credentials logs in anonymously. `openas` defines no custom environment variables, while HTTP/HTTPS inherits `requests.Session` `trust_env=True` defaults (`HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY`, `REQUESTS_CA_BUNDLE`, `CURL_CA_BUNDLE`, and `~/.netrc`).
 
 ## Command-Line Interface
 
@@ -124,7 +126,7 @@ python -m openas --version
 python -m openas --read path/to/large.zst
 
 # Single-pass broadcast (reads source once and writes to one or more destinations)
-python -m openas --write https://example.com/data.csv.gz local_copy.txt sftp://user@host/dest.csv.zst
+python -m openas --write https://example.com/data.csv.gz local_copy.txt sftp://user@host/path/to/dest.csv.zst
 ```
 
 ## Development and Benchmarks
@@ -158,7 +160,7 @@ python benchmarks/bench_openas.py
 ## Troubleshooting and Tips
 
 - **SSH `known_hosts` / `RejectPolicy` errors:** `openas` loads system host keys (`load_system_host_keys()`) and enforces Paramiko's `RejectPolicy` to protect against Man-in-the-Middle attacks. If a connection fails because the host key is unknown, verify the server's fingerprint out of band and add the verified host key to `~/.ssh/known_hosts` (for example via an interactive `ssh` check or `ssh-keyscan` after verifying the fingerprint). Do not disable host-key verification.
-- **Special characters in URL credentials or paths:** Percent-encode reserved characters (`@` as `%40`, `:` as `%3A`, `/` as `%2F`, space as `%20`, `%` as `%25`) in `ftp://`, `ssh://`, and `sftp://` URLs (for example `sftp://user@host/logs%202026/data.gz`, or if inline credentials cannot be avoided, `ftp://user:p%40ss@host/data.txt`). `openas` decodes FTP/SSH/SFTP credentials and paths automatically via `urllib.parse.unquote()`. Prefer SSH agent or `~/.ssh` key authentication over inline passwords.
+- **Special characters in URL credentials or paths:** Percent-encode reserved characters (`@` as `%40`, `:` as `%3A`, `/` as `%2F`, space as `%20`, `%` as `%25`) in `ftp://`, `ssh://`, and `sftp://` URLs (for example `sftp://user@host/path/to/logs%202026/data.gz`, or if inline credentials cannot be avoided, `ftp://user:p%40ss@host/path/to/data.txt`). `openas` decodes FTP/SSH/SFTP credentials and paths automatically via `urllib.parse.unquote()`. Prefer SSH agent or `~/.ssh` key authentication over inline passwords.
 - **`UnsupportedArchiveError` on `.zip` or `.tar.*` files:** `openas` handles single-file streams and rejects multi-file container archives to prevent corrupting archive headers or directory tables. Use Python's `zipfile` module for `.zip` archives and `tarfile` for `.tar` and `.tar.*` archives.
 - **Streaming multi-GB `.zst` and `.gz` corpora in `'rb'` mode:** When downstream parsers accept `bytes` directly (for example JSON or byte-level log parsers), open large compressed files with `'rb'` instead of `'r'`. Binary mode avoids per-line UTF-8 decoding overhead and uses C-level `io.BufferedReader` line scanning; benchmark your own environment with `benchmarks/bench_openas.py`.
 

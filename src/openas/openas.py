@@ -954,8 +954,8 @@ def _ftp_session_wrapper_class():
 
             Methods
             -------
-            __init__(host, userid, password, port=21):
-                Initializes the FTP connection and logs in with the provided credentials.
+            __init__(host, userid, password, port=21, timeout=None):
+                Initializes the FTP connection (with optional socket timeout) and logs in with the provided credentials.
             """
 
             def __init__(
@@ -2497,6 +2497,10 @@ def openas(
         If writing or appending to `http://` or `https://`.
     UnsupportedProtocolError
         If invoking an unsupported scheme (e.g., `s3://`, `gs://`, `az://`, `hdfs://`) or FTP append.
+    IsADirectoryError
+        If attempting a local, SFTP, or FTP `.bu` backup on an existing directory when writing.
+    EOFError
+        If reading a truncated `.zst` stream across local, HTTP, FTP, or SFTP transports.
     ValueError
         If `mode` is unsupported, `backup=True` is combined with append, or `timeout` is non-positive.
     NotImplementedError
@@ -2573,7 +2577,7 @@ def main():
             "Examples:\n"
             "  python -m openas --read data.txt.gz https://example.com/log.zst\n"
             "  python -m openas --write source.gz copy.txt backup.bz2\n"
-            "  python -m openas --write -i source.gz copy.txt sftp://user@host/dest.zst"
+            "  python -m openas --write -i source.gz copy.txt sftp://user@host/path/to/dest.zst"
         ),
     )
 

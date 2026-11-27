@@ -58,8 +58,20 @@ This document records the rationale and trade-offs behind load-bearing design ch
 - **Decision:** Keep `max_window_size=2**31` in v0.1.0 to preserve compatibility with `--long=31` archives, document the untrusted-input caveat in `FUNCTIONAL_SPEC.md`, and defer making `max_window_size` configurable to v0.2.
 - **Consequences:** Existing large-window archives keep working; callers handling untrusted `.zst` streams are explicitly informed of the memory boundary.
 
-## ADR-010: Minimum Python 3.9 to match PEP 639 build backend (2026-11-25)
+## ADR-010: Minimum Python 3.9 to match PEP 639 build backend (2026-11-25, updated 2026-11-27)
 
-- **Context:** `pyproject.toml` uses PEP 639 `license` and `license-files` metadata requiring `setuptools>=77.0.0`, which dropped Python 3.8 support in `75.4.0`. Python 3.8 is also end-of-life.
-- **Decision:** Set `requires-python = ">=3.9"` in `pyproject.toml`, test Python 3.9 through 3.14 on `ubuntu-latest` plus Python 3.12 on `macos-latest` and `windows-latest` in CI, and run the built-wheel smoke test from a temporary directory outside `src/`.
-- **Consequences:** Packaging metadata matches the actual build backend and supported Python versions across Linux, macOS, and Windows.
+- **Context:** `pyproject.toml` uses PEP 639 `license` and `license-files` metadata requiring `setuptools>=77.0.0`, which dropped Python 3.8 support in `75.4.0`. Python 3.8 is also end-of-life. In GitHub Actions, `ubuntu-latest` lacks prebuilt Python 3.9 binaries in `actions/setup-python@v5`.
+- **Decision:** Set `requires-python = ">=3.9"` in `pyproject.toml`, run Python 3.10 through 3.14 on `ubuntu-latest` and pin Python 3.9 to `ubuntu-24.04` (plus Python 3.12 on `macos-latest` and `windows-latest`) in `.github/workflows/tests.yml`, and run the built-wheel smoke test from a temporary directory outside `src/`.
+- **Consequences:** Packaging metadata matches the actual build backend and supported Python versions across Linux, macOS, and Windows while keeping Python 3.9 CI reliable.
+
+## ADR-011: Zero-copy RFC 8878 frame validator for truncated `.zst` detection (2026-11-25)
+
+- **Context:** `python-zstandard`'s `ZstdDecompressor.stream_reader()` silently returns EOF when the underlying compressed byte stream ends mid-frame instead of raising an error, hiding truncated files and dropped network connections. Switching to `zstandard.ZstdDecompressor().decompressobj().decompress()` is not safe for streaming because `decompress()` does not accept `max_length` in `python-zstandard 0.25.0`, which would buffer unbounded decompressed output and break the O(1) memory invariant.
+- **Decision:** Wrap the raw (or `_CountingByteStream`-wrapped) binary stream in `_ZstdFrameValidatingStream` before `ZstdDecompressor.stream_reader()` inside `OpenAsReader._open_zst_reader()`. This lightweight state machine tracks RFC 8878 Zstandard and skippable frame and block wire lengths over `memoryview` slices without copying payload bytes, defers unknown magic numbers and reserved block types to `zstandard` (`ZstdError`), and raises `EOFError` if EOF occurs before a frame completes. Traverse `_ZstdFrameValidatingStream` in `_record_raw_close_attempted()` so `_close_handles()` deduplicates underlying raw handles cleanly.
+- **Consequences:** Truncated `.zst` streams fail fast with `EOFError` across local, HTTP, FTP, and SFTP transports while preserving O(1) streaming memory and `stream_reader()` throughput.
+
+## ADR-012: Cross-platform text newline contract (`newline=None` / `os.linesep`) (2026-11-25)
+
+- **Context:** Python text streams opened via `builtins.open()`, `gzip.open(..., 'rt'/'wt')`, `bz2.open(..., 'rt'/'wt')`, `lzma.open(..., 'rt'/'wt')`, and `io.TextIOWrapper(..., encoding='utf-8')` default to `newline=None`. On read, `newline=None` enables universal newline translation to `\n`; on write, it translates `\n` to `os.linesep` (`\n` on POSIX, `\r\n` on Windows) across both local and remote text streams.
+- **Decision:** Preserve Python's standard `newline=None` text semantics uniformly across all local and remote text modes (`'r'`, `'rt'`, `'w'`, `'wt'`, `'a'`, `'at'`) in v0.1.0 rather than diverging from `builtins.open()` or introducing a `newline` parameter before v0.1.0. Document the contract explicitly and recommend binary modes (`'rb'`, `'wb'`, `'ab'`) whenever exact wire bytes or LF (`\n`) preservation on Windows are required.
+- **Consequences:** Text-mode behavior stays consistent with `builtins.open()` across all codecs and transports, while callers with strict LF wire requirements have a direct binary-mode path. An explicit `newline` parameter may be evaluated for v0.2.
