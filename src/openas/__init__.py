@@ -1,5 +1,13 @@
-"""
-openas - Unified stream-level file I/O across local files, remote protocols, and compression formats.
+"""Unified stream-level file I/O across local files, remote protocols, and compression formats.
+
+Quick Start
+-----------
+>>> from openas import openas
+>>> with openas("data.gz", "w") as w:
+...     w.write("hello\\n")
+>>> with openas("data.gz", "r") as r:
+...     for line in r:
+...         print(line, end="")
 
 Exports `openas`, `OpenAsReader`, `OpenAsWriter`, custom exceptions (`OpenAsError`,
 `UnsupportedArchiveError`, `ReadOnlyProtocolError`, `UnsupportedProtocolError`),

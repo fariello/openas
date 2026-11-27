@@ -39,7 +39,7 @@ dev = [
 ]
 
 [project.scripts]
-openas = "openas.openas:main"
+openas = "openas.openas:_cli_main"
 
 [project.urls]
 Homepage = "https://github.com/fariello/openas"

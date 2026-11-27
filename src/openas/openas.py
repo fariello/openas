@@ -717,7 +717,7 @@ def _validate_timeout(timeout: Optional[float]) -> Optional[float]:
     if timeout is None:
         return None
     if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or timeout <= 0:
-        raise ValueError("timeout must be a positive number or None.")
+        raise ValueError(f"timeout must be a positive number (seconds) or None, got {timeout!r}.")
     return float(timeout)
 
 
@@ -769,7 +769,10 @@ def _resolve_target(filename: str):
         )
     if scheme in _SUPPORTED_SCHEMES:
         if not parsed.hostname:
-            raise ValueError(f"Missing hostname in {scheme}:// URL: {_redact_url(filename)}")
+            raise ValueError(
+                f"Missing hostname in {scheme}:// URL: {_redact_url(filename)} "
+                f"(expected '{scheme}://host/path')"
+            )
         return filename, parsed, scheme
     if len(scheme) > 1 and f"{scheme}://" in filename.lower():
         raise UnsupportedProtocolError(
@@ -1047,6 +1050,14 @@ class OpenAsReader:
         Standard file-like capability predicates.
     close() -> None
         Idempotently close all acquired stream and transport handles.
+
+    Examples
+    --------
+    >>> with OpenAsReader("data.gz", show_progress=True) as r:
+    ...     for line in r:
+    ...         process(line)
+    >>> with OpenAsReader("https://example.com/data.zst", binary=True, timeout=30) as r:
+    ...     raw = r.read()
     """
 
     @property
@@ -1842,6 +1853,13 @@ class OpenAsWriter:
         Standard file-like capability predicates.
     close() -> None
         Idempotently close all acquired stream and transport handles.
+
+    Examples
+    --------
+    >>> with OpenAsWriter("out.gz").open(append=False, backup=True, compresslevel=6) as w:
+    ...     w.write("hello\\n")
+    >>> with OpenAsWriter("out.gz").open(append=True, backup=False) as w:
+    ...     w.write("more\\n")
     """
 
     @property
@@ -1868,7 +1886,10 @@ class OpenAsWriter:
 
     def __repr__(self) -> str:
         state = "closed" if self.closed else "open"
-        mode = "wb" if self.binary else "w"
+        if self._append:
+            mode = "ab" if self.binary else "a"
+        else:
+            mode = "wb" if self.binary else "w"
         return f"OpenAsWriter({_redact_url(self.filename)!r}, mode={mode!r}, state={state!r})"
 
     def __init__(
@@ -1893,11 +1914,15 @@ class OpenAsWriter:
             If True, write raw `bytes`-like objects instead of UTF-8 `str` (default is False).
         """
         if show_progress:
-            raise NotImplementedError('Progress tracking is currently isolated to reader paths. Write implementations are deferred.')
+            raise NotImplementedError(
+                "show_progress=True is only supported for reading ('r', 'rt', 'rb' or OpenAsReader). "
+                "Pass show_progress=False (default) when writing or appending."
+            )
         self.filename = os.fsdecode(filename)
         self.show_progress = show_progress
         self.timeout = _validate_timeout(timeout)
         self.binary = bool(binary)
+        self._append = False
         self._fh = None
         self._raw_fh = None
         self._ftp = None
@@ -1964,7 +1989,8 @@ class OpenAsWriter:
         """
         if append:
             raise UnsupportedProtocolError(
-                "Protocol 'ftp' does not support append mode in openas (ftputil does not support FTP append)."
+                "Protocol 'ftp' does not support append mode in openas (ftputil does not support FTP append). "
+                "Use write mode ('w'/'wb') on ftp:// or append over sftp:// instead."
             )
         import ftputil
         port = 21 if parsed.port is None else parsed.port
@@ -2360,10 +2386,16 @@ class OpenAsWriter:
             )
 
         if append and backup:
-            raise ValueError("Cannot have both append and backup set to True.")
+            raise ValueError(
+                "Cannot set both append=True and backup=True. "
+                "Pass backup=False when appending (or use openas(path, 'a') / openas(path, 'ab'), which defaults backup=False)."
+            )
 
         if scheme in ('http', 'https'):
-            raise ReadOnlyProtocolError(f"Protocol '{parsed.scheme}' does not support write/append operations in openas.")
+            raise ReadOnlyProtocolError(
+                f"Protocol '{parsed.scheme}' does not support write/append operations in openas. "
+                "HTTP/HTTPS is read-only; write to a local path, ftp://, or sftp:// target instead."
+            )
 
         _validate_write_options(norm, compresslevel)
 
@@ -2378,6 +2410,7 @@ class OpenAsWriter:
             self.close()
             raise
 
+        self._append = bool(append)
         if type(self).write is OpenAsWriter.write:
             self.write = self._fh.write
 
@@ -2436,6 +2469,7 @@ class OpenAsWriter:
         ssh_client = self._ssh_client
         ftp = self._ftp
 
+        self._append = False
         self._fh = None
         self._raw_fh = None
         self._sftp_file = None
@@ -2517,7 +2551,10 @@ def openas(
     """
     filename = os.fsdecode(filename)
     if show_progress and mode in ('w', 'wt', 'wb', 'a', 'at', 'ab'):
-        raise NotImplementedError('Progress tracking is currently isolated to reader paths. Write implementations are deferred.')
+        raise NotImplementedError(
+            "show_progress=True is only supported for reading ('r', 'rt', 'rb' or OpenAsReader). "
+            "Pass show_progress=False (default) when writing or appending."
+        )
     if mode in ('r', 'rt', 'rb'):
         return OpenAsReader(filename, show_progress=show_progress, timeout=timeout, binary=(mode == 'rb')).open()
     elif mode in ('w', 'wt', 'wb'):
@@ -2575,9 +2612,12 @@ def main():
         ),
         epilog=(
             "Examples:\n"
-            "  python -m openas --read data.txt.gz https://example.com/log.zst\n"
-            "  python -m openas --write source.gz copy.txt backup.bz2\n"
-            "  python -m openas --write -i source.gz copy.txt sftp://user@host/path/to/dest.zst"
+            "  openas --read data.txt.gz https://example.com/log.zst\n"
+            "  openas --write source.gz copy.txt backup.bz2\n"
+            "  openas --write -i source.gz copy.txt sftp://user@host/abs/path/dest.zst\n\n"
+            "Notes:\n"
+            "  --write moves existing destination files to sequential .001.bu backups before overwriting.\n"
+            "  sftp://user@host/abs/path uses absolute remote paths and system SSH keys / ~/.ssh/known_hosts."
         ),
     )
 
@@ -2610,7 +2650,10 @@ def main():
         '--write',
         '-w',
         action='store_true',
-        help='Read one source stream in 64 KiB binary chunks and broadcast exact bytes to one or more destinations.',
+        help=(
+            'Read one source stream in 64 KiB binary chunks and broadcast exact bytes to one or more destinations '
+            '(moves existing destinations to sequential .001.bu backups before writing).'
+        ),
     )
     group.add_argument(
         '--read',
@@ -2625,9 +2668,9 @@ def main():
         if args.input_file is not None:
             parser.error("--input-file/-i is only valid with --write")
         if len(args.files) < 1:
-            parser.error("Read mode requires at least one file (e.g., 'python -m openas -r path/to/file.gz')")
+            parser.error("Read mode requires at least one file (e.g., 'openas -r path/to/file.gz')")
         for input_file in args.files:
-            print(f"TESTING reading {_redact_url(input_file)}")
+            print(f"Reading {_redact_url(input_file)}")
             with OpenAsReader(input_file, binary=True) as reader:
                 line_count = 0
                 bytes_count = 0
@@ -2652,7 +2695,7 @@ def main():
             output_files = args.files
         else:
             if len(args.files) < 2:
-                parser.error("Write mode requires at least one source file and one destination file (e.g., 'python -m openas -w src dest')")
+                parser.error("Write mode requires at least one source file and one destination file (e.g., 'openas -w src dest')")
             source_file = args.files[0]
             output_files = args.files[1:]
 
@@ -2665,7 +2708,10 @@ def main():
                     f"Use Python's zipfile or tarfile module instead."
                 )
             if scheme_out in ('http', 'https'):
-                raise ReadOnlyProtocolError(f"Protocol '{parsed_out.scheme}' does not support write/append operations in openas.")
+                raise ReadOnlyProtocolError(
+                    f"Protocol '{parsed_out.scheme}' does not support write/append operations in openas. "
+                    "HTTP/HTTPS is read-only; write to a local path, ftp://, or sftp:// target instead."
+                )
 
         import contextlib
         print(f"Will Read from {_redact_url(source_file)}")
@@ -2700,6 +2746,56 @@ def main():
             pinfo("FINISHED Writing.", filename, line_count, bytes_count, elapsed)
 
 
+_CLI_OPERATIONAL_EXCEPTION_MODULES = frozenset((
+    'paramiko', 'ftputil', 'ftplib', 'zstandard', 'requests', 'lzma', '_lzma', 'zlib',
+))
+
+
+def _is_cli_operational_error(exc: BaseException) -> bool:
+    """Return True for expected operational CLI failures without eager third-party or codec imports."""
+    if isinstance(exc, (OpenAsError, OSError, EOFError, ValueError, NotImplementedError)):
+        return True
+    top_module = type(exc).__module__.split('.', 1)[0]
+    return top_module in _CLI_OPERATIONAL_EXCEPTION_MODULES
+
+
+def _redact_urls_in_text(text: str) -> str:
+    """Mask URL passwords and query strings in embedded URL tokens (imports re lazily)."""
+    if '://' not in text:
+        return text
+    import re
+
+    def _replace(match):
+        token = match.group(0)
+        trailing = ''
+        while token and (
+            token[-1] in '.,;:)'
+            or (token[-1] == ']' and '[' not in token)
+        ):
+            trailing = token[-1] + trailing
+            token = token[:-1]
+        return _redact_url(token) + trailing
+
+    return re.sub(r'[A-Za-z][A-Za-z0-9+.-]*://(?:<redacted>|[^\s\'"<>])+', _replace, text)
+
+
+def _cli_main() -> None:
+    """CLI entry wrapper formatting operational errors to stderr and exiting 1."""
+    import sys
+
+    try:
+        main()
+    except Exception as exc:
+        if not _is_cli_operational_error(exc):
+            raise
+        msg = _redact_urls_in_text(str(exc)).strip()
+        if msg:
+            sys.stderr.write(f"openas: error ({type(exc).__name__}): {msg}\n")
+        else:
+            sys.stderr.write(f"openas: error ({type(exc).__name__})\n")
+        sys.exit(1)
+
+
 if __name__ == "__main__":
-    main()
+    _cli_main()
 

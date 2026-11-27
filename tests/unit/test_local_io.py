@@ -973,6 +973,52 @@ def test_repr_redacts_malformed_ipv6_urls_without_raising(bad_url, secret, expec
         assert expected_fragment in rep
 
 
+def test_openas_writer_repr_modes_open_and_closed(tmp_path):
+    """n5d1ot E-01: OpenAsWriter.__repr__ reports 'w', 'wb', 'a', 'ab' accurately when open and resets on close."""
+    fp = tmp_path / "repr_modes.txt"
+
+    # Unopened text and binary writers report closed with 'w' / 'wb'
+    w_txt = OpenAsWriter(fp, binary=False)
+    assert repr(w_txt) == f"OpenAsWriter({str(fp)!r}, mode='w', state='closed')"
+    w_bin = OpenAsWriter(fp, binary=True)
+    assert repr(w_bin) == f"OpenAsWriter({str(fp)!r}, mode='wb', state='closed')"
+
+    # Write mode ('w' and 'wb') via openas()
+    with openas(fp, "w", backup=False) as w:
+        assert repr(w) == f"OpenAsWriter({str(fp)!r}, mode='w', state='open')"
+    assert repr(w) == f"OpenAsWriter({str(fp)!r}, mode='w', state='closed')"
+
+    with openas(fp, "wb", backup=False) as w:
+        assert repr(w) == f"OpenAsWriter({str(fp)!r}, mode='wb', state='open')"
+    assert repr(w) == f"OpenAsWriter({str(fp)!r}, mode='wb', state='closed')"
+
+    # Append mode ('a' and 'ab') reports 'a' / 'ab' while open and resets to 'w' / 'wb' when closed
+    with openas(fp, "a") as w:
+        assert repr(w) == f"OpenAsWriter({str(fp)!r}, mode='a', state='open')"
+        # Calling open(append=False) on an already-open append writer returns early without mutating _append
+        assert w.open(append=False, backup=False) is w
+        assert repr(w) == f"OpenAsWriter({str(fp)!r}, mode='a', state='open')"
+    assert repr(w) == f"OpenAsWriter({str(fp)!r}, mode='w', state='closed')"
+
+    with openas(fp, "ab") as w:
+        assert repr(w) == f"OpenAsWriter({str(fp)!r}, mode='ab', state='open')"
+        assert w.open(append=False, backup=False) is w
+        assert repr(w) == f"OpenAsWriter({str(fp)!r}, mode='ab', state='open')"
+    assert repr(w) == f"OpenAsWriter({str(fp)!r}, mode='wb', state='closed')"
+
+    # Direct OpenAsWriter.open(append=True, backup=False) then close() and reopen(append=False)
+    w_direct = OpenAsWriter(fp)
+    w_direct.open(append=True, backup=False)
+    try:
+        assert repr(w_direct) == f"OpenAsWriter({str(fp)!r}, mode='a', state='open')"
+    finally:
+        w_direct.close()
+    assert repr(w_direct) == f"OpenAsWriter({str(fp)!r}, mode='w', state='closed')"
+    with w_direct.open(append=False, backup=False):
+        assert repr(w_direct) == f"OpenAsWriter({str(fp)!r}, mode='w', state='open')"
+    assert repr(w_direct) == f"OpenAsWriter({str(fp)!r}, mode='w', state='closed')"
+
+
 @pytest.mark.parametrize("ext", [".gz", ".bz2", ".xz", ".zst"])
 @pytest.mark.parametrize("binary", [False, True])
 def test_compressed_progress_eof_before_close_early_break_and_mixed_reads(tmp_path, ext, binary):

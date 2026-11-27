@@ -1,6 +1,6 @@
 """Entry point for `python -m openas`."""
 
-from .openas import main
+from .openas import _cli_main
 
 if __name__ == "__main__":
-    main()
+    _cli_main()

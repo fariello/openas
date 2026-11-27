@@ -33,12 +33,12 @@ Prefer `openas` or `python -m openas` to avoid Python's `runpy` `RuntimeWarning`
 ## Exit Codes
 
 - `0`: Command completed successfully, or `--help` / `--version` was printed.
+- `1`: Operational guard, I/O, compression, or remote transport failure during execution (for example `UnsupportedArchiveError`, `ReadOnlyProtocolError`, `UnsupportedProtocolError`, `FileNotFoundError`, `IsADirectoryError`, corrupt compressed stream errors, or remote connection errors). Printed concisely to `stderr` as `openas: error (<ExcName>): <message>` without a raw Python traceback. Unexpected internal errors still propagate with a full traceback.
 - `2`: Usage or argument validation error reported by `argparse` / `parser.error` (for example missing `--read`/`--write`, zero files passed to `--read`, fewer than two positional files passed to `--write` without `--input-file`, `--input-file` combined with `--read`, or `--input-file` with no destinations).
-- Non-zero (`1` on uncaught Python exceptions): Guard or I/O failure during execution (for example `UnsupportedArchiveError`, `ReadOnlyProtocolError`, `UnsupportedProtocolError`, `FileNotFoundError`, `IsADirectoryError`, or remote connection errors).
 
 ## Credential Redaction
 
-URL passwords and query strings are automatically masked (`user:***@host/path?<redacted>`) in CLI stdout messages. Even so, avoid passing inline passwords on shell command lines because they can remain visible in shell history and process listings; prefer SSH keys (`sftp://user@host/path/to/file`).
+URL passwords and query strings are automatically masked (`user:***@host/path?<redacted>`) in both CLI stdout messages and formatted CLI stderr error lines. Even so, avoid passing inline passwords on shell command lines because they can remain visible in shell history and process listings; prefer SSH keys (`sftp://user@host/path/to/file`).
 
 ## Examples
 
@@ -51,7 +51,7 @@ python -m openas --read syslog.01.zst syslog.02.bz2 https://example.com/archive.
 Example output:
 
 ```text
-TESTING reading syslog.01.zst
+Reading syslog.01.zst
 FINISHED Reading. syslog.01.zst. 238,901 lines / 48.2MB at 41,200.5/s (8.1MB/s). Total time: 5.79 Secs.
 ```
 
@@ -64,7 +64,7 @@ python -m openas --read payload.bin.gz
 For an empty file (0 bytes), the summary reports zero lines and `(0.0B/s)`:
 
 ```text
-TESTING reading empty.txt
+Reading empty.txt
 FINISHED Reading. empty.txt. 0 lines / 0.0B at 0.0/s (0.0B/s). Total time: 0.00 Secs.
 ```
 

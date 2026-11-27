@@ -599,3 +599,175 @@ def test_cli_compressed_formats_subprocess_roundtrip(tmp_path, ext):
     )
     assert res_decode.returncode == 0, res_decode.stderr
     assert plain_back.read_bytes() == payload_bytes
+
+
+def test_cli_help_notes_examples_and_read_status_wording(tmp_path):
+    """n5d1ot E-03: --help surfaces .001.bu backups, sftp:// notes, openas examples, and --read prints 'Reading '."""
+    res_help = subprocess.run(
+        [sys.executable, "-m", "openas", "--help"],
+        capture_output=True,
+        text=True,
+        env=_cli_env(),
+    )
+    assert res_help.returncode == 0, res_help.stderr
+    out = res_help.stdout
+    assert "64 KiB binary chunks" in out
+    assert ".001.bu" in out
+    assert "Examples:" in out
+    assert "openas --read " in out
+    assert "openas --write " in out
+    assert "openas --write -i " in out
+    assert "Notes:" in out
+    assert "sftp://user@host/abs/path" in out
+    assert "~/.ssh/known_hosts" in out
+
+    # parser.error examples reference `openas -r` and `openas -w`
+    res_no_read_file = subprocess.run(
+        [sys.executable, "-m", "openas", "--read"],
+        capture_output=True,
+        text=True,
+        env=_cli_env(),
+    )
+    assert res_no_read_file.returncode == 2
+    assert "'openas -r path/to/file.gz'" in res_no_read_file.stderr
+
+    res_one_write_file = subprocess.run(
+        [sys.executable, "-m", "openas", "--write", "only_src.txt"],
+        capture_output=True,
+        text=True,
+        env=_cli_env(),
+    )
+    assert res_one_write_file.returncode == 2
+    assert "'openas -w src dest'" in res_one_write_file.stderr
+
+    # --read status line uses "Reading <file>" instead of "TESTING reading <file>"
+    sample = tmp_path / "status_check.txt"
+    sample.write_text("hello\n", encoding="utf-8")
+    res_read = subprocess.run(
+        [sys.executable, "-m", "openas", "--read", str(sample)],
+        capture_output=True,
+        text=True,
+        env=_cli_env(),
+    )
+    assert res_read.returncode == 0, res_read.stderr
+    assert f"Reading {sample}" in res_read.stdout
+    assert "TESTING reading" not in res_read.stdout
+    assert "FINISHED Reading." in res_read.stdout
+
+
+@pytest.mark.parametrize("module_name", ["openas", "openas.openas"])
+def test_cli_operational_errors_formatted_without_traceback(tmp_path, module_name):
+    """n5d1ot E-04: Subprocess CLI operational failures exit 1 with concise redacted stderr and no traceback."""
+    src = tmp_path / "src.txt"
+    src.write_text("hello\n", encoding="utf-8")
+    corrupt_xz = tmp_path / "corrupt.xz"
+    corrupt_xz.write_bytes(b"not-a-valid-xz-stream")
+    missing = tmp_path / "does_not_exist.txt"
+
+    cases = [
+        (["--read", "archive.zip"], "UnsupportedArchiveError", "zipfile"),
+        (["--read", str(missing)], "FileNotFoundError", "does_not_exist.txt"),
+        (
+            ["--write", str(src), "https://alice:topsecret@example.com/out.txt?token=tok99"],
+            "ReadOnlyProtocolError",
+            "HTTP/HTTPS is read-only",
+        ),
+        (["--read", "s3://bucket/key.gz"], "UnsupportedProtocolError", "smart_open"),
+        (["--read", str(corrupt_xz)], "LZMAError", ""),
+    ]
+
+    for cli_args, exc_name, expected_sub in cases:
+        res = subprocess.run(
+            [sys.executable, "-m", module_name, *cli_args],
+            capture_output=True,
+            text=True,
+            env=_cli_env(),
+        )
+        assert res.returncode == 1, f"{module_name} {cli_args}: rc={res.returncode}, stderr={res.stderr!r}"
+        assert f"openas: error ({exc_name}):" in res.stderr, res.stderr
+        if expected_sub:
+            assert expected_sub in res.stderr, res.stderr
+        assert "Traceback (most recent call last):" not in res.stderr, res.stderr
+        assert "topsecret" not in res.stderr
+        assert "tok99" not in res.stderr
+
+    # Explicit credential/query redaction in CLI stderr on missing-hostname URL error
+    res_redact = subprocess.run(
+        [sys.executable, "-m", module_name, "--read", "https:///missing.txt?token=secret_query_val"],
+        capture_output=True,
+        text=True,
+        env=_cli_env(),
+    )
+    assert res_redact.returncode == 1
+    assert "openas: error (ValueError):" in res_redact.stderr
+    assert "secret_query_val" not in res_redact.stderr
+    assert "?<redacted>" in res_redact.stderr
+    assert "Traceback (most recent call last):" not in res_redact.stderr
+
+
+def test_cli_main_operational_classification_redaction_and_internal_reraise(monkeypatch, capsys):
+    """n5d1ot E-04: _is_cli_operational_error and _cli_main cover codec/transport errors, redact URLs, and re-raise bugs."""
+    import ftplib
+    import importlib
+    import lzma
+    import zlib
+    import ftputil.error
+    import paramiko
+    import requests
+    import zstandard as zstd
+    mod = importlib.import_module("openas.openas")
+
+    operational_instances = [
+        lzma.LZMAError("corrupt xz data"),
+        zlib.error("invalid block type"),
+        ftplib.error_perm("530 Login incorrect"),
+        zstd.ZstdError("corrupt zstd frame"),
+        paramiko.SSHException("Server not found in known_hosts"),
+        ftputil.error.FTPError("ftp failure"),
+    ]
+
+    for exc in operational_instances:
+        assert mod._is_cli_operational_error(exc) is True
+        monkeypatch.setattr(mod, "main", lambda _e=exc: (_ for _ in ()).throw(_e))
+        with pytest.raises(SystemExit) as sysexit:
+            mod._cli_main()
+        assert sysexit.value.code == 1
+        err = capsys.readouterr().err
+        assert err == f"openas: error ({type(exc).__name__}): {exc}\n"
+
+    # Empty exception message omits trailing ": "
+    monkeypatch.setattr(mod, "main", lambda: (_ for _ in ()).throw(OSError()))
+    with pytest.raises(SystemExit) as sysexit:
+        mod._cli_main()
+    assert sysexit.value.code == 1
+    assert capsys.readouterr().err == "openas: error (OSError)\n"
+
+    # Embedded URL passwords and query strings in third-party exception text are redacted
+    http_exc = requests.HTTPError(
+        "401 Client Error: Unauthorized for url: https://alice:s3cr3t@example.com/data.gz?api_key=xyz987."
+    )
+    monkeypatch.setattr(mod, "main", lambda: (_ for _ in ()).throw(http_exc))
+    with pytest.raises(SystemExit) as sysexit:
+        mod._cli_main()
+    assert sysexit.value.code == 1
+    err_http = capsys.readouterr().err
+    assert "s3cr3t" not in err_http
+    assert "xyz987" not in err_http
+    assert "https://alice:***@example.com/data.gz?<redacted>." in err_http
+    assert err_http.startswith("openas: error (HTTPError): ")
+
+    # Already-redacted URLs remain intact (idempotent)
+    already = "openas failed on sftp://alice:***@host/a.zip?<redacted>."
+    assert mod._redact_urls_in_text(already) == already
+
+    # Unexpected internal bug (RuntimeError) is NOT swallowed and propagates with traceback
+    bug = RuntimeError("internal invariant violated")
+    assert mod._is_cli_operational_error(bug) is False
+    monkeypatch.setattr(mod, "main", lambda: (_ for _ in ()).throw(bug))
+    with pytest.raises(RuntimeError, match="internal invariant violated"):
+        mod._cli_main()
+
+    # KeyboardInterrupt is never intercepted by _cli_main
+    monkeypatch.setattr(mod, "main", lambda: (_ for _ in ()).throw(KeyboardInterrupt()))
+    with pytest.raises(KeyboardInterrupt):
+        mod._cli_main()

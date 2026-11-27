@@ -227,3 +227,65 @@ def test_percent_encoded_remote_archives_rejected(url, mode):
     """iev841 E-01: Percent-encoded archive extensions in network URLs raise UnsupportedArchiveError."""
     with pytest.raises(UnsupportedArchiveError):
         openas(url, mode)
+
+
+def test_actionable_api_error_messages(tmp_path):
+    """n5d1ot E-02: Six API error paths preserve exception classes and include actionable recovery guidance."""
+    from openas import OpenAsWriter
+
+    target = tmp_path / "actionable.txt"
+
+    # 1. show_progress=True on writer/write/append
+    for call in (
+        lambda: OpenAsWriter(target, show_progress=True),
+        lambda: openas(target, "w", show_progress=True),
+        lambda: openas(target, "a", show_progress=True),
+    ):
+        with pytest.raises(NotImplementedError) as excinfo:
+            call()
+        msg = str(excinfo.value)
+        assert "show_progress=True is only supported for reading" in msg
+        assert "Pass show_progress=False (default) when writing or appending." in msg
+
+    # 2. append=True with backup=True
+    for call in (
+        lambda: OpenAsWriter(target).open(append=True, backup=True),
+        lambda: openas(target, "a", backup=True),
+    ):
+        with pytest.raises(ValueError) as excinfo:
+            call()
+        msg = str(excinfo.value)
+        assert "Cannot set both append=True and backup=True." in msg
+        assert "Pass backup=False when appending" in msg
+        assert "openas(path, 'a')" in msg
+
+    # 3. HTTP/HTTPS write/append ReadOnlyProtocolError
+    for url in ("http://example.com/out.txt", "https://example.com/out.txt"):
+        with pytest.raises(ReadOnlyProtocolError) as excinfo:
+            openas(url, "w")
+        msg = str(excinfo.value)
+        assert "HTTP/HTTPS is read-only; write to a local path, ftp://, or sftp:// target instead." in msg
+
+    # 4. FTP append UnsupportedProtocolError
+    with pytest.raises(UnsupportedProtocolError) as excinfo:
+        openas("ftp://user@host/dir/out.txt", "a")
+    msg = str(excinfo.value)
+    assert "append" in msg
+    assert "Use write mode ('w'/'wb') on ftp:// or append over sftp:// instead." in msg
+
+    # 5. _validate_timeout echoes invalid input with units
+    for bad_timeout in (0, -2.5, True, "fast"):
+        with pytest.raises(ValueError) as excinfo:
+            openas(target, "r", timeout=bad_timeout)
+        msg = str(excinfo.value)
+        assert "timeout must be a positive number (seconds) or None" in msg
+        assert f"got {bad_timeout!r}." in msg
+
+    # 6. _resolve_target missing hostname includes expected format and redacts secrets
+    with pytest.raises(ValueError) as excinfo:
+        openas("sftp:///abs/file.txt?token=topsecret", "r")
+    msg = str(excinfo.value)
+    assert "Missing hostname" in msg
+    assert "(expected 'sftp://host/path')" in msg
+    assert "topsecret" not in msg
+    assert "<redacted>" in msg
