@@ -17,10 +17,10 @@ See [GUIDING_PRINCIPLES.md](GUIDING_PRINCIPLES.md) and [DECISIONS.md](DECISIONS.
 
 ## Features
 
-- **Line-by-Line Streaming and Transparent Compression:** Streams plain, `.gz`, `.bz2`, `.xz`, and multi-frame `.zst` files on the fly in UTF-8 text (`'r'`/`'rt'`, `'w'`/`'wt'`, `'a'`/`'at'`) or raw binary (`'rb'`, `'wb'`, `'ab'`) mode. Accepts optional `compresslevel: Optional[int] = None` (defaulting to each library's own setting: `zstd` level 3, `lzma` preset 6, `bz2` level 9, `gzip` level 9).
-- **Local and Remote Protocols:** Reads and writes over local files (`file://` or plain paths), `ssh://`/`sftp://` (read, write, and append), and `ftp://` (read and write), and streams read-only `http://`/`https://` responses via thread-local, cookie-free `requests.Session` reuse. Supports an optional `timeout` parameter across all network transports.
+- **Line-by-Line Streaming and Transparent Compression:** Streams plain, `.gz`, `.bz2`, `.xz`, and multi-frame `.zst` files on the fly in text (`'r'`/`'rt'`, `'w'`/`'wt'`, `'a'`/`'at'`, UTF-8 by default with `builtins.open()`-compatible `encoding`, `errors`, and `newline` options) or raw binary (`'rb'`, `'wb'`, `'ab'`) mode. Accepts optional `compresslevel: Optional[int] = None` (defaulting to each library's own setting: `zstd` level 3, `lzma` preset 6, `bz2` level 9, `gzip` level 9).
+- **Local and Remote Protocols:** Reads and writes over local files (`file://` or plain paths), `ssh://`/`sftp://` (read, write, and append, with optional `key_filename`), and `ftp://` (read and write), and streams read-only `http://`/`https://` responses via thread-local, cookie-free `requests.Session` reuse with optional per-request `headers`. Supports an optional `timeout` parameter across all network transports.
 - **SFTP Pipelining, Progress Bars, and Clean Shutdown:** Uses bounded 4 MiB sliding-window SFTP `readv()` streaming (`max_concurrent_prefetch_requests=64`, O(1) memory on multi-GB files), SFTP write pipelining (`set_pipelined(True)`), optional `tqdm` progress bars tracking exact raw bytes read (`show_progress=True`), and deterministic, idempotent handle closure across all transports.
-- **Standard File-Like Interface:** Supports `with` context management, `read()`, `readline()`, `readlines()`, line iteration (`for line in f:`), `write()`, `writelines()`, `flush()`, `closed`, `readable()`, `writable()`, `seekable()`, and `encoding` (`'utf-8'` in text mode, `None` in binary mode).
+- **Standard File-Like Interface:** Supports `with` context management, `read()`, binary `read1()`, `readline()`, `readlines()`, line iteration (`for line in f:`), `write()`, `writelines()`, `flush()`, `closed`, `readable()`, `writable()`, `seekable()`, `encoding` (effective encoding string in text mode, `None` in binary mode), and direct `io.TextIOWrapper(openas(path, "rb"))` composition.
 - **Optional Sequential `.bu` Overwrite Backups:** When overwriting an existing file (`backup=True`, default for write modes; pass `backup=False` to disable), moves the existing file to `<path>.001.bu` (checking `.001.bu` first in O(1), then scanning once up to `.999.bu` with a nanosecond timestamp fallback). Local backups use atomic `os.link`/`os.unlink` and reject directories (`IsADirectoryError`).
 
 ## Installation
@@ -99,19 +99,31 @@ Pass remote URLs directly; `openas` detects `.gz`, `.bz2`, `.xz`, and `.zst` fro
 ```python
 from openas import openas
 
-# Write over SSH/SFTP using SSH agent / ~/.ssh keys (preferred over inline passwords)
-with openas("sftp://user@hostname/path/to/data.csv.zst", "w", backup=True, timeout=30) as f:
+# Write over SSH/SFTP using an explicit deploy key or SSH agent / ~/.ssh keys
+with openas(
+    "sftp://user@hostname/path/to/data.csv.zst",
+    "w",
+    backup=True,
+    timeout=30,
+    newline="\n",
+    key_filename="/path/to/id_ed25519",
+) as f:
     f.write("id,name\n1,alice\n")
 
-# Stream a remote compressed HTTP file line-by-line
-with openas("https://example.com/data.jsonl.gz", "r", timeout=30) as f:
+# Stream a remote compressed HTTP file line-by-line with custom request headers
+with openas(
+    "https://example.com/data.jsonl.gz",
+    "r",
+    timeout=30,
+    headers={"Authorization": "Bearer <token>", "User-Agent": "my-app/1.0"},
+) as f:
     for line in f:
         print(line.strip())
 ```
 
-> **Credential safety:** Prefer SSH agent or `~/.ssh` key authentication (`sftp://user@host/path/to/file`) over inline passwords (`user:pass@host`). Avoid putting plaintext passwords on command lines where they can appear in shell history or process listings. `openas` redacts URL passwords and query strings in CLI output, `__repr__()`, and archive error messages.
+> **Credential safety:** Prefer SSH agent, `~/.ssh` keys, or explicit `key_filename` authentication (`sftp://user@host/path/to/file`) over inline passwords (`user:pass@host`). Avoid putting plaintext passwords on command lines where they can appear in shell history or process listings. `openas` redacts URL passwords and query strings in CLI output, `__repr__()`, and archive error messages, and never exposes HTTP `headers` or SSH `key_filename` in `__repr__()`. On cross-host HTTP redirects, `requests` strips `Authorization` automatically while forwarding other custom headers (such as `X-API-Key`).
 
-> **Remote URL paths, authentication, and environment variables:** `sftp://` and `ssh://` URLs pass the URL path verbatim as an absolute remote path (for example `/path/to/data.csv.zst`) with no `~/` expansion and do not parse `~/.ssh/config`. Omitting the SSH username defaults to the local OS user authenticating via the SSH agent or `~/.ssh/id_*` keys; omitting FTP credentials logs in anonymously. `openas` defines no custom environment variables, while HTTP/HTTPS inherits `requests.Session` `trust_env=True` defaults (`HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY`, `REQUESTS_CA_BUNDLE`, `CURL_CA_BUNDLE`, and `~/.netrc`).
+> **Remote URL paths, authentication, and environment variables:** `sftp://` and `ssh://` URLs pass the URL path verbatim as an absolute remote path (for example `/path/to/data.csv.zst`) with no `~/` expansion and do not parse `~/.ssh/config`. Omitting the SSH username defaults to the local OS user authenticating via the SSH agent, `~/.ssh/id_*` keys, or `key_filename`; omitting FTP credentials logs in anonymously. `openas` defines no custom environment variables, while HTTP/HTTPS inherits `requests.Session` `trust_env=True` defaults (`HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY`, `REQUESTS_CA_BUNDLE`, `CURL_CA_BUNDLE`, and `~/.netrc`).
 
 ## Command-Line Interface
 

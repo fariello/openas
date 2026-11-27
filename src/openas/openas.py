@@ -9,10 +9,11 @@ paths), `http://` and `https://` (read-only), `ftp://` (read and write), and `ss
 
 Public API
 ----------
-- `openas(filename, mode='r', backup=None, show_progress=False, compresslevel=None, timeout=None)`:
+- `openas(filename, mode='r', backup=None, show_progress=False, compresslevel=None, timeout=None, encoding=None, errors=None, newline=None, headers=None, key_filename=None)`:
   Unified factory returning an opened `OpenAsReader` or `OpenAsWriter`.
-- `OpenAsReader`: Stream reader supporting `read()`, `readline()`, `readlines()`, line-by-line
-  iteration (`str` in text mode, `bytes` in binary mode), and optional raw-byte `tqdm` progress bars.
+- `OpenAsReader`: Stream reader supporting `read()`, `read1()`, `readline()`, `readlines()`,
+  `flush()`, line-by-line iteration (`str` in text mode, `bytes` in binary mode), and optional
+  raw-byte `tqdm` progress bars.
 - `OpenAsWriter`: Stream writer supporting `write()`, `writelines()`, `flush()`, `compresslevel`,
   and collision-safe sequential `.NNN.bu` backups on overwrite.
 - `OpenAsError`, `UnsupportedArchiveError`, `ReadOnlyProtocolError`, `UnsupportedProtocolError`:
@@ -75,6 +76,7 @@ import time
 from typing import TYPE_CHECKING, Optional, Union
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping, Sequence
     from urllib.parse import SplitResult
 
 _NETWORK_SCHEMES = frozenset(('http', 'https', 'ftp', 'ssh', 'sftp', 's3', 'gs', 'az', 'hdfs'))
@@ -751,6 +753,106 @@ def _redact_url(target: str) -> str:
     return urlunsplit((parts.scheme, netloc, parts.path, query, parts.fragment))
 
 
+_VALID_NEWLINES = frozenset(('', '\n', '\r', '\r\n'))
+
+
+def _validate_text_options(
+    binary: bool,
+    encoding: Optional[str],
+    errors: Optional[str],
+    newline: Optional[str],
+) -> tuple[Optional[str], Optional[str], Optional[str]]:
+    """Validate and normalize builtins.open()-compatible text options before I/O or backups."""
+    if binary:
+        if encoding is not None:
+            raise ValueError("binary mode doesn't take an encoding argument")
+        if errors is not None:
+            raise ValueError("binary mode doesn't take an errors argument")
+        if newline is not None:
+            raise ValueError("binary mode doesn't take a newline argument")
+        return None, None, None
+
+    if encoding is None:
+        effective_encoding = 'utf-8'
+    else:
+        if not isinstance(encoding, str):
+            raise TypeError(f"encoding must be a str or None, got {type(encoding).__name__}.")
+        import codecs
+        codecs.lookup(encoding)
+        effective_encoding = encoding
+
+    if errors is not None and not isinstance(errors, str):
+        raise TypeError(f"errors must be a str or None, got {type(errors).__name__}.")
+
+    if newline is not None:
+        if not isinstance(newline, str):
+            raise TypeError(f"newline must be a str or None, got {type(newline).__name__}.")
+        if newline not in _VALID_NEWLINES:
+            raise ValueError(f"illegal newline value: {newline!r}")
+
+    return effective_encoding, errors, newline
+
+
+def _validate_headers(headers: Optional[Mapping[str, str]]) -> Optional[dict[str, str]]:
+    """Validate optional HTTP headers and return a defensive dict copy (never echoing secret values)."""
+    if headers is None:
+        return None
+    from collections.abc import Mapping as _Mapping
+    if not isinstance(headers, _Mapping):
+        raise TypeError(f"headers must be a mapping of str to str or None, got {type(headers).__name__}.")
+    validated: dict[str, str] = {}
+    for name, value in headers.items():
+        if not isinstance(name, str):
+            raise TypeError(f"HTTP header names must be str, got {type(name).__name__}.")
+        if not isinstance(value, str):
+            raise TypeError(f"HTTP header values must be str, got {type(value).__name__}.")
+        if not name or not name.strip():
+            raise ValueError("HTTP header name must be a non-empty string.")
+        if '\r' in name or '\n' in name or '\x00' in name:
+            raise ValueError("HTTP header name must not contain CR, LF, or NUL characters.")
+        if '\r' in value or '\n' in value or '\x00' in value:
+            raise ValueError("HTTP header value must not contain CR, LF, or NUL characters.")
+        validated[name] = value
+    return validated
+
+
+def _validate_key_filename(
+    key_filename: Optional[Union[str, os.PathLike, Sequence[Union[str, os.PathLike]]]],
+) -> Optional[Union[str, list[str]]]:
+    """Validate and normalize optional SSH key_filename (single path or non-empty sequence of paths)."""
+    if key_filename is None:
+        return None
+    if isinstance(key_filename, (bytes, bytearray)):
+        raise TypeError(
+            f"key_filename must be a str, os.PathLike, sequence of paths, or None, "
+            f"got {type(key_filename).__name__}."
+        )
+    if isinstance(key_filename, (str, os.PathLike)):
+        path_str = os.fsdecode(key_filename)
+        if not path_str:
+            raise ValueError("key_filename must not be an empty path.")
+        return path_str
+    from collections.abc import Sequence as _Sequence
+    if isinstance(key_filename, _Sequence):
+        if len(key_filename) == 0:
+            raise ValueError("key_filename sequence must not be empty.")
+        normalized: list[str] = []
+        for item in key_filename:
+            if isinstance(item, (bytes, bytearray)) or not isinstance(item, (str, os.PathLike)):
+                raise TypeError(
+                    f"key_filename elements must be str or os.PathLike, got {type(item).__name__}."
+                )
+            item_str = os.fsdecode(item)
+            if not item_str:
+                raise ValueError("key_filename elements must not be empty paths.")
+            normalized.append(item_str)
+        return normalized
+    raise TypeError(
+        f"key_filename must be a str, os.PathLike, sequence of paths, or None, "
+        f"got {type(key_filename).__name__}."
+    )
+
+
 def _validate_timeout(timeout: Optional[float]) -> Optional[float]:
     """Validate optional network timeout (finite positive float/int or None)."""
     if timeout is None:
@@ -1108,7 +1210,7 @@ class OpenAsReader:
     Streaming reader supporting `.gz`, `.bz2`, `.xz`, and `.zst` decompression
     over local files (`file://` or plain paths), HTTP/HTTPS, FTP, and SSH/SFTP.
 
-    Operates on UTF-8 text (`str`) by default, or raw `bytes` when `binary=True`.
+    Operates on decoded text (`str`, UTF-8 by default) or raw `bytes` when `binary=True`.
 
     Attributes
     ----------
@@ -1119,9 +1221,9 @@ class OpenAsReader:
     timeout : float or None
         Optional network timeout in seconds.
     binary : bool
-        When True, stream operations return raw `bytes`; when False, UTF-8 `str`.
+        When True, stream operations return raw `bytes`; when False, decoded `str`.
     encoding : str or None
-        `'utf-8'` in text mode, or `None` in binary mode.
+        Effective text encoding in text mode (`'utf-8'` by default), or `None` in binary mode.
     closed : bool
         True when no underlying stream handle is open.
 
@@ -1129,8 +1231,10 @@ class OpenAsReader:
     -------
     open() -> OpenAsReader
         Open the stream for reading.
-    read(size=-1) -> str or bytes, readline(size=-1) -> str or bytes, readlines(hint=-1) -> list
-        Standard stream read operations (`str` in text mode, `bytes` in binary mode).
+    read(size=-1) -> str or bytes, read1(size=-1) -> bytes, readline(size=-1) -> str or bytes, readlines(hint=-1) -> list
+        Standard stream read operations (`str` in text mode, `bytes` in binary mode; `read1()` is binary-only).
+    flush() -> None
+        No-op on an open reader; raises `ValueError` when closed (enables `io.TextIOWrapper` composition).
     readable() -> bool, writable() -> bool, seekable() -> bool
         Standard file-like capability predicates.
     close() -> None
@@ -1147,8 +1251,8 @@ class OpenAsReader:
 
     @property
     def encoding(self) -> Optional[str]:
-        """Return `'utf-8'` in text mode or `None` in binary mode."""
-        return None if self.binary else 'utf-8'
+        """Return the effective text encoding in text mode or `None` in binary mode."""
+        return self._encoding
 
     @property
     def closed(self) -> bool:
@@ -1178,6 +1282,11 @@ class OpenAsReader:
         show_progress: bool = False,
         timeout: Optional[float] = None,
         binary: bool = False,
+        encoding: Optional[str] = None,
+        errors: Optional[str] = None,
+        newline: Optional[str] = None,
+        headers: Optional[Mapping[str, str]] = None,
+        key_filename: Optional[Union[str, os.PathLike, Sequence[Union[str, os.PathLike]]]] = None,
     ):
         """
         Initialize OpenAsReader with a filename.
@@ -1191,12 +1300,27 @@ class OpenAsReader:
         timeout : float or None, optional
             Optional network timeout in seconds for HTTP, FTP, and SSH/SFTP connections.
         binary : bool, optional
-            If True, read raw `bytes` instead of UTF-8 decoded `str` (default is False).
+            If True, read raw `bytes` instead of decoded `str` (default is False).
+        encoding : str or None, optional
+            Text encoding in text mode (defaults to `'utf-8'`). Must be None in binary mode.
+        errors : str or None, optional
+            Codec error handler in text mode (defaults to Python's `'strict'`). Must be None in binary mode.
+        newline : str or None, optional
+            Newline translation mode (`None`, `''`, `'\\n'`, `'\\r'`, or `'\\r\\n'`). Must be None in binary mode.
+        headers : Mapping[str, str] or None, optional
+            Optional per-request HTTP/HTTPS headers (defensively copied; ignored on non-HTTP targets).
+        key_filename : str, os.PathLike, Sequence[str | os.PathLike], or None, optional
+            Optional SSH private key path or sequence of paths forwarded to Paramiko `connect()`.
         """
         self.filename = os.fsdecode(filename)
         self.show_progress = show_progress
         self.timeout = _validate_timeout(timeout)
         self.binary = bool(binary)
+        self._encoding, self._errors, self._newline = _validate_text_options(
+            self.binary, encoding, errors, newline
+        )
+        self._headers = _validate_headers(headers)
+        self._key_filename = _validate_key_filename(key_filename)
         self._fh = None
         self._raw_fh = None
         self._ssh_client = None
@@ -1223,6 +1347,18 @@ class OpenAsReader:
         if self._fh is None:
             raise ValueError("I/O operation on closed file.")
 
+    def _encoded_byte_len(self, text: str) -> int:
+        """Compute an approximate byte length for plain-local text progress without raising on lossy text."""
+        enc = self._encoding or 'utf-8'
+        err = self._errors or 'strict'
+        try:
+            return len(text.encode(enc, err))
+        except (UnicodeError, LookupError, TypeError):
+            try:
+                return len(text.encode(enc, 'replace'))
+            except (UnicodeError, LookupError, TypeError):
+                return len(text)
+
     def _flush_progress(self) -> None:
         """Apply any buffered progress delta to the progress bar once."""
         if self._counting_stream is not None:
@@ -1248,7 +1384,7 @@ class OpenAsReader:
             self._flush_progress()
         if data:
             self._progress.update(
-                len(data) if isinstance(data, (bytes, bytearray)) else len(data.encode('utf-8'))
+                len(data) if isinstance(data, (bytes, bytearray)) else self._encoded_byte_len(data)
             )
 
     def _reconcile_crlf_eof_progress(self) -> None:
@@ -1256,6 +1392,7 @@ class OpenAsReader:
         if (
             self._counting_stream is not None
             or self.binary
+            or self._newline is not None
             or self._progress is None
             or self._progress.total is None
         ):
@@ -1329,9 +1466,11 @@ class OpenAsReader:
 
     def _iter_decoded(self):
         """Yield decoded text lines from a non-text handle (binary stream)."""
+        enc = self._encoding or 'utf-8'
+        err = self._errors or 'strict'
         for line in self._fh:
             if isinstance(line, bytes):
-                yield line.decode('utf-8')
+                yield line.decode(enc, err)
             else:
                 yield line
 
@@ -1343,13 +1482,15 @@ class OpenAsReader:
             binary = self.binary
             is_text = isinstance(fh, io.TextIOBase)
             counting = self._counting_stream
+            enc = self._encoding or 'utf-8'
+            err = self._errors or 'strict'
 
             if progress is None:
                 if binary or is_text:
                     yield from fh
                 else:
                     for line in fh:
-                        yield line.decode('utf-8') if isinstance(line, bytes) else line
+                        yield line.decode(enc, err) if isinstance(line, bytes) else line
                 return
 
             if counting is not None:
@@ -1357,7 +1498,7 @@ class OpenAsReader:
                     yield from fh
                 else:
                     for line in fh:
-                        yield line.decode('utf-8') if isinstance(line, bytes) else line
+                        yield line.decode(enc, err) if isinstance(line, bytes) else line
                 return
 
             update = progress.update
@@ -1370,8 +1511,9 @@ class OpenAsReader:
                         update(pending)
                     yield line
             elif is_text:
+                byte_len = self._encoded_byte_len
                 for line in fh:
-                    self._progress_pending += len(line.encode('utf-8'))
+                    self._progress_pending += byte_len(line)
                     if self._progress_pending >= _PROGRESS_BATCH_BYTES:
                         pending = self._progress_pending
                         self._progress_pending = 0
@@ -1379,12 +1521,13 @@ class OpenAsReader:
                     yield line
                 self._reconcile_crlf_eof_progress()
             else:
+                byte_len = self._encoded_byte_len
                 for line in fh:
                     if isinstance(line, bytes):
                         line_bytes = len(line)
-                        line = line.decode('utf-8')
+                        line = line.decode(enc, err)
                     else:
-                        line_bytes = len(line.encode('utf-8'))
+                        line_bytes = byte_len(line)
                     self._progress_pending += line_bytes
                     if self._progress_pending >= _PROGRESS_BATCH_BYTES:
                         pending = self._progress_pending
@@ -1395,12 +1538,16 @@ class OpenAsReader:
         finally:
             self._flush_progress()
 
+    def flush(self) -> None:
+        """No-op flush on an open reader; raises ValueError when closed (matches io.IOBase.flush)."""
+        self._ensure_open()
+
     def readline(self, size: int = -1) -> Union[str, bytes]:
         """Read and return one line from the stream, or up to size characters/bytes."""
         self._ensure_open()
         line = self._fh.readline() if (size is None or size < 0) else self._fh.readline(size)
         if not self.binary and isinstance(line, bytes):
-            line = line.decode('utf-8')
+            line = line.decode(self._encoding or 'utf-8', self._errors or 'strict')
         self._update_progress(line)
         if line == "" and (size is None or size != 0):
             self._reconcile_crlf_eof_progress()
@@ -1411,10 +1558,24 @@ class OpenAsReader:
         self._ensure_open()
         data = self._fh.read() if (size is None or size < 0) else self._fh.read(size)
         if not self.binary and isinstance(data, bytes):
-            data = data.decode('utf-8')
+            data = data.decode(self._encoding or 'utf-8', self._errors or 'strict')
         self._update_progress(data)
         if (size is None or size < 0) or (size > 0 and data == ""):
             self._reconcile_crlf_eof_progress()
+        return data
+
+    def read1(self, size: int = -1) -> bytes:
+        """Read and return up to size bytes with at most one underlying read (binary mode only)."""
+        self._ensure_open()
+        if not self.binary:
+            raise io.UnsupportedOperation("read1() is only supported in binary mode.")
+        unbounded = size is None or size < 0
+        read1_fn = getattr(self._fh, 'read1', None)
+        if read1_fn is not None:
+            data = read1_fn() if unbounded else read1_fn(size)
+        else:
+            data = self._fh.read() if unbounded else self._fh.read(size)
+        self._update_progress(data)
         return data
 
     def readlines(self, hint: int = -1) -> list:
@@ -1471,7 +1632,11 @@ class OpenAsReader:
         validated = _ZstdFrameValidatingStream(stream)
         sr = dctx.stream_reader(validated, read_across_frames=True, read_size=_ZST_BUFFER_SIZE)
         buffered = io.BufferedReader(sr, buffer_size=_ZST_BUFFER_SIZE)
-        return buffered if self.binary else io.TextIOWrapper(buffered, encoding='utf-8')
+        return (
+            buffered
+            if self.binary
+            else io.TextIOWrapper(buffered, encoding=self._encoding, errors=self._errors, newline=self._newline)
+        )
 
     def _wrap_ftp(self, parsed: SplitResult):
         """
@@ -1515,27 +1680,27 @@ class OpenAsReader:
             self._fh = (
                 io.BufferedReader(bz2.open(stream, 'rb'), buffer_size=_BINARY_BUFFER_SIZE)
                 if self.binary
-                else bz2.open(stream, 'rt', encoding='utf-8')
+                else bz2.open(stream, 'rt', encoding=self._encoding, errors=self._errors, newline=self._newline)
             )
         elif norm.endswith('.xz'):
             import lzma
             self._fh = (
                 io.BufferedReader(lzma.open(stream, 'rb'), buffer_size=_BINARY_BUFFER_SIZE)
                 if self.binary
-                else lzma.open(stream, 'rt', encoding='utf-8')
+                else lzma.open(stream, 'rt', encoding=self._encoding, errors=self._errors, newline=self._newline)
             )
         elif norm.endswith('.gz'):
             import gzip
             self._fh = (
                 io.BufferedReader(gzip.open(stream, 'rb'), buffer_size=_BINARY_BUFFER_SIZE)
                 if self.binary
-                else gzip.open(stream, 'rt', encoding='utf-8')
+                else gzip.open(stream, 'rt', encoding=self._encoding, errors=self._errors, newline=self._newline)
             )
         else:
             self._fh = (
                 io.BufferedReader(stream, buffer_size=_BINARY_BUFFER_SIZE)
                 if self.binary
-                else io.TextIOWrapper(stream, encoding='utf-8')
+                else io.TextIOWrapper(stream, encoding=self._encoding, errors=self._errors, newline=self._newline)
             )
 
     def _wrap_ssh(self, parsed: SplitResult):
@@ -1569,6 +1734,8 @@ class OpenAsReader:
             connect_kwargs['timeout'] = self.timeout
             connect_kwargs['banner_timeout'] = self.timeout
             connect_kwargs['auth_timeout'] = self.timeout
+        if self._key_filename is not None:
+            connect_kwargs['key_filename'] = self._key_filename
         try:
             self._ssh_client = client
             client.connect(parsed.hostname, **connect_kwargs)
@@ -1609,7 +1776,7 @@ class OpenAsReader:
             self._fh = (
                 io.BufferedReader(bz2.open(stream, 'rb'), buffer_size=_BINARY_BUFFER_SIZE)
                 if self.binary
-                else bz2.open(stream, 'rt', encoding='utf-8')
+                else bz2.open(stream, 'rt', encoding=self._encoding, errors=self._errors, newline=self._newline)
             )
         elif norm.endswith('.xz'):
             import lzma
@@ -1617,7 +1784,7 @@ class OpenAsReader:
             self._fh = (
                 io.BufferedReader(lzma.open(stream, 'rb'), buffer_size=_BINARY_BUFFER_SIZE)
                 if self.binary
-                else lzma.open(stream, 'rt', encoding='utf-8')
+                else lzma.open(stream, 'rt', encoding=self._encoding, errors=self._errors, newline=self._newline)
             )
         elif norm.endswith('.gz'):
             import gzip
@@ -1625,7 +1792,7 @@ class OpenAsReader:
             self._fh = (
                 io.BufferedReader(gzip.open(stream, 'rb'), buffer_size=_BINARY_BUFFER_SIZE)
                 if self.binary
-                else gzip.open(stream, 'rt', encoding='utf-8')
+                else gzip.open(stream, 'rt', encoding=self._encoding, errors=self._errors, newline=self._newline)
             )
         else:
             if self.binary:
@@ -1637,7 +1804,7 @@ class OpenAsReader:
                 self._fh = io.BufferedReader(stream, buffer_size=_BINARY_BUFFER_SIZE)
             else:
                 stream = self._make_counted_stream(raw_stream)
-                self._fh = io.TextIOWrapper(stream, encoding='utf-8')
+                self._fh = io.TextIOWrapper(stream, encoding=self._encoding, errors=self._errors, newline=self._newline)
 
     def _wrap_http(self, parsed: Optional[SplitResult] = None):
         """
@@ -1662,8 +1829,11 @@ class OpenAsReader:
         norm = _normalized_path(self.filename, parsed)
         is_compressed = norm.endswith(('.zst', '.bz2', '.xz', '.gz'))
         get_kwargs = {'stream': True}
-        if is_compressed:
-            get_kwargs['headers'] = {'Accept-Encoding': 'identity'}
+        req_headers = dict(self._headers) if self._headers else {}
+        if is_compressed and not any(k.lower() == 'accept-encoding' for k in req_headers):
+            req_headers['Accept-Encoding'] = 'identity'
+        if req_headers:
+            get_kwargs['headers'] = req_headers
         if self.timeout is not None:
             get_kwargs['timeout'] = self.timeout
         response = _get_http_session().get(self.filename, **get_kwargs)
@@ -1689,7 +1859,7 @@ class OpenAsReader:
             self._fh = (
                 io.BufferedReader(bz2.open(stream, 'rb'), buffer_size=_BINARY_BUFFER_SIZE)
                 if self.binary
-                else bz2.open(stream, 'rt', encoding='utf-8')
+                else bz2.open(stream, 'rt', encoding=self._encoding, errors=self._errors, newline=self._newline)
             )
         elif norm.endswith('.xz'):
             import lzma
@@ -1697,7 +1867,7 @@ class OpenAsReader:
             self._fh = (
                 io.BufferedReader(lzma.open(stream, 'rb'), buffer_size=_BINARY_BUFFER_SIZE)
                 if self.binary
-                else lzma.open(stream, 'rt', encoding='utf-8')
+                else lzma.open(stream, 'rt', encoding=self._encoding, errors=self._errors, newline=self._newline)
             )
         elif norm.endswith('.gz'):
             import gzip
@@ -1705,7 +1875,7 @@ class OpenAsReader:
             self._fh = (
                 io.BufferedReader(gzip.open(stream, 'rb'), buffer_size=_BINARY_BUFFER_SIZE)
                 if self.binary
-                else gzip.open(stream, 'rt', encoding='utf-8')
+                else gzip.open(stream, 'rt', encoding=self._encoding, errors=self._errors, newline=self._newline)
             )
         else:
             content_encoding = response.headers.get('Content-Encoding')
@@ -1719,7 +1889,7 @@ class OpenAsReader:
             self._fh = (
                 io.BufferedReader(stream, buffer_size=_BINARY_BUFFER_SIZE)
                 if self.binary
-                else io.TextIOWrapper(stream, encoding='utf-8')
+                else io.TextIOWrapper(stream, encoding=self._encoding, errors=self._errors, newline=self._newline)
             )
 
     def _wrap_local(self, parsed: Optional[SplitResult] = None):
@@ -1745,7 +1915,11 @@ class OpenAsReader:
             self._fh = self._open_zst_reader(stream)
         elif norm.endswith('.bz2'):
             import bz2
-            open_kwargs = {'mode': 'rb'} if self.binary else {'mode': 'rt', 'encoding': 'utf-8'}
+            open_kwargs = (
+                {'mode': 'rb'}
+                if self.binary
+                else {'mode': 'rt', 'encoding': self._encoding, 'errors': self._errors, 'newline': self._newline}
+            )
             if self.show_progress:
                 self._raw_fh = open(self.filename, 'rb')
                 fh = bz2.open(self._make_counted_stream(self._raw_fh), **open_kwargs)
@@ -1754,7 +1928,11 @@ class OpenAsReader:
             self._fh = io.BufferedReader(fh, buffer_size=_BINARY_BUFFER_SIZE) if self.binary else fh
         elif norm.endswith('.xz'):
             import lzma
-            open_kwargs = {'mode': 'rb'} if self.binary else {'mode': 'rt', 'encoding': 'utf-8'}
+            open_kwargs = (
+                {'mode': 'rb'}
+                if self.binary
+                else {'mode': 'rt', 'encoding': self._encoding, 'errors': self._errors, 'newline': self._newline}
+            )
             if self.show_progress:
                 self._raw_fh = open(self.filename, 'rb')
                 fh = lzma.open(self._make_counted_stream(self._raw_fh), **open_kwargs)
@@ -1763,7 +1941,11 @@ class OpenAsReader:
             self._fh = io.BufferedReader(fh, buffer_size=_BINARY_BUFFER_SIZE) if self.binary else fh
         elif norm.endswith('.gz'):
             import gzip
-            open_kwargs = {'mode': 'rb'} if self.binary else {'mode': 'rt', 'encoding': 'utf-8'}
+            open_kwargs = (
+                {'mode': 'rb'}
+                if self.binary
+                else {'mode': 'rt', 'encoding': self._encoding, 'errors': self._errors, 'newline': self._newline}
+            )
             if self.show_progress:
                 self._raw_fh = open(self.filename, 'rb')
                 fh = gzip.open(self._make_counted_stream(self._raw_fh), **open_kwargs)
@@ -1771,7 +1953,11 @@ class OpenAsReader:
                 fh = gzip.open(self.filename, **open_kwargs)
             self._fh = io.BufferedReader(fh, buffer_size=_BINARY_BUFFER_SIZE) if self.binary else fh
         else:
-            self._fh = open(self.filename, 'rb') if self.binary else open(self.filename, 'r', encoding='utf-8')
+            self._fh = (
+                open(self.filename, 'rb')
+                if self.binary
+                else open(self.filename, 'r', encoding=self._encoding, errors=self._errors, newline=self._newline)
+            )
 
     def open(self) -> 'OpenAsReader':
         """
@@ -1913,7 +2099,7 @@ class OpenAsWriter:
     over local files (`file://` or plain paths), FTP (write only), and SSH/SFTP (write/append),
     with collision-safe sequential `.NNN.bu` backups on overwrite.
 
-    Operates on UTF-8 text (`str`) by default, or raw `bytes` when `binary=True`.
+    Operates on encoded text (`str`, UTF-8 by default) or raw `bytes`-like objects when `binary=True`.
 
     Attributes
     ----------
@@ -1922,9 +2108,9 @@ class OpenAsWriter:
     timeout : float or None
         Optional network timeout in seconds.
     binary : bool
-        When True, stream operations accept raw `bytes`-like data; when False, UTF-8 `str`.
+        When True, stream operations accept raw `bytes`-like data; when False, `str`.
     encoding : str or None
-        `'utf-8'` in text mode, or `None` in binary mode.
+        Effective text encoding in text mode (`'utf-8'` by default), or `None` in binary mode.
     closed : bool
         True when no underlying stream handle is open.
 
@@ -1949,8 +2135,8 @@ class OpenAsWriter:
 
     @property
     def encoding(self) -> Optional[str]:
-        """Return `'utf-8'` in text mode or `None` in binary mode."""
-        return None if self.binary else 'utf-8'
+        """Return the effective text encoding in text mode or `None` in binary mode."""
+        return self._encoding
 
     @property
     def closed(self) -> bool:
@@ -1983,6 +2169,10 @@ class OpenAsWriter:
         show_progress: bool = False,
         timeout: Optional[float] = None,
         binary: bool = False,
+        encoding: Optional[str] = None,
+        errors: Optional[str] = None,
+        newline: Optional[str] = None,
+        key_filename: Optional[Union[str, os.PathLike, Sequence[Union[str, os.PathLike]]]] = None,
     ):
         """
         Initialize OpenAsWriter with a filename.
@@ -1996,7 +2186,15 @@ class OpenAsWriter:
         timeout : float or None, optional
             Optional network timeout in seconds for FTP and SSH/SFTP connections.
         binary : bool, optional
-            If True, write raw `bytes`-like objects instead of UTF-8 `str` (default is False).
+            If True, write raw `bytes`-like objects instead of encoded `str` (default is False).
+        encoding : str or None, optional
+            Text encoding in text mode (defaults to `'utf-8'`). Must be None in binary mode.
+        errors : str or None, optional
+            Codec error handler in text mode (defaults to Python's `'strict'`). Must be None in binary mode.
+        newline : str or None, optional
+            Newline translation mode (`None`, `''`, `'\\n'`, `'\\r'`, or `'\\r\\n'`). Must be None in binary mode.
+        key_filename : str, os.PathLike, Sequence[str | os.PathLike], or None, optional
+            Optional SSH private key path or sequence of paths forwarded to Paramiko `connect()`.
         """
         if show_progress:
             raise NotImplementedError(
@@ -2007,6 +2205,10 @@ class OpenAsWriter:
         self.show_progress = show_progress
         self.timeout = _validate_timeout(timeout)
         self.binary = bool(binary)
+        self._encoding, self._errors, self._newline = _validate_text_options(
+            self.binary, encoding, errors, newline
+        )
+        self._key_filename = _validate_key_filename(key_filename)
         self._append = False
         self._fh = None
         self._raw_fh = None
@@ -2118,27 +2320,47 @@ class OpenAsWriter:
             import zstandard as zstd
             cctx = zstd.ZstdCompressor() if compresslevel is None else zstd.ZstdCompressor(level=compresslevel)
             sw = cctx.stream_writer(adapted)
-            self._fh = sw if self.binary else io.TextIOWrapper(sw, encoding='utf-8')
+            self._fh = (
+                sw
+                if self.binary
+                else io.TextIOWrapper(sw, encoding=self._encoding, errors=self._errors, newline=self._newline)
+            )
         elif norm.endswith('.bz2'):
             import bz2
-            bz2_kwargs = {'mode': 'wb'} if self.binary else {'mode': 'wt', 'encoding': 'utf-8'}
+            bz2_kwargs = (
+                {'mode': 'wb'}
+                if self.binary
+                else {'mode': 'wt', 'encoding': self._encoding, 'errors': self._errors, 'newline': self._newline}
+            )
             if compresslevel is not None:
                 bz2_kwargs['compresslevel'] = compresslevel
             self._fh = bz2.open(adapted, **bz2_kwargs)
         elif norm.endswith('.xz'):
             import lzma
-            lzma_kwargs = {'mode': 'wb'} if self.binary else {'mode': 'wt', 'encoding': 'utf-8'}
+            lzma_kwargs = (
+                {'mode': 'wb'}
+                if self.binary
+                else {'mode': 'wt', 'encoding': self._encoding, 'errors': self._errors, 'newline': self._newline}
+            )
             if compresslevel is not None:
                 lzma_kwargs['preset'] = compresslevel
             self._fh = lzma.open(adapted, **lzma_kwargs)
         elif norm.endswith('.gz'):
             import gzip
-            gz_kwargs = {'mode': 'wb'} if self.binary else {'mode': 'wt', 'encoding': 'utf-8'}
+            gz_kwargs = (
+                {'mode': 'wb'}
+                if self.binary
+                else {'mode': 'wt', 'encoding': self._encoding, 'errors': self._errors, 'newline': self._newline}
+            )
             if compresslevel is not None:
                 gz_kwargs['compresslevel'] = compresslevel
             self._fh = gzip.open(adapted, **gz_kwargs)
         else:
-            self._fh = adapted if self.binary else io.TextIOWrapper(adapted, encoding='utf-8')
+            self._fh = (
+                adapted
+                if self.binary
+                else io.TextIOWrapper(adapted, encoding=self._encoding, errors=self._errors, newline=self._newline)
+            )
 
     def _ssh_backup_if(self, sftp, path):
         """
@@ -2245,6 +2467,8 @@ class OpenAsWriter:
             connect_kwargs['timeout'] = self.timeout
             connect_kwargs['banner_timeout'] = self.timeout
             connect_kwargs['auth_timeout'] = self.timeout
+        if self._key_filename is not None:
+            connect_kwargs['key_filename'] = self._key_filename
 
         try:
             self._ssh_client = client
@@ -2270,12 +2494,18 @@ class OpenAsWriter:
             import zstandard as zstd
             cctx = zstd.ZstdCompressor() if compresslevel is None else zstd.ZstdCompressor(level=compresslevel)
             sw = cctx.stream_writer(self._sftp_file)
-            self._fh = sw if self.binary else io.TextIOWrapper(sw, encoding='utf-8')
+            self._fh = (
+                sw
+                if self.binary
+                else io.TextIOWrapper(sw, encoding=self._encoding, errors=self._errors, newline=self._newline)
+            )
         elif norm.endswith('.bz2'):
             import bz2
             bz2_kwargs = {'mode': codec_mode}
             if not self.binary:
-                bz2_kwargs['encoding'] = 'utf-8'
+                bz2_kwargs['encoding'] = self._encoding
+                bz2_kwargs['errors'] = self._errors
+                bz2_kwargs['newline'] = self._newline
             if compresslevel is not None:
                 bz2_kwargs['compresslevel'] = compresslevel
             self._fh = bz2.open(self._sftp_file, **bz2_kwargs)
@@ -2283,7 +2513,9 @@ class OpenAsWriter:
             import lzma
             lzma_kwargs = {'mode': codec_mode}
             if not self.binary:
-                lzma_kwargs['encoding'] = 'utf-8'
+                lzma_kwargs['encoding'] = self._encoding
+                lzma_kwargs['errors'] = self._errors
+                lzma_kwargs['newline'] = self._newline
             if compresslevel is not None:
                 lzma_kwargs['preset'] = compresslevel
             self._fh = lzma.open(self._sftp_file, **lzma_kwargs)
@@ -2291,13 +2523,19 @@ class OpenAsWriter:
             import gzip
             gz_kwargs = {'mode': codec_mode}
             if not self.binary:
-                gz_kwargs['encoding'] = 'utf-8'
+                gz_kwargs['encoding'] = self._encoding
+                gz_kwargs['errors'] = self._errors
+                gz_kwargs['newline'] = self._newline
             if compresslevel is not None:
                 gz_kwargs['compresslevel'] = compresslevel
             self._fh = gzip.open(self._sftp_file, **gz_kwargs)
         else:
             adapted = _BinaryStreamAdapter(self._sftp_file, readable=False, writable=True)
-            self._fh = adapted if self.binary else io.TextIOWrapper(adapted, encoding='utf-8')
+            self._fh = (
+                adapted
+                if self.binary
+                else io.TextIOWrapper(adapted, encoding=self._encoding, errors=self._errors, newline=self._newline)
+            )
 
     def _backup_local_file(self):
         """Atomically move an existing local file to the next free sequential .bu slot."""
@@ -2417,12 +2655,18 @@ class OpenAsWriter:
             cctx = zstd.ZstdCompressor() if compresslevel is None else zstd.ZstdCompressor(level=compresslevel)
             self._raw_fh = open(self.filename, mode)
             sw = cctx.stream_writer(self._raw_fh)
-            self._fh = sw if self.binary else io.TextIOWrapper(sw, encoding='utf-8')
+            self._fh = (
+                sw
+                if self.binary
+                else io.TextIOWrapper(sw, encoding=self._encoding, errors=self._errors, newline=self._newline)
+            )
         elif norm.endswith('.bz2'):
             import bz2
             bz2_kwargs = {'mode': codec_mode}
             if not self.binary:
-                bz2_kwargs['encoding'] = 'utf-8'
+                bz2_kwargs['encoding'] = self._encoding
+                bz2_kwargs['errors'] = self._errors
+                bz2_kwargs['newline'] = self._newline
             if compresslevel is not None:
                 bz2_kwargs['compresslevel'] = compresslevel
             self._fh = bz2.open(self.filename, **bz2_kwargs)
@@ -2430,7 +2674,9 @@ class OpenAsWriter:
             import lzma
             lzma_kwargs = {'mode': codec_mode}
             if not self.binary:
-                lzma_kwargs['encoding'] = 'utf-8'
+                lzma_kwargs['encoding'] = self._encoding
+                lzma_kwargs['errors'] = self._errors
+                lzma_kwargs['newline'] = self._newline
             if compresslevel is not None:
                 lzma_kwargs['preset'] = compresslevel
             self._fh = lzma.open(self.filename, **lzma_kwargs)
@@ -2438,12 +2684,24 @@ class OpenAsWriter:
             import gzip
             gz_kwargs = {'mode': codec_mode}
             if not self.binary:
-                gz_kwargs['encoding'] = 'utf-8'
+                gz_kwargs['encoding'] = self._encoding
+                gz_kwargs['errors'] = self._errors
+                gz_kwargs['newline'] = self._newline
             if compresslevel is not None:
                 gz_kwargs['compresslevel'] = compresslevel
             self._fh = gzip.open(self.filename, **gz_kwargs)
         else:
-            self._fh = open(self.filename, mode) if self.binary else open(self.filename, 'a' if append else 'w', encoding='utf-8')
+            self._fh = (
+                open(self.filename, mode)
+                if self.binary
+                else open(
+                    self.filename,
+                    'a' if append else 'w',
+                    encoding=self._encoding,
+                    errors=self._errors,
+                    newline=self._newline,
+                )
+            )
 
     def open(self, append: bool = False, backup: bool = True, compresslevel: Optional[int] = None) -> 'OpenAsWriter':
         """
@@ -2586,6 +2844,11 @@ def openas(
     show_progress: bool = False,
     compresslevel: Optional[int] = None,
     timeout: Optional[float] = None,
+    encoding: Optional[str] = None,
+    errors: Optional[str] = None,
+    newline: Optional[str] = None,
+    headers: Optional[Mapping[str, str]] = None,
+    key_filename: Optional[Union[str, os.PathLike, Sequence[Union[str, os.PathLike]]]] = None,
 ) -> Union[OpenAsReader, OpenAsWriter]:
     """
     Open a local or remote stream with transparent compression in text (`str`) or binary (`bytes`) mode.
@@ -2593,7 +2856,8 @@ def openas(
     Supports plain, `.gz`, `.bz2`, `.xz`, and `.zst` over local paths (`file://` or implicit),
     `http://`/`https://` (read-only), `ftp://` (read/write), and `ssh://`/`sftp://` (read/write/append).
 
-    Text modes (`'r'`/`'rt'`, `'w'`/`'wt'`, `'a'`/`'at'`) decode and encode UTF-8 `str`.
+    Text modes (`'r'`/`'rt'`, `'w'`/`'wt'`, `'a'`/`'at'`) decode and encode `str` (UTF-8 by default,
+    configurable via `encoding`, `errors`, and `newline`).
     Binary modes (`'rb'`, `'wb'`, `'ab'`) read and write raw `bytes`.
 
     Parameters
@@ -2601,9 +2865,9 @@ def openas(
     filename : str or os.PathLike
         Path or URL to open (extension matching is case-insensitive and ignores URL query strings).
     mode : str, optional
-        One of `'r'`, `'rt'` (UTF-8 text read, default `'r'`), `'rb'` (binary read),
-        `'w'`, `'wt'` (UTF-8 text write/truncate), `'wb'` (binary write/truncate),
-        `'a'`, `'at'` (UTF-8 text append), or `'ab'` (binary append).
+        One of `'r'`, `'rt'` (text read, default `'r'`), `'rb'` (binary read),
+        `'w'`, `'wt'` (text write/truncate), `'wb'` (binary write/truncate),
+        `'a'`, `'at'` (text append), or `'ab'` (binary append).
     backup : bool or None, optional
         Move an existing target to sequential `.001.bu`..`.999.bu` (or nanosecond timestamp fallback)
         before overwriting. Defaults to `True` in write modes and `False` in append modes; passing
@@ -2616,6 +2880,21 @@ def openas(
         `.bz2` (default 9), and `.gz` (default 9) writers; ignored in read modes.
     timeout : float or None, optional
         Optional network timeout in seconds for HTTP, FTP, and SSH/SFTP connections.
+    encoding : str or None, optional
+        Text encoding in text modes (defaults to `'utf-8'`). Passing a non-None value in binary mode
+        raises `ValueError`.
+    errors : str or None, optional
+        Codec error handling scheme in text modes (defaults to Python's `'strict'`). Passing a non-None
+        value in binary mode raises `ValueError`.
+    newline : str or None, optional
+        Newline translation mode (`None`, `''`, `'\\n'`, `'\\r'`, or `'\\r\\n'`) matching `builtins.open()`.
+        Passing a non-None value in binary mode raises `ValueError`.
+    headers : Mapping[str, str] or None, optional
+        Optional per-request HTTP/HTTPS headers. Validated unconditionally; valid headers are ignored
+        on non-HTTP targets and write/append modes.
+    key_filename : str, os.PathLike, Sequence[str | os.PathLike], or None, optional
+        Optional SSH private key path or non-empty sequence of paths forwarded to Paramiko `connect()`
+        on `ssh://` and `sftp://` targets.
 
     Returns
     -------
@@ -2634,10 +2913,16 @@ def openas(
         If attempting a local, SFTP, or FTP `.bu` backup on an existing directory when writing.
     EOFError
         If reading a truncated `.zst` stream across local, HTTP, FTP, or SFTP transports.
+    LookupError
+        If `encoding` names an unknown text codec.
+    TypeError
+        If `encoding`, `errors`, `newline`, `headers`, `key_filename`, or `compresslevel` has an invalid type.
     ValueError
         If `mode` is unsupported, `backup=True` is combined with append, `timeout` is non-positive
-        or non-finite, a URL omits a hostname, specifies an invalid or zero port (outside `1..65535`),
-        or has an empty path on `file://`, `ftp://`, `ssh://`, or `sftp://`, or `compresslevel` is out of range.
+        or non-finite, text options are passed in binary mode, `newline` is invalid, `headers` contains
+        an empty name or CR/LF/NUL characters, `key_filename` is empty, a URL omits a hostname, specifies
+        an invalid or zero port (outside `1..65535`), or has an empty path on `file://`, `ftp://`,
+        `ssh://`, or `sftp://`, or `compresslevel` is out of range.
     NotImplementedError
         If `show_progress=True` is passed with write or append modes.
 
@@ -2657,17 +2942,47 @@ def openas(
             "Pass show_progress=False (default) when writing or appending."
         )
     if mode in ('r', 'rt', 'rb'):
-        return OpenAsReader(filename, show_progress=show_progress, timeout=timeout, binary=(mode == 'rb')).open()
+        return OpenAsReader(
+            filename,
+            show_progress=show_progress,
+            timeout=timeout,
+            binary=(mode == 'rb'),
+            encoding=encoding,
+            errors=errors,
+            newline=newline,
+            headers=headers,
+            key_filename=key_filename,
+        ).open()
     elif mode in ('w', 'wt', 'wb'):
+        _validate_headers(headers)
         effective_backup = True if backup is None else backup
-        return OpenAsWriter(filename, show_progress=show_progress, timeout=timeout, binary=(mode == 'wb')).open(
+        return OpenAsWriter(
+            filename,
+            show_progress=show_progress,
+            timeout=timeout,
+            binary=(mode == 'wb'),
+            encoding=encoding,
+            errors=errors,
+            newline=newline,
+            key_filename=key_filename,
+        ).open(
             append=False,
             backup=effective_backup,
             compresslevel=compresslevel,
         )
     elif mode in ('a', 'at', 'ab'):
+        _validate_headers(headers)
         effective_backup = False if backup is None else backup
-        return OpenAsWriter(filename, show_progress=show_progress, timeout=timeout, binary=(mode == 'ab')).open(
+        return OpenAsWriter(
+            filename,
+            show_progress=show_progress,
+            timeout=timeout,
+            binary=(mode == 'ab'),
+            encoding=encoding,
+            errors=errors,
+            newline=newline,
+            key_filename=key_filename,
+        ).open(
             append=True,
             backup=effective_backup,
             compresslevel=compresslevel,

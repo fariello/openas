@@ -400,3 +400,159 @@ def test_non_finite_timeout_and_format_bytes(tmp_path, bad_timeout):
         openas(target, "r", timeout=bad_timeout)
 
     assert format_bytes(bad_timeout) == f"{bad_timeout}B"
+
+
+@pytest.mark.parametrize("mode", ["rb", "wb", "ab"])
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"encoding": "utf-8"},
+        {"errors": "replace"},
+        {"newline": "\n"},
+        {"newline": ""},
+    ],
+)
+def test_binary_mode_rejects_encoding_errors_and_newline(tmp_path, mode, kwargs):
+    """ckmclg E-01: Binary modes raise ValueError when encoding, errors, or newline is non-None."""
+    from openas import OpenAsReader, OpenAsWriter
+
+    target = tmp_path / "bin_guard.txt"
+    target.write_bytes(b"original\n")
+
+    with pytest.raises(ValueError, match="binary mode"):
+        openas(target, mode, **kwargs)
+    assert not os.path.exists(f"{target}.001.bu")
+    assert target.read_bytes() == b"original\n"
+
+    if mode == "rb":
+        with pytest.raises(ValueError, match="binary mode"):
+            OpenAsReader(target, binary=True, **kwargs)
+    else:
+        with pytest.raises(ValueError, match="binary mode"):
+            OpenAsWriter(target, binary=True, **kwargs)
+
+
+@pytest.mark.parametrize(
+    "kwargs,exc_type",
+    [
+        ({"encoding": 123}, TypeError),
+        ({"encoding": b"utf-8"}, TypeError),
+        ({"encoding": "not-a-real-codec-xyz"}, LookupError),
+        ({"encoding": ""}, LookupError),
+        ({"errors": 123}, TypeError),
+        ({"errors": b"strict"}, TypeError),
+        ({"newline": 123}, TypeError),
+        ({"newline": b"\n"}, TypeError),
+        ({"newline": "\n\r"}, ValueError),
+        ({"newline": "invalid"}, ValueError),
+    ],
+)
+def test_invalid_encoding_errors_newline_fail_before_backup(tmp_path, kwargs, exc_type):
+    """ckmclg E-01: Invalid encoding/errors/newline raise TypeError/LookupError/ValueError before creating .001.bu."""
+    from openas import OpenAsReader, OpenAsWriter
+
+    target = tmp_path / "text_opt_guard.txt"
+    target.write_text("keep original\n", encoding="utf-8")
+
+    with pytest.raises(exc_type):
+        openas(target, "w", backup=True, **kwargs)
+    assert not os.path.exists(f"{target}.001.bu")
+    assert target.read_text(encoding="utf-8") == "keep original\n"
+
+    with pytest.raises(exc_type):
+        OpenAsReader(target, **kwargs)
+    with pytest.raises(exc_type):
+        OpenAsWriter(target, **kwargs)
+
+
+def test_http_headers_validation_guards_redaction_and_writer_exclusion(tmp_path):
+    """ckmclg E-03: Header type/CRLF/NUL/empty guards never echo secrets, validate on write/append before backup, and OpenAsWriter rejects headers."""
+    from openas import OpenAsReader, OpenAsWriter
+
+    target = tmp_path / "headers_guard.txt"
+    target.write_text("original\n", encoding="utf-8")
+
+    # Non-mapping, non-str key, non-str value -> TypeError without echoing values
+    for bad_headers in (
+        "Authorization: secret",
+        [("Authorization", "Bearer secret")],
+        {123: "Bearer secret"},
+        {"Authorization": 987654321},
+        {"Authorization": b"Bearer secret"},
+    ):
+        with pytest.raises(TypeError) as excinfo:
+            openas(target, "r", headers=bad_headers)
+        msg = str(excinfo.value)
+        assert "secret" not in msg
+        assert "987654321" not in msg
+
+        # Also validated unconditionally on write/append before .001.bu backup
+        with pytest.raises(TypeError):
+            openas(target, "w", backup=True, headers=bad_headers)
+        assert not os.path.exists(f"{target}.001.bu")
+        assert target.read_text(encoding="utf-8") == "original\n"
+
+    # Empty/whitespace header name, CR, LF, NUL in name or value -> ValueError without echoing secret values
+    secret_val = "Bearer ultra-secret-token-xyz"
+    for bad_headers in (
+        {"": secret_val},
+        {"   ": secret_val},
+        {"X-Bad\rName": secret_val},
+        {"X-Bad\nName": secret_val},
+        {"X-Bad\x00Name": secret_val},
+        {"Authorization": f"{secret_val}\r\nX-Injected: 1"},
+        {"Authorization": f"{secret_val}\nInjected"},
+        {"Authorization": f"{secret_val}\x00Injected"},
+    ):
+        with pytest.raises(ValueError) as excinfo:
+            OpenAsReader("https://example.com/data.txt", headers=bad_headers)
+        msg = str(excinfo.value)
+        assert "ultra-secret-token-xyz" not in msg
+        assert "X-Injected" not in msg
+
+        with pytest.raises(ValueError):
+            openas(target, "a", headers=bad_headers)
+
+    # Valid headers are ignored on non-HTTP targets (read/write/append)
+    with openas(target, "w", backup=False, headers={"Authorization": "Bearer ok"}) as w:
+        w.write("updated\n")
+    with openas(target, "r", headers={"Authorization": "Bearer ok"}) as r:
+        assert r.read() == "updated\n"
+
+    # OpenAsWriter does not accept headers
+    with pytest.raises(TypeError):
+        OpenAsWriter(target, headers={"Authorization": "Bearer ok"})
+
+
+@pytest.mark.parametrize(
+    "bad_key,exc_type",
+    [
+        (b"/path/to/key", TypeError),
+        (bytearray(b"/path/to/key"), TypeError),
+        (123, TypeError),
+        ({"key": "/path"}, TypeError),
+        ({"/path/to/key"}, TypeError),
+        (["/valid/key", b"/bytes/key"], TypeError),
+        (["/valid/key", 42], TypeError),
+        ("", ValueError),
+        ([], ValueError),
+        ((), ValueError),
+        (["/valid/key", ""], ValueError),
+    ],
+)
+def test_key_filename_validation_guards_fail_before_backup(tmp_path, bad_key, exc_type):
+    """ckmclg E-04: Invalid key_filename raises TypeError/ValueError before creating .001.bu backup."""
+    from openas import OpenAsReader, OpenAsWriter
+
+    target = tmp_path / "key_guard.txt"
+    target.write_text("keep me\n", encoding="utf-8")
+
+    with pytest.raises(exc_type):
+        openas(target, "w", backup=True, key_filename=bad_key)
+    assert not os.path.exists(f"{target}.001.bu")
+    assert target.read_text(encoding="utf-8") == "keep me\n"
+
+    with pytest.raises(exc_type):
+        OpenAsReader("sftp://user@host/file.txt", key_filename=bad_key)
+    with pytest.raises(exc_type):
+        OpenAsWriter("sftp://user@host/file.txt", key_filename=bad_key)

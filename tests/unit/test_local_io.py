@@ -290,17 +290,22 @@ def test_compressed_progress_tracks_raw_bytes(tmp_path, ext):
 
 
 def test_lazy_imports_and_ftp_session_wrapper_factory():
-    """PERF-06: import openas loads no optional stdlib/FTP modules; FTPSessionWrapper is cached."""
+    """PERF-06 / ckmclg E-05: import openas loads no optional stdlib/third-party modules; FTPSessionWrapper is internal to openas.openas."""
     script = (
         "import sys; "
         "before = set(sys.modules); "
         "import openas; "
         "added = set(sys.modules) - before; "
-        "forbidden = ('argparse', 'ftplib', 'ssl', 'bz2', 'gzip', 'lzma', 'urllib.parse'); "
+        "forbidden = ("
+        "'argparse', 'ftplib', 'ssl', 'bz2', 'gzip', 'lzma', 'urllib.parse', "
+        "'paramiko', 'ftputil', 'requests', 'zstandard', 'tqdm'"
+        "); "
         "loaded = [m for m in forbidden if m in added]; "
         "assert loaded == [], f'unexpected eager imports: {loaded}'; "
-        "from openas import FTPSessionWrapper as A; "
-        "from openas import FTPSessionWrapper as B; "
+        "assert 'FTPSessionWrapper' not in openas.__all__; "
+        "assert not hasattr(openas, 'FTPSessionWrapper'); "
+        "from openas.openas import FTPSessionWrapper as A; "
+        "from openas.openas import FTPSessionWrapper as B; "
         "import ftplib; "
         "assert issubclass(A, ftplib.FTP); "
         "assert A is B; "
@@ -1801,3 +1806,211 @@ def test_readinto_typed_buffers_and_zero_length_across_stream_adapters():
         nb_zst = _ZstdFrameValidatingStream(NonBlockingStream(with_readinto=with_ri))
         nb_zst._feed(full_zst[:8])
         assert nb_zst.readinto(array.array("I", [0])) is None
+
+
+@pytest.mark.parametrize("ext", ["", ".gz", ".bz2", ".xz", ".zst"])
+def test_local_text_encoding_errors_newline_and_csv_writer(tmp_path, ext):
+    """ckmclg E-01: encoding='latin-1', errors='replace', newline='' (csv.writer), newline='\\n', and .encoding."""
+    import csv
+
+    # 1. latin-1 write/append/read round-trip and .encoding reporting
+    latin_fp = tmp_path / f"latin1{ext or '.txt'}"
+    with openas(latin_fp, "w", backup=False, encoding="latin-1") as w:
+        assert w.encoding == "latin-1"
+        w.write("café naïve\n")
+    with openas(latin_fp, "a", encoding="latin-1") as w:
+        assert w.encoding == "latin-1"
+        w.write("über\n")
+    with openas(latin_fp, "r", encoding="latin-1") as r:
+        assert r.encoding == "latin-1"
+        assert r.read() == "café naïve\nüber\n"
+    with openas(latin_fp, "rb") as r:
+        assert r.encoding is None
+        raw = r.read()
+        assert raw == f"café naïve{os.linesep}über{os.linesep}".encode("latin-1")
+
+    # 2. Dirty stream decoded cleanly with errors='replace'
+    dirty_fp = tmp_path / f"dirty{ext or '.txt'}"
+    with openas(dirty_fp, "wb", backup=False) as w:
+        w.write(b"ok-\xff\xfe-tail\n")
+    with openas(dirty_fp, "r", encoding="utf-8", errors="replace") as r:
+        assert r.encoding == "utf-8"
+        assert r.read() == "ok-\ufffd\ufffd-tail\n"
+
+    # 3. newline='' with csv.writer preserves exact CRLF without doubled blank rows
+    csv_fp = tmp_path / f"table{ext or '.csv'}"
+    rows = [["id", "name"], ["1", "alice"], ["2", "bob"]]
+    with openas(csv_fp, "w", backup=False, newline="") as w:
+        writer = csv.writer(w)
+        writer.writerows(rows)
+    with openas(csv_fp, "rb") as r:
+        assert r.read() == b"id,name\r\n1,alice\r\n2,bob\r\n"
+    with openas(csv_fp, "r", newline="") as r:
+        assert list(csv.reader(r)) == rows
+    with openas(csv_fp, "r", newline="") as r:
+        assert list(r) == ["id,name\r\n", "1,alice\r\n", "2,bob\r\n"]
+
+    # 4. newline='\n' writes exact LF bytes regardless of platform os.linesep
+    lf_fp = tmp_path / f"lf_only{ext or '.txt'}"
+    with openas(lf_fp, "w", backup=False, newline="\n") as w:
+        w.write("line1\nline2\n")
+    with openas(lf_fp, "rb") as r:
+        assert r.read() == b"line1\nline2\n"
+
+
+def test_local_plain_progress_with_non_utf8_errors_replace_and_newline(tmp_path):
+    """ckmclg E-01: Plain-local show_progress=True works with latin-1, ascii+errors='replace', and newline='' without error."""
+    import io as _io
+
+    # 1. latin-1 with show_progress=True tracks exact byte length
+    latin_fp = tmp_path / "prog_latin1.txt"
+    latin_raw = "café\nnaïve\nüber\n".encode("latin-1")
+    latin_fp.write_bytes(latin_raw)
+    with OpenAsReader(latin_fp, show_progress=True, encoding="latin-1") as r:
+        pbar = r._progress
+        assert pbar is not None
+        assert pbar.total == len(latin_raw)
+        assert list(r) == ["café\n", "naïve\n", "über\n"]
+        assert pbar.n == len(latin_raw)
+
+    # 2. Lossy ascii + errors='replace' produces U+FFFD which cannot strict-encode to ascii; must not raise UnicodeEncodeError
+    dirty_fp = tmp_path / "prog_dirty.txt"
+    dirty_fp.write_bytes(b"abc\xff\xfe\ndef\x80\n")
+    for enc in ("ascii", "latin-1", "utf-8"):
+        with OpenAsReader(dirty_fp, show_progress=True, encoding=enc, errors="replace") as r:
+            lines = list(r)
+            assert len(lines) == 2
+        with OpenAsReader(dirty_fp, show_progress=True, encoding=enc, errors="replace") as r:
+            first = r.readline()
+            rest = r.read()
+            assert first + rest == "".join(lines)
+
+    # 3. newline='' on CRLF file preserves '\r\n' and skips _reconcile_crlf_eof_progress()
+    crlf_fp = tmp_path / "prog_crlf_raw.txt"
+    crlf_raw = b"one\r\ntwo\r\n"
+    crlf_fp.write_bytes(crlf_raw)
+    with OpenAsReader(crlf_fp, show_progress=True, newline="") as r:
+        pbar = r._progress
+        assert pbar is not None
+        assert list(r) == ["one\r\n", "two\r\n"]
+        assert pbar.n == len(crlf_raw)
+    # Verify _reconcile_crlf_eof_progress() returns immediately when newline is not None
+    with OpenAsReader(crlf_fp, show_progress=True, newline="") as r:
+        pbar = r._progress
+        assert pbar is not None
+        r.readline()
+        n_before = pbar.n
+        r._reconcile_crlf_eof_progress()
+        assert pbar.n == n_before
+
+    # 4. Internal fallback decode paths (_iter_decoded, _iter_progress, read, readline) with errors=None and errors='replace'
+    class RawByteHandle:
+        def __init__(self, data: bytes):
+            self._buf = _io.BytesIO(data)
+
+        def __iter__(self):
+            return iter(self._buf)
+
+        def read(self, size=-1):
+            return self._buf.read() if (size is None or size < 0) else self._buf.read(size)
+
+        def readline(self, size=-1):
+            return self._buf.readline() if (size is None or size < 0) else self._buf.readline(size)
+
+        def close(self):
+            self._buf.close()
+
+    r_dec = OpenAsReader(dirty_fp, encoding="utf-8", errors="replace")
+    r_dec._fh = RawByteHandle(b"hi\xff\nthere\n")
+    try:
+        assert list(r_dec) == ["hi\ufffd\n", "there\n"]
+    finally:
+        r_dec.close()
+
+    r_dec2 = OpenAsReader(dirty_fp, encoding="utf-8", errors=None)
+    r_dec2._fh = RawByteHandle(b"ok\nline2\n")
+    try:
+        assert r_dec2.readline() == "ok\n"
+        assert r_dec2.read() == "line2\n"
+    finally:
+        r_dec2.close()
+
+
+@pytest.mark.parametrize("ext", ["", ".gz", ".zst"])
+def test_openas_reader_textiowrapper_composability_read1_and_flush(tmp_path, ext):
+    """ckmclg E-02: io.TextIOWrapper(openas(path, 'rb')) composes cleanly with zero ResourceWarning, plus flush/read1."""
+    import io as _io
+
+    fp = tmp_path / f"compose{ext or '.txt'}"
+    raw_payload = "café line 1\nnaïve line 2\n".encode("latin-1")
+    with openas(fp, "wb", backup=False) as w:
+        w.write(raw_payload)
+
+    # 1. Direct `with io.TextIOWrapper(openas(path, "rb"), ...)` closes cleanly with zero ResourceWarning
+    with _io.TextIOWrapper(openas(fp, "rb"), encoding="latin-1", errors="replace") as wrapper:
+        assert list(wrapper) == ["café line 1\n", "naïve line 2\n"]
+
+    # 2. `detach()` inside `with openas(path, "rb") as raw:` closes cleanly with zero ResourceWarning
+    with openas(fp, "rb") as raw:
+        wrapper = _io.TextIOWrapper(raw, encoding="latin-1", errors="replace")
+        try:
+            assert wrapper.read() == "café line 1\nnaïve line 2\n"
+        finally:
+            detached = wrapper.detach()
+            assert detached is raw
+        assert not raw.closed
+    assert raw.closed
+
+    # 3. OpenAsReader.flush() succeeds when open and raises ValueError when closed (text & binary)
+    for mode in ("r", "rb"):
+        r = openas(fp, mode, **({"encoding": "latin-1"} if mode == "r" else {}))
+        r.flush()
+        r.close()
+        with pytest.raises(ValueError, match="closed"):
+            r.flush()
+
+    # 4. OpenAsReader.read1() in binary mode (with show_progress=True), closed ValueError, and text UnsupportedOperation
+    raw_size = fp.stat().st_size
+    with openas(fp, "rb", show_progress=True) as r:
+        pbar = r._progress
+        assert pbar is not None
+        assert r.read1(0) == b""
+        first = r.read1(4)
+        assert first == raw_payload[:4]
+        chunks = [first]
+        while True:
+            part = r.read1()
+            if not part:
+                break
+            chunks.append(part)
+        assert b"".join(chunks) == raw_payload
+        assert pbar.n == raw_size
+    with pytest.raises(ValueError, match="closed"):
+        r.read1()
+
+    with openas(fp, "r", encoding="latin-1") as r_txt:
+        with pytest.raises(_io.UnsupportedOperation):
+            r_txt.read1()
+    with pytest.raises(ValueError, match="closed"):
+        r_txt.read1()
+
+    # 5. read1() fallback when underlying handle lacks read1()
+    if ext == "":
+        class ReadOnlyNoRead1:
+            def __init__(self, data: bytes):
+                self._buf = _io.BytesIO(data)
+
+            def read(self, size=-1):
+                return self._buf.read() if (size is None or size < 0) else self._buf.read(size)
+
+            def close(self):
+                self._buf.close()
+
+        r_fb = OpenAsReader(fp, binary=True)
+        r_fb._fh = ReadOnlyNoRead1(b"abcdef")
+        try:
+            assert r_fb.read1(2) == b"ab"
+            assert r_fb.read1(None) == b"cdef"
+            assert r_fb.read1(-1) == b""
+        finally:
+            r_fb.close()

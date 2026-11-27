@@ -943,7 +943,7 @@ def test_ftp_real_ftpfile_contract_reads_writes_and_append_rejected(mock_host, e
 def test_ftp_session_wrapper_port_timeout_and_login_failure_closes_socket(monkeypatch):
     """S2-MEM1 & S3-T1: FTPSessionWrapper forwards port/timeout and closes socket if login() raises."""
     import ftplib
-    from openas import FTPSessionWrapper
+    from openas.openas import FTPSessionWrapper
 
     calls = []
     closed = []
@@ -1935,3 +1935,249 @@ def test_exited_thread_http_session_reclaimed_and_closed_after_gc():
     assert closed_count == worker_session_ids
     assert all(id(s) != worker_session_ids[0] for s in openas_mod._http_sessions_registry)
     assert any(s is main_session for s in openas_mod._http_sessions_registry)
+
+
+@pytest.mark.parametrize("ext", ["", ".gz", ".bz2", ".xz", ".zst"])
+def test_remote_text_encoding_errors_and_newline_http_ftp_sftp(ext):
+    """ckmclg E-01: HTTP, FTP, and SFTP forward encoding, errors, and newline on reads and writes."""
+    latin_text = "café\nnaïve\n"
+    latin_lf_bytes = latin_text.encode("latin-1")
+    dirty_bytes = b"good-\xff-end\r\n"
+
+    def _encode(raw: bytes) -> bytes:
+        if ext == ".gz":
+            return gzip.compress(raw)
+        if ext == ".bz2":
+            return bz2.compress(raw)
+        if ext == ".xz":
+            return lzma.compress(raw)
+        if ext == ".zst":
+            return zstd.ZstdCompressor().compress(raw)
+        return raw
+
+    # 1. HTTP read with encoding='latin-1', errors='replace', and newline=''
+    with patch("requests.Session.get") as mock_get:
+        resp_latin = MagicMock()
+        resp_latin.headers = {}
+        resp_latin.raw = io.BytesIO(_encode(latin_lf_bytes))
+        mock_get.return_value = resp_latin
+        with openas(f"https://example.com/doc{ext or '.txt'}", "r", encoding="latin-1") as r:
+            assert r.encoding == "latin-1"
+            assert r.read() == latin_text
+
+        resp_dirty = MagicMock()
+        resp_dirty.headers = {}
+        resp_dirty.raw = io.BytesIO(_encode(dirty_bytes))
+        mock_get.return_value = resp_dirty
+        with openas(
+            f"https://example.com/dirty{ext or '.txt'}", "r", encoding="utf-8", errors="replace", newline=""
+        ) as r:
+            assert r.read() == "good-\ufffd-end\r\n"
+
+    # 2. FTP write with encoding='latin-1' + newline='\n' and read back with encoding='latin-1' / errors='replace'
+    with patch("ftputil.FTPHost") as mock_ftp:
+        host = MagicMock()
+        mock_ftp.return_value = host
+        write_proxy = _StrictFTPFileProxy()
+        host.open.return_value = write_proxy
+        with openas(
+            f"ftp://u:p@host/dir/out{ext or '.txt'}", "w", backup=False, encoding="latin-1", newline="\n"
+        ) as w:
+            assert w.encoding == "latin-1"
+            w.write(latin_text)
+        assert write_proxy.closed
+        if ext:
+            if ext == ".gz":
+                assert gzip.decompress(write_proxy.saved_bytes) == latin_lf_bytes
+            elif ext == ".bz2":
+                assert bz2.decompress(write_proxy.saved_bytes) == latin_lf_bytes
+            elif ext == ".xz":
+                assert lzma.decompress(write_proxy.saved_bytes) == latin_lf_bytes
+            else:
+                assert zstd.ZstdDecompressor().stream_reader(io.BytesIO(write_proxy.saved_bytes)).read() == latin_lf_bytes
+        else:
+            assert write_proxy.saved_bytes == latin_lf_bytes
+
+        host.open.return_value = _StrictFTPFileProxy(write_proxy.saved_bytes)
+        with openas(f"ftp://u:p@host/dir/out{ext or '.txt'}", "r", encoding="latin-1") as r:
+            assert r.read() == latin_text
+
+        host.open.return_value = _StrictFTPFileProxy(_encode(dirty_bytes))
+        with openas(
+            f"ftp://u:p@host/dir/dirty{ext or '.txt'}", "r", encoding="utf-8", errors="replace", newline=""
+        ) as r:
+            assert r.read() == "good-\ufffd-end\r\n"
+
+    # 3. SFTP write with encoding='latin-1' + newline='\n' and read back
+    with patch("paramiko.SSHClient") as mock_ssh:
+        client = MagicMock()
+        sftp = MagicMock()
+        mock_ssh.return_value = client
+        client.open_sftp.return_value = sftp
+
+        sftp_write = _InspectableBytesIO()
+        sftp.file.return_value = sftp_write
+        with openas(
+            f"sftp://u@host/dir/out{ext or '.txt'}", "w", backup=False, encoding="latin-1", newline="\n"
+        ) as w:
+            assert w.encoding == "latin-1"
+            w.write(latin_text)
+        assert sftp_write.closed
+
+        sftp.file.return_value = io.BytesIO(sftp_write.saved_bytes)
+        with openas(f"sftp://u@host/dir/out{ext or '.txt'}", "r", encoding="latin-1", newline="") as r:
+            assert r.read() == latin_text
+
+        sftp.file.return_value = io.BytesIO(_encode(dirty_bytes))
+        with openas(
+            f"sftp://u@host/dir/dirty{ext or '.txt'}", "r", encoding="utf-8", errors="replace", newline=""
+        ) as r:
+            assert r.read() == "good-\ufffd-end\r\n"
+
+
+def test_http_custom_headers_accept_encoding_isolation_and_repr():
+    """ckmclg E-03: Custom HTTP headers, Accept-Encoding preservation/override, defensive copy, session isolation, and repr."""
+    plain_body = b"hello headers\n"
+    gz_body = gzip.compress(b"hello gz headers\n")
+    recorded = []
+
+    class HeaderInspectHandler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            recorded.append(
+                {
+                    "path": self.path,
+                    "authorization": self.headers.get("Authorization"),
+                    "user-agent": self.headers.get("User-Agent"),
+                    "accept-encoding": self.headers.get("Accept-Encoding"),
+                    "x-custom": self.headers.get("X-Custom"),
+                }
+            )
+            body = gz_body if self.path.endswith(".gz") else plain_body
+            self.send_response(200)
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, format, *args):  # noqa: A002
+            return
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), HeaderInspectHandler)
+    port = server.server_address[1]
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        # 1. Custom Authorization + User-Agent on compressed URL preserves Accept-Encoding: identity; caller dict not mutated
+        caller_headers = {
+            "Authorization": "Bearer super-secret-tok",
+            "User-Agent": "openas-test/1.0",
+        }
+        reader = OpenAsReader(
+            f"http://127.0.0.1:{port}/data.txt.gz",
+            headers=caller_headers,
+            timeout=5.0,
+        )
+        # Mutating caller's dict after __init__ must not affect the request
+        caller_headers["X-Custom"] = "mutated-after-init"
+        caller_headers["Authorization"] = "Bearer wrong"
+
+        # repr() must never expose header names or values
+        rep = repr(reader)
+        assert "super-secret-tok" not in rep
+        assert "Authorization" not in rep
+        assert "openas-test/1.0" not in rep
+
+        with reader:
+            assert reader.read() == "hello gz headers\n"
+        assert "Accept-Encoding" not in caller_headers
+        assert recorded[-1]["authorization"] == "Bearer super-secret-tok"
+        assert recorded[-1]["user-agent"] == "openas-test/1.0"
+        assert recorded[-1]["accept-encoding"] == "identity"
+        assert recorded[-1]["x-custom"] is None
+
+        # 2. Subsequent request without headers on the same thread-local Session must not receive previous headers
+        with openas(f"http://127.0.0.1:{port}/plain.txt", "r", timeout=5.0) as r2:
+            assert r2.read() == "hello headers\n"
+        assert recorded[-1]["authorization"] is None
+        assert recorded[-1]["user-agent"] != "openas-test/1.0"
+
+        # 3. Case-insensitive Accept-Encoding override on compressed URL
+        with openas(
+            f"http://127.0.0.1:{port}/override.txt.gz",
+            "r",
+            headers={"accept-encoding": "gzip, identity"},
+            timeout=5.0,
+        ) as r3:
+            assert r3.read() == "hello gz headers\n"
+        assert recorded[-1]["accept-encoding"] == "gzip, identity"
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+@patch("paramiko.SSHClient")
+def test_ssh_key_filename_forwarding_omission_and_repr(mock_ssh, tmp_path):
+    """ckmclg E-04: key_filename (str, Path, sequence) forwards to Paramiko connect(), omitted when None and in repr()."""
+    from pathlib import Path
+
+    key1 = tmp_path / "deploy_ed25519"
+    key2 = tmp_path / "fallback_rsa"
+
+    cases = [
+        (None, None),
+        (str(key1), str(key1)),
+        (Path(key1), str(key1)),
+        ([Path(key1), str(key2)], [str(key1), str(key2)]),
+        ((Path(key1),), [str(key1)]),
+    ]
+
+    for passed, expected in cases:
+        # Reader
+        client = MagicMock()
+        sftp = MagicMock()
+        client.open_sftp.return_value = sftp
+        sftp.file.return_value = io.BytesIO(b"ssh ok\n")
+        mock_ssh.return_value = client
+
+        reader = OpenAsReader("sftp://user@host/dir/in.txt", key_filename=passed)
+        if passed is not None:
+            assert str(key1) not in repr(reader)
+        with reader:
+            assert reader.read() == "ssh ok\n"
+        connect_kwargs = client.connect.call_args.kwargs
+        if expected is None:
+            assert "key_filename" not in connect_kwargs
+        else:
+            assert connect_kwargs["key_filename"] == expected
+
+        # Writer (via openas)
+        client_w = MagicMock()
+        sftp_w = MagicMock()
+        buf_w = _InspectableBytesIO()
+        client_w.open_sftp.return_value = sftp_w
+        sftp_w.file.return_value = buf_w
+        mock_ssh.return_value = client_w
+
+        with openas("sftp://user@host/dir/out.txt", "w", backup=False, key_filename=passed) as w:
+            if passed is not None:
+                assert str(key1) not in repr(w)
+            w.write("written\n")
+        connect_kwargs_w = client_w.connect.call_args.kwargs
+        if expected is None:
+            assert "key_filename" not in connect_kwargs_w
+        else:
+            assert connect_kwargs_w["key_filename"] == expected
+
+    # Defensive copy: mutating caller list after __init__ does not alter connect_kwargs
+    key_list = [str(key1)]
+    client_d = MagicMock()
+    sftp_d = MagicMock()
+    client_d.open_sftp.return_value = sftp_d
+    sftp_d.file.return_value = io.BytesIO(b"defensive\n")
+    mock_ssh.return_value = client_d
+    reader_d = OpenAsReader("sftp://user@host/dir/in.txt", key_filename=key_list)
+    key_list.append(str(key2))
+    with reader_d:
+        assert reader_d.read() == "defensive\n"
+    assert client_d.connect.call_args.kwargs["key_filename"] == [str(key1)]
