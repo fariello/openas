@@ -1511,6 +1511,9 @@ def test_local_backup_moves_broken_and_valid_symlinks_without_following(tmp_path
         raise
     probe_link.unlink()
 
+    def _norm_link_target(target_path: str) -> str:
+        return target_path[4:] if os.name == "nt" and target_path.startswith("\\\\?\\") else target_path
+
     def _run_case(case_dir):
         case_dir.mkdir()
         # 1. Broken symlink: moved to .001.bu, dangling target never created, new regular file at path
@@ -1523,7 +1526,7 @@ def test_local_backup_moves_broken_and_valid_symlinks_without_following(tmp_path
 
         broken_bu = case_dir / "broken.txt.001.bu"
         assert os.path.islink(broken_bu)
-        assert os.readlink(broken_bu) == str(dangling_target)
+        assert _norm_link_target(os.readlink(broken_bu)) == str(dangling_target)
         assert not os.path.lexists(dangling_target)
         assert not os.path.islink(broken_link)
         assert broken_link.read_text(encoding="utf-8") == "fresh regular\n"
@@ -1539,7 +1542,7 @@ def test_local_backup_moves_broken_and_valid_symlinks_without_following(tmp_path
 
         valid_bu = case_dir / "alias.txt.001.bu"
         assert os.path.islink(valid_bu)
-        assert os.readlink(valid_bu) == str(real_file)
+        assert _norm_link_target(os.readlink(valid_bu)) == str(real_file)
         assert os.stat(real_file).st_nlink == 1
         assert real_file.read_text(encoding="utf-8") == "precious target\n"
         assert not os.path.islink(valid_link)
@@ -1572,10 +1575,10 @@ def test_local_backup_moves_broken_and_valid_symlinks_without_following(tmp_path
         with openas(target_sym, "w", backup=True) as w:
             w.write("after collision\n")
         assert os.path.islink(pre_bu)
-        assert os.readlink(pre_bu) == str(fallback_dir / "nonexistent_bu_target")
+        assert _norm_link_target(os.readlink(pre_bu)) == str(fallback_dir / "nonexistent_bu_target")
         bu2 = fallback_dir / "collide.txt.002.bu"
         assert os.path.islink(bu2)
-        assert os.readlink(bu2) == str(dangling2)
+        assert _norm_link_target(os.readlink(bu2)) == str(dangling2)
         assert target_sym.read_text(encoding="utf-8") == "after collision\n"
 
     # Path C: os.link raises FileNotFoundError on a broken symlink (following symlink) while lexists(src) is True
@@ -1590,7 +1593,7 @@ def test_local_backup_moves_broken_and_valid_symlinks_without_following(tmp_path
                 w.write("recovered\n")
     bu3 = fnf_dir / "sym3.txt.001.bu"
     assert os.path.islink(bu3)
-    assert os.readlink(bu3) == str(dangling3)
+    assert _norm_link_target(os.readlink(bu3)) == str(dangling3)
     assert not os.path.lexists(dangling3)
     assert not os.path.islink(sym3)
     assert sym3.read_text(encoding="utf-8") == "recovered\n"

@@ -66,7 +66,7 @@ jobs:
           python -m pip install dist/*.tar.gz
           python -m pip install --force-reinstall --no-deps dist/*.whl
           CHECKOUT_SRC="$(pwd)/src"
-          WHEEL_PATH="$(ls dist/*.whl)"
+          WHEEL_PATH="$(pwd)/$(ls dist/*.whl)"
           SMOKE_DIR="$(mktemp -d)"
           trap 'rm -rf "$SMOKE_DIR"' EXIT
           cd "$SMOKE_DIR"
