@@ -19,7 +19,7 @@ See [GUIDING_PRINCIPLES.md](GUIDING_PRINCIPLES.md) and [DECISIONS.md](DECISIONS.
 
 - **Line-by-Line Streaming and Transparent Compression:** Streams plain, `.gz`, `.bz2`, `.xz`, and multi-frame `.zst` files on the fly in text (`'r'`/`'rt'`, `'w'`/`'wt'`, `'a'`/`'at'`, UTF-8 by default with `builtins.open()`-compatible `encoding`, `errors`, and `newline` options) or raw binary (`'rb'`, `'wb'`, `'ab'`) mode. Accepts optional `compresslevel: Optional[int] = None` (defaulting to each library's own setting: `zstd` level 3, `lzma` preset 6, `bz2` level 9, `gzip` level 9).
 - **Local and Remote Protocols:** Reads and writes over local files (`file://` or plain paths), `ssh://`/`sftp://` (read, write, and append, with optional `key_filename`), and `ftp://` (read and write), and streams read-only `http://`/`https://` responses via thread-local, cookie-free `requests.Session` reuse with optional per-request `headers`. Supports an optional `timeout` parameter across all network transports.
-- **SFTP Pipelining, Progress Bars, and Clean Shutdown:** Uses bounded 4 MiB sliding-window SFTP `readv()` streaming (`max_concurrent_prefetch_requests=64`, O(1) memory on multi-GB files), SFTP write pipelining (`set_pipelined(True)`), optional `tqdm` progress bars tracking exact raw bytes read (`show_progress=True`), and deterministic, idempotent handle closure across all transports.
+- **SFTP Pipelining, Progress Bars, and Clean Shutdown:** Uses bounded 4 MiB sliding-window SFTP `readv()` streaming (`max_concurrent_prefetch_requests=64`, O(1) memory on multi-GB files), SFTP write pipelining (`set_pipelined(True)`), optional `tqdm` progress bars tracking exact raw bytes read or written (`show_progress=True` on both `OpenAsReader` and `OpenAsWriter`), and deterministic, idempotent handle closure across all transports.
 - **Standard File-Like Interface:** Supports `with` context management, `read()`, binary `read1()`, `readline()`, `readlines()`, line iteration (`for line in f:`), `write()`, `writelines()`, `flush()`, `closed`, `readable()`, `writable()`, `seekable()`, `encoding` (effective encoding string in text mode, `None` in binary mode), and direct `io.TextIOWrapper(openas(path, "rb"))` composition.
 - **Optional Sequential `.bu` Overwrite Backups:** When overwriting an existing file (`backup=True`, default for write modes; pass `backup=False` to disable), moves the existing file to `<path>.001.bu` (checking `.001.bu` first in O(1), then scanning once up to `.999.bu` with a nanosecond timestamp fallback). Local backups use atomic `os.link`/`os.unlink` and reject directories (`IsADirectoryError`).
 
@@ -134,11 +134,11 @@ Run the built-in CLI via `openas` (installed console script) or `python -m opena
 python -m openas --help
 python -m openas --version
 
-# Stream compressed files and report line/byte throughput
-python -m openas --read path/to/large.zst
+# Stream compressed files with a progress bar and report line/byte throughput
+python -m openas --read --progress path/to/large.zst
 
 # Single-pass broadcast (reads source once and writes to one or more destinations)
-python -m openas --write https://example.com/data.csv.gz local_copy.txt sftp://user@host/path/to/dest.csv.zst
+python -m openas --write --compresslevel 6 --timeout 30 https://example.com/data.csv.gz local_copy.txt sftp://user@host/path/to/dest.csv.zst
 ```
 
 ## Development and Benchmarks
@@ -161,7 +161,7 @@ python benchmarks/bench_openas.py
 ## Documentation
 
 - [Public API Reference](docs/API.md): Signatures, text and binary modes, parameters, exceptions, and handle lifecycle semantics.
-- [CLI Guide](docs/CLI.md): `--read`, `--write`, `--input-file` / `-i`, `--version`, and broadcast behavior.
+- [CLI Guide](docs/CLI.md): `--read`, `--write`, `--input-file` / `-i`, `--no-backup`, `--compresslevel` / `-c`, `--timeout`, `--progress`, `--version`, and broadcast behavior.
 - [Architecture Overview](ARCHITECTURE.md): Stream layering, transport wrappers, sequential `.bu` backups, and test structure.
 - [Functional Specification](FUNCTIONAL_SPEC.md): Behavioral contracts, edge cases, non-goals, and security boundaries.
 - [Design Decisions](DECISIONS.md): Rationale and trade-offs behind load-bearing invariants.
@@ -180,7 +180,6 @@ python benchmarks/bench_openas.py
 
 - **Sequential Streaming Only:** Streams do not support random-access `seek()`/`tell()`, read-write modes (`r+`, `w+`, `x`), or asynchronous (`async`/`await`) I/O.
 - **Cloud Object Store Exclusions:** Cloud schemes (`s3://`, `gs://`, `az://`, `hdfs://`) raise `UnsupportedProtocolError`. Use `smart_open`, `fsspec`, or dedicated cloud SDKs instead.
-- **Write Progress Tracking (v0.1.0):** `show_progress=True` is implemented for `OpenAsReader` only; passing `show_progress=True` to `OpenAsWriter` or write/append modes raises `NotImplementedError`.
 - **FTP Append Not Supported:** `ftp://` supports read and write only; append mode raises `UnsupportedProtocolError` because `ftputil` does not support FTP append.
 - **Synchronous CLI Fan-Out:** Multi-target `--write` reads the source once in 64 KiB binary chunks via `contextlib.ExitStack` and writes exact bytes synchronously to each destination. Use the Python API with threads or processes for concurrent remote uploads.
 

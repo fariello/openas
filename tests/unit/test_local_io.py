@@ -2014,3 +2014,242 @@ def test_openas_reader_textiowrapper_composability_read1_and_flush(tmp_path, ext
             assert r_fb.read1(-1) == b""
         finally:
             r_fb.close()
+
+
+def test_counting_write_stream_progress_typed_buffers_and_none_return():
+    """va1pd2 E-01: _CountingWriteStream handles typed buffers, None returns, 64 KiB batching, flush, and close."""
+    import array
+    import io as _io
+    from openas.openas import _CountingWriteStream
+
+    class NoneReturningStream:
+        def __init__(self):
+            self.chunks = []
+            self.flushed = 0
+            self.closed = False
+            self.close_calls = 0
+
+        def write(self, data):
+            self.chunks.append(bytes(data))
+            return None  # Mimics Paramiko SFTPFile / ftputil FTPFile
+
+        def flush(self):
+            self.flushed += 1
+
+        def close(self):
+            self.close_calls += 1
+            self.closed = True
+
+    raw = NoneReturningStream()
+    updates = []
+    cws = _CountingWriteStream(raw, on_progress=updates.append, batch_size=16)
+
+    assert cws.readable() is False
+    assert cws.writable() is True
+    assert cws.seekable() is False
+    assert cws.closed is False
+
+    # Empty write does not trigger callback
+    assert cws.write(b"") == 0
+    assert cws.bytes_written == 0
+    assert updates == []
+
+    # Sub-batch writes accumulate without emitting until threshold or flush()
+    assert cws.write(b"123456") == 6
+    assert cws.write(bytearray(b"7890")) == 4
+    assert cws.bytes_written == 10
+    assert updates == []
+
+    # Typed buffer (4 uint32 = 16 bytes) pushes pending to 26 >= 16 -> batched update of 26
+    arr = array.array("I", [1, 2, 3, 4])
+    assert cws.write(arr) == 16
+    assert cws.bytes_written == 26
+    assert updates == [26]
+
+    # Memoryview slice below batch threshold flushed explicitly on flush()
+    mv = memoryview(b"abcdefgh")[2:7]
+    assert cws.write(mv) == 5
+    assert cws.bytes_written == 31
+    assert updates == [26]
+    cws.flush()
+    assert raw.flushed == 1
+    assert updates == [26, 5]
+
+    # Pending bytes remain flushable via flush_progress() even after close()
+    assert cws.write(b"XYZ") == 3
+    cws.close()
+    assert cws.closed is True
+    assert cws._raw_close_attempted is True
+    assert raw.closed is True
+    assert raw.close_calls == 1
+    cws.close()  # idempotent
+    assert raw.close_calls == 1
+    cws.flush_progress()
+    assert updates == [26, 5, 3]
+    assert b"".join(raw.chunks) == b"1234567890" + arr.tobytes() + b"cdefgXYZ"
+
+    for op in (lambda: cws.write(b"x"), lambda: cws.flush()):
+        with pytest.raises(ValueError, match="closed"):
+            op()
+
+    # Standard BytesIO (returns int) works identically
+    bio = _io.BytesIO()
+    updates_bio = []
+    cws_bio = _CountingWriteStream(bio, on_progress=updates_bio.append, batch_size=8)
+    assert cws_bio.write(b"hello") == 5
+    assert updates_bio == []
+    assert cws_bio.write(b"world") == 5
+    assert updates_bio == [10]
+    assert bio.getvalue() == b"helloworld"
+    cws_bio.close()
+    assert bio.closed is True
+
+
+@pytest.mark.parametrize("ext", ["", ".gz", ".bz2", ".xz", ".zst"])
+@pytest.mark.parametrize("binary", [False, True])
+def test_local_writer_progress_all_formats_write_append_and_encoding(tmp_path, ext, binary):
+    """va1pd2 E-01: OpenAsWriter(show_progress=True) tracks exact raw disk bytes (including trailers) on write and append."""
+    # Payload large enough to exceed 64 KiB in plain mode and produce multi-block compressed streams with trailers.
+    lines_text = [f"row-{i:05d}-café-{i % 97:02d}-" + ("0123456789abcdef" * 4) + "\n" for i in range(1200)]
+    payload_text = "".join(lines_text)
+    payload_bytes = payload_text.encode("utf-8")
+    append_text = "appended-line-1-café\nappended-line-2\n"
+    append_bytes = append_text.encode("utf-8")
+
+    fp = tmp_path / f"writer_prog_{'bin' if binary else 'txt'}{ext or '.txt'}"
+    w_mode = "wb" if binary else "w"
+    a_mode = "ab" if binary else "a"
+    r_mode = "rb" if binary else "r"
+
+    # 1. Write with show_progress=True: header bytes captured in initial, trailer bytes flushed on close()
+    with openas(fp, w_mode, backup=False, show_progress=True) as w:
+        pbar = w._progress
+        assert pbar is not None
+        assert pbar.total is None
+        if ext == ".gz":
+            # gzip writes its header during open(); initial captures it without loss or double-counting
+            assert pbar.n > 0
+        w.write(payload_bytes if binary else payload_text)
+        w.flush()
+    raw_size_after_write = fp.stat().st_size
+    assert raw_size_after_write > 0
+    assert pbar.n == raw_size_after_write
+
+    # 2. Append with show_progress=True: tracks exact delta written during append session
+    with openas(fp, a_mode, show_progress=True) as w_app:
+        pbar_app = w_app._progress
+        assert pbar_app is not None
+        assert pbar_app.total is None
+        w_app.write(append_bytes if binary else append_text)
+    raw_size_after_append = fp.stat().st_size
+    assert pbar_app.n == raw_size_after_append - raw_size_after_write
+
+    # 3. Round-trip verification
+    with openas(fp, r_mode) as r:
+        assert r.read() == (payload_bytes + append_bytes if binary else payload_text + append_text)
+
+    # 4. Text mode encoding/errors/newline preserved with show_progress=True
+    if not binary:
+        latin_fp = tmp_path / f"writer_prog_latin{ext or '.txt'}"
+        with openas(latin_fp, "w", backup=False, show_progress=True, encoding="latin-1", newline="\n") as w_lat:
+            pbar_lat = w_lat._progress
+            assert w_lat.encoding == "latin-1"
+            w_lat.write("café\nnaïve\n")
+        assert pbar_lat is not None
+        assert pbar_lat.n == latin_fp.stat().st_size
+        with openas(latin_fp, "r", encoding="latin-1", newline="") as r_lat:
+            assert r_lat.read() == "café\nnaïve\n"
+
+
+def test_local_writer_progress_error_teardown_keyboard_interrupt_and_zero_overhead(tmp_path):
+    """va1pd2 E-01: Early-open/close errors and KeyboardInterrupt close all writer handles cleanly; show_progress=False keeps fast path."""
+    import tqdm as tqdm_mod
+
+    # 1. Zero-overhead fast path when show_progress=False
+    fast_fp = tmp_path / "fast_writer.txt"
+    w_fast = OpenAsWriter(fast_fp, show_progress=False).open(backup=False)
+    try:
+        assert w_fast._counting_stream is None
+        assert w_fast._progress is None
+        assert w_fast.write == w_fast._fh.write
+        w_fast.write("fast\n")
+    finally:
+        w_fast.close()
+    assert w_fast.closed is True
+
+    # 2. Mid-open RuntimeError and KeyboardInterrupt while initializing tqdm close raw_fh cleanly with zero ResourceWarning
+    for ext in (".txt", ".gz", ".zst"):
+        for exc_cls in (RuntimeError, KeyboardInterrupt):
+            out_fp = tmp_path / f"mid_open_{exc_cls.__name__}{ext}"
+            writer = OpenAsWriter(out_fp, show_progress=True)
+            captured = {}
+
+            def failing_tqdm(*args, **kwargs):
+                captured["raw_fh"] = writer._raw_fh
+                captured["counting"] = writer._counting_stream
+                raise exc_cls(f"boom {exc_cls.__name__}")
+
+            with patch.object(tqdm_mod, "tqdm", side_effect=failing_tqdm):
+                with pytest.raises(exc_cls, match=f"boom {exc_cls.__name__}"):
+                    writer.open(backup=False)
+
+            assert captured["raw_fh"] is not None
+            assert captured["raw_fh"].closed is True
+            assert captured["counting"] is not None
+            assert captured["counting"].closed is True
+            assert writer.closed is True
+            assert writer._fh is None
+            assert writer._raw_fh is None
+            assert writer._counting_stream is None
+            assert writer._progress is None
+
+    # 3. close() when flush_progress() raises RuntimeError or KeyboardInterrupt still closes raw_fh and tqdm
+    for err_cls in (RuntimeError, KeyboardInterrupt):
+        err_fp = tmp_path / f"flush_err_{err_cls.__name__}.gz"
+        w_err = OpenAsWriter(err_fp, show_progress=True).open(backup=False)
+        raw_fh = w_err._raw_fh
+        pbar = w_err._progress
+        assert raw_fh is not None and pbar is not None
+        w_err.write("buffered line\n")
+        pbar_closed = []
+        orig_pbar_close = pbar.close
+
+        def spy_pbar_close(closed_list=pbar_closed, orig=orig_pbar_close):
+            closed_list.append(True)
+            return orig()
+
+        pbar.close = spy_pbar_close
+        w_err._counting_stream._on_progress = MagicMock(side_effect=err_cls("progress flush boom"))
+
+        with pytest.raises(err_cls, match="progress flush boom"):
+            w_err.close()
+        assert raw_fh.closed is True
+        assert pbar_closed == [True]
+        assert w_err.closed is True
+        assert w_err._raw_fh is None
+        assert w_err._counting_stream is None
+        assert w_err._progress is None
+
+    # 4. close() when fh.close() raises still flushes pending progress and closes raw_fh and tqdm
+    fh_err_fp = tmp_path / "fh_close_err.gz"
+    w_fh_err = OpenAsWriter(fh_err_fp, show_progress=True).open(backup=False)
+    orig_fh = w_fh_err._fh
+    raw_fh2 = w_fh_err._raw_fh
+    pbar2 = w_fh_err._progress
+    assert orig_fh is not None and raw_fh2 is not None and pbar2 is not None
+    w_fh_err.write("data before close error\n")
+    orig_fh.close()  # flushes trailer through _CountingWriteStream into pending
+    failing_fh = MagicMock()
+    failing_fh.closed = False
+    failing_fh.close.side_effect = OSError("writer fh close boom")
+    w_fh_err._fh = failing_fh
+    pbar2_closed = []
+    orig_pbar2_close = pbar2.close
+    pbar2.close = lambda: (pbar2_closed.append(True), orig_pbar2_close())[1]
+
+    with pytest.raises(OSError, match="writer fh close boom"):
+        w_fh_err.close()
+    assert raw_fh2.closed is True
+    assert pbar2_closed == [True]
+    assert pbar2.n == fh_err_fp.stat().st_size
+    assert w_fh_err.closed is True

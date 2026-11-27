@@ -29,9 +29,16 @@ def test_append_backup_conflict(tmp_path):
         OpenAsWriter(str(tmp_path / "data.zst")).open(append=True, backup=True)
 
 def test_writer_progress_exception(tmp_path):
-    # Validates explicitly the newly structured parameter guard correctly fails.
-    with pytest.raises(NotImplementedError):
-        openas(str(tmp_path / "testing.zst"), 'w', show_progress=True)
+    """va1pd2 E-01: openas(..., 'w', show_progress=True) now succeeds and tracks exact compressed bytes."""
+    target = tmp_path / "testing.zst"
+    with openas(str(target), 'w', show_progress=True) as w:
+        pbar = w._progress
+        assert pbar is not None
+        assert pbar.total is None
+        w.write("writer progress ok\n")
+    assert pbar.n == target.stat().st_size
+    with openas(target, 'r') as r:
+        assert r.read() == "writer progress ok\n"
 
 
 def test_openas_append_backup_guard(tmp_path):
@@ -52,14 +59,23 @@ def test_openas_append_backup_guard(tmp_path):
 
 
 def test_openas_writer_show_progress_signature_guard(tmp_path):
-    """BUG-06a: OpenAsWriter accepts show_progress=False and rejects show_progress=True."""
+    """va1pd2 E-01: OpenAsWriter accepts both show_progress=False and show_progress=True."""
     from openas import OpenAsWriter
 
     target = tmp_path / "writer_prog.txt"
     with OpenAsWriter(target, show_progress=False) as w:
+        assert w._progress is None
+        assert w._counting_stream is None
         w.write("ok\n")
-    with pytest.raises(NotImplementedError):
-        OpenAsWriter(target, show_progress=True)
+
+    target2 = tmp_path / "writer_prog_on.txt"
+    with OpenAsWriter(target2, show_progress=True) as w:
+        pbar = w._progress
+        assert pbar is not None
+        assert pbar.total is None
+        w.write("ok with progress\n")
+    assert pbar.n == target2.stat().st_size
+    assert target2.read_text(encoding="utf-8") == "ok with progress\n"
 
 
 @pytest.mark.parametrize(
@@ -125,13 +141,18 @@ def test_unknown_schemes_and_remote_file_uri_rejected(url, mode):
 
 @pytest.mark.parametrize("bad_mode", ["x", "r+", "w+", "", "rw"])
 def test_invalid_modes_and_append_progress_and_timeout_validation(tmp_path, bad_mode):
-    """S3-T1 & S2-S2: Invalid modes, append+progress, and invalid timeout fail clearly."""
+    """S3-T1, S2-S2 & va1pd2 E-01: Invalid modes and invalid timeout fail clearly; append+progress succeeds."""
     target = tmp_path / "modes.txt"
     with pytest.raises(ValueError, match="Supported modes"):
         openas(target, bad_mode)
 
-    with pytest.raises(NotImplementedError):
-        openas(target, "a", show_progress=True)
+    size_before = target.stat().st_size if target.exists() else 0
+    with openas(target, "a", show_progress=True) as w:
+        pbar = w._progress
+        assert pbar is not None
+        assert pbar.total is None
+        w.write("appended\n")
+    assert pbar.n == target.stat().st_size - size_before
 
     for bad_timeout in (0, -1.5, True, "5"):
         with pytest.raises(ValueError, match="timeout"):
@@ -232,22 +253,22 @@ def test_percent_encoded_remote_archives_rejected(url, mode):
 
 
 def test_actionable_api_error_messages(tmp_path):
-    """n5d1ot E-02: Six API error paths preserve exception classes and include actionable recovery guidance."""
+    """n5d1ot E-02 & va1pd2 E-01: API error paths preserve exception classes with actionable guidance; writer progress succeeds."""
     from openas import OpenAsWriter
 
     target = tmp_path / "actionable.txt"
 
-    # 1. show_progress=True on writer/write/append
-    for call in (
-        lambda: OpenAsWriter(target, show_progress=True),
-        lambda: openas(target, "w", show_progress=True),
-        lambda: openas(target, "a", show_progress=True),
-    ):
-        with pytest.raises(NotImplementedError) as excinfo:
-            call()
-        msg = str(excinfo.value)
-        assert "show_progress=True is only supported for reading" in msg
-        assert "Pass show_progress=False (default) when writing or appending." in msg
+    # 1. show_progress=True on writer/write/append succeeds cleanly
+    with OpenAsWriter(target, show_progress=True).open(backup=False) as w:
+        assert w._progress is not None
+        w.write("one\n")
+    with openas(target, "w", backup=False, show_progress=True) as w:
+        assert w._progress is not None
+        w.write("two\n")
+    with openas(target, "a", show_progress=True) as w:
+        assert w._progress is not None
+        w.write("three\n")
+    assert target.read_text(encoding="utf-8") == "two\nthree\n"
 
     # 2. append=True with backup=True
     for call in (

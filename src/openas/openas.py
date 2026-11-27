@@ -15,7 +15,8 @@ Public API
   `flush()`, line-by-line iteration (`str` in text mode, `bytes` in binary mode), and optional
   raw-byte `tqdm` progress bars.
 - `OpenAsWriter`: Stream writer supporting `write()`, `writelines()`, `flush()`, `compresslevel`,
-  and collision-safe sequential `.NNN.bu` backups on overwrite.
+  optional raw-byte `tqdm` progress bars (`show_progress=True`), and collision-safe sequential
+  `.NNN.bu` backups on overwrite.
 - `OpenAsError`, `UnsupportedArchiveError`, `ReadOnlyProtocolError`, `UnsupportedProtocolError`:
   Exception hierarchy for unsupported archive containers and protocols.
 
@@ -488,6 +489,80 @@ class _CountingByteStream:
 
     def __getattr__(self, name):
         return getattr(self._stream, name)
+
+
+class _CountingWriteStream(io.BufferedIOBase):
+    """io.BufferedIOBase proxy that counts exact raw bytes written and batches progress updates."""
+
+    def __init__(self, stream, on_progress=None, batch_size: int = _PROGRESS_BATCH_BYTES):
+        self._stream = stream
+        self.bytes_written = 0
+        self._on_progress = on_progress
+        self._batch_size = batch_size
+        self._pending = 0
+        self._closed = False
+        self._raw_close_attempted = False
+
+    @property
+    def closed(self) -> bool:
+        return self._closed
+
+    def readable(self) -> bool:
+        return False
+
+    def writable(self) -> bool:
+        return True
+
+    def seekable(self) -> bool:
+        return False
+
+    def set_progress_callback(self, callback) -> None:
+        self._on_progress = callback
+        self._pending = 0
+
+    def flush_progress(self) -> None:
+        pending = self._pending
+        if pending > 0:
+            self._pending = 0
+            if self._on_progress is not None:
+                self._on_progress(pending)
+
+    def _account(self, n: int) -> None:
+        self.bytes_written += n
+        if self._on_progress is not None:
+            self._pending += n
+            if self._pending >= self._batch_size:
+                pending = self._pending
+                self._pending = 0
+                self._on_progress(pending)
+
+    def write(self, b) -> int:
+        if self._closed:
+            raise ValueError("I/O operation on closed file.")
+        with memoryview(b) as raw_mv, raw_mv.cast('B') as mv:
+            n_in = len(mv)
+            data = b if isinstance(b, bytes) else mv.tobytes()
+        res = self._stream.write(data)
+        written = res if (isinstance(res, int) and not isinstance(res, bool)) else n_in
+        if written > 0:
+            self._account(written)
+        return written
+
+    def flush(self):
+        if self._closed:
+            raise ValueError("I/O operation on closed file.")
+        flush_fn = getattr(self._stream, 'flush', None)
+        if flush_fn is not None:
+            flush_fn()
+        self.flush_progress()
+
+    def close(self):
+        if not self._closed:
+            self._closed = True
+            self._raw_close_attempted = True
+            close_fn = getattr(self._stream, 'close', None)
+            if close_fn is not None:
+                close_fn()
 
 
 _ZSTD_MAGIC = 0xFD2FB528
@@ -973,7 +1048,11 @@ def _record_raw_close_attempted(obj, seen: set) -> None:
             if cur._raw_close_attempted:
                 seen.add(id(cur._sftp_file))
             break
-        if isinstance(cur, (_CountingByteStream, _ZstdFrameValidatingStream)):
+        if isinstance(cur, _CountingWriteStream):
+            if cur._raw_close_attempted:
+                seen.add(id(cur._stream))
+            cur = cur._stream
+        elif isinstance(cur, (_CountingByteStream, _ZstdFrameValidatingStream)):
             cur = cur._stream
         elif isinstance(cur, io.IOBase):
             nxt = getattr(cur, 'buffer', None)
@@ -2105,6 +2184,8 @@ class OpenAsWriter:
     ----------
     filename : str
         Normalized path or URL to write.
+    show_progress : bool
+        Whether to display a `tqdm` progress bar tracking raw bytes written.
     timeout : float or None
         Optional network timeout in seconds.
     binary : bool
@@ -2182,7 +2263,7 @@ class OpenAsWriter:
         filename : str or os.PathLike
             The name of the file to write to.
         show_progress : bool, optional
-            Progress tracking on writers is not implemented; passing True raises NotImplementedError.
+            Whether to display a `tqdm` progress bar tracking exact raw bytes written (default is False).
         timeout : float or None, optional
             Optional network timeout in seconds for FTP and SSH/SFTP connections.
         binary : bool, optional
@@ -2196,13 +2277,8 @@ class OpenAsWriter:
         key_filename : str, os.PathLike, Sequence[str | os.PathLike], or None, optional
             Optional SSH private key path or sequence of paths forwarded to Paramiko `connect()`.
         """
-        if show_progress:
-            raise NotImplementedError(
-                "show_progress=True is only supported for reading ('r', 'rt', 'rb' or OpenAsReader). "
-                "Pass show_progress=False (default) when writing or appending."
-            )
         self.filename = os.fsdecode(filename)
-        self.show_progress = show_progress
+        self.show_progress = bool(show_progress)
         self.timeout = _validate_timeout(timeout)
         self.binary = bool(binary)
         self._encoding, self._errors, self._newline = _validate_text_options(
@@ -2216,6 +2292,15 @@ class OpenAsWriter:
         self._ssh_client = None
         self._sftp_client = None
         self._sftp_file = None
+        self._progress = None
+        self._counting_stream = None
+
+    def _make_counted_stream(self, stream):
+        """Wrap binary write stream in _CountingWriteStream when show_progress is enabled."""
+        if self.show_progress:
+            self._counting_stream = _CountingWriteStream(stream)
+            return self._counting_stream
+        return stream
 
     def __enter__(self) -> 'OpenAsWriter':
         """
@@ -2315,11 +2400,12 @@ class OpenAsWriter:
         raw_fh = self._ftp.open(remote_path, 'wb')
         self._raw_fh = raw_fh
         adapted = _BinaryStreamAdapter(raw_fh, readable=False, writable=True)
+        target = self._make_counted_stream(adapted)
         norm = _normalized_path(self.filename, parsed)
         if norm.endswith('.zst'):
             import zstandard as zstd
             cctx = zstd.ZstdCompressor() if compresslevel is None else zstd.ZstdCompressor(level=compresslevel)
-            sw = cctx.stream_writer(adapted)
+            sw = cctx.stream_writer(target)
             self._fh = (
                 sw
                 if self.binary
@@ -2334,7 +2420,7 @@ class OpenAsWriter:
             )
             if compresslevel is not None:
                 bz2_kwargs['compresslevel'] = compresslevel
-            self._fh = bz2.open(adapted, **bz2_kwargs)
+            self._fh = bz2.open(target, **bz2_kwargs)
         elif norm.endswith('.xz'):
             import lzma
             lzma_kwargs = (
@@ -2344,7 +2430,7 @@ class OpenAsWriter:
             )
             if compresslevel is not None:
                 lzma_kwargs['preset'] = compresslevel
-            self._fh = lzma.open(adapted, **lzma_kwargs)
+            self._fh = lzma.open(target, **lzma_kwargs)
         elif norm.endswith('.gz'):
             import gzip
             gz_kwargs = (
@@ -2354,12 +2440,12 @@ class OpenAsWriter:
             )
             if compresslevel is not None:
                 gz_kwargs['compresslevel'] = compresslevel
-            self._fh = gzip.open(adapted, **gz_kwargs)
+            self._fh = gzip.open(target, **gz_kwargs)
         else:
             self._fh = (
-                adapted
+                target
                 if self.binary
-                else io.TextIOWrapper(adapted, encoding=self._encoding, errors=self._errors, newline=self._newline)
+                else io.TextIOWrapper(target, encoding=self._encoding, errors=self._errors, newline=self._newline)
             )
 
     def _ssh_backup_if(self, sftp, path):
@@ -2493,7 +2579,8 @@ class OpenAsWriter:
         if norm.endswith('.zst'):
             import zstandard as zstd
             cctx = zstd.ZstdCompressor() if compresslevel is None else zstd.ZstdCompressor(level=compresslevel)
-            sw = cctx.stream_writer(self._sftp_file)
+            target = self._make_counted_stream(self._sftp_file)
+            sw = cctx.stream_writer(target)
             self._fh = (
                 sw
                 if self.binary
@@ -2508,7 +2595,8 @@ class OpenAsWriter:
                 bz2_kwargs['newline'] = self._newline
             if compresslevel is not None:
                 bz2_kwargs['compresslevel'] = compresslevel
-            self._fh = bz2.open(self._sftp_file, **bz2_kwargs)
+            target = self._make_counted_stream(self._sftp_file)
+            self._fh = bz2.open(target, **bz2_kwargs)
         elif norm.endswith('.xz'):
             import lzma
             lzma_kwargs = {'mode': codec_mode}
@@ -2518,7 +2606,8 @@ class OpenAsWriter:
                 lzma_kwargs['newline'] = self._newline
             if compresslevel is not None:
                 lzma_kwargs['preset'] = compresslevel
-            self._fh = lzma.open(self._sftp_file, **lzma_kwargs)
+            target = self._make_counted_stream(self._sftp_file)
+            self._fh = lzma.open(target, **lzma_kwargs)
         elif norm.endswith('.gz'):
             import gzip
             gz_kwargs = {'mode': codec_mode}
@@ -2528,13 +2617,15 @@ class OpenAsWriter:
                 gz_kwargs['newline'] = self._newline
             if compresslevel is not None:
                 gz_kwargs['compresslevel'] = compresslevel
-            self._fh = gzip.open(self._sftp_file, **gz_kwargs)
+            target = self._make_counted_stream(self._sftp_file)
+            self._fh = gzip.open(target, **gz_kwargs)
         else:
             adapted = _BinaryStreamAdapter(self._sftp_file, readable=False, writable=True)
+            target = self._make_counted_stream(adapted)
             self._fh = (
-                adapted
+                target
                 if self.binary
-                else io.TextIOWrapper(adapted, encoding=self._encoding, errors=self._errors, newline=self._newline)
+                else io.TextIOWrapper(target, encoding=self._encoding, errors=self._errors, newline=self._newline)
             )
 
     def _backup_local_file(self):
@@ -2654,7 +2745,8 @@ class OpenAsWriter:
             import zstandard as zstd
             cctx = zstd.ZstdCompressor() if compresslevel is None else zstd.ZstdCompressor(level=compresslevel)
             self._raw_fh = open(self.filename, mode)
-            sw = cctx.stream_writer(self._raw_fh)
+            target = self._make_counted_stream(self._raw_fh)
+            sw = cctx.stream_writer(target)
             self._fh = (
                 sw
                 if self.binary
@@ -2669,7 +2761,11 @@ class OpenAsWriter:
                 bz2_kwargs['newline'] = self._newline
             if compresslevel is not None:
                 bz2_kwargs['compresslevel'] = compresslevel
-            self._fh = bz2.open(self.filename, **bz2_kwargs)
+            if self.show_progress:
+                self._raw_fh = open(self.filename, mode)
+                self._fh = bz2.open(self._make_counted_stream(self._raw_fh), **bz2_kwargs)
+            else:
+                self._fh = bz2.open(self.filename, **bz2_kwargs)
         elif norm.endswith('.xz'):
             import lzma
             lzma_kwargs = {'mode': codec_mode}
@@ -2679,7 +2775,11 @@ class OpenAsWriter:
                 lzma_kwargs['newline'] = self._newline
             if compresslevel is not None:
                 lzma_kwargs['preset'] = compresslevel
-            self._fh = lzma.open(self.filename, **lzma_kwargs)
+            if self.show_progress:
+                self._raw_fh = open(self.filename, mode)
+                self._fh = lzma.open(self._make_counted_stream(self._raw_fh), **lzma_kwargs)
+            else:
+                self._fh = lzma.open(self.filename, **lzma_kwargs)
         elif norm.endswith('.gz'):
             import gzip
             gz_kwargs = {'mode': codec_mode}
@@ -2689,19 +2789,32 @@ class OpenAsWriter:
                 gz_kwargs['newline'] = self._newline
             if compresslevel is not None:
                 gz_kwargs['compresslevel'] = compresslevel
-            self._fh = gzip.open(self.filename, **gz_kwargs)
+            if self.show_progress:
+                self._raw_fh = open(self.filename, mode)
+                self._fh = gzip.open(self._make_counted_stream(self._raw_fh), **gz_kwargs)
+            else:
+                self._fh = gzip.open(self.filename, **gz_kwargs)
         else:
-            self._fh = (
-                open(self.filename, mode)
-                if self.binary
-                else open(
-                    self.filename,
-                    'a' if append else 'w',
-                    encoding=self._encoding,
-                    errors=self._errors,
-                    newline=self._newline,
+            if self.show_progress:
+                self._raw_fh = open(self.filename, mode)
+                target = self._make_counted_stream(self._raw_fh)
+                self._fh = (
+                    target
+                    if self.binary
+                    else io.TextIOWrapper(target, encoding=self._encoding, errors=self._errors, newline=self._newline)
                 )
-            )
+            else:
+                self._fh = (
+                    open(self.filename, mode)
+                    if self.binary
+                    else open(
+                        self.filename,
+                        'a' if append else 'w',
+                        encoding=self._encoding,
+                        errors=self._errors,
+                        newline=self._newline,
+                    )
+                )
 
     def open(self, append: bool = False, backup: bool = True, compresslevel: Optional[int] = None) -> 'OpenAsWriter':
         """
@@ -2763,6 +2876,22 @@ class OpenAsWriter:
                 self._wrap_ssh(parsed, append, backup, compresslevel=compresslevel)
             else:
                 self._wrap_local(append, backup, parsed, compresslevel=compresslevel)
+
+            if self.show_progress:
+                from tqdm import tqdm
+                initial_bytes = (
+                    self._counting_stream.bytes_written
+                    if self._counting_stream is not None
+                    else 0
+                )
+                self._progress = tqdm(
+                    total=None,
+                    initial=initial_bytes,
+                    unit='B',
+                    unit_scale=True,
+                )
+                if self._counting_stream is not None:
+                    self._counting_stream.set_progress_callback(self._progress.update)
         except BaseException:
             self.close()
             raise
@@ -2806,13 +2935,15 @@ class OpenAsWriter:
         if self._fh is None:
             raise ValueError("I/O operation on closed file.")
         self._fh.flush()
+        if self._counting_stream is not None:
+            self._counting_stream.flush_progress()
 
     def close(self):
         """
         Close the file.
 
         This method closes the file handle and any associated resources idempotently,
-        resetting all handle attributes even if one handle fails to close.
+        resetting all handle and progress attributes even if one handle fails to close.
 
         Returns
         -------
@@ -2820,21 +2951,64 @@ class OpenAsWriter:
         """
         self.__dict__.pop('write', None)
         fh = self._fh
+        counting_stream = self._counting_stream
         raw_fh = self._raw_fh
         sftp_file = self._sftp_file
         sftp_client = self._sftp_client
         ssh_client = self._ssh_client
         ftp = self._ftp
+        progress = self._progress
 
         self._append = False
         self._fh = None
+        self._counting_stream = None
         self._raw_fh = None
         self._sftp_file = None
         self._sftp_client = None
         self._ssh_client = None
         self._ftp = None
+        self._progress = None
 
-        _close_handles(fh, raw_fh, sftp_file, sftp_client, ssh_client, ftp)
+        first_err = None
+        seen = set()
+
+        # Close fh first while progress callback is still active so TextIOWrapper
+        # and compressors flush buffered payload and trailer bytes through _CountingWriteStream.
+        if fh is not None:
+            seen.add(id(fh))
+            if getattr(fh, 'closed', False) is True:
+                _record_raw_close_attempted(fh, seen)
+            else:
+                close_fn = getattr(fh, 'close', None)
+                if close_fn is not None:
+                    try:
+                        close_fn()
+                    except BaseException as err:
+                        first_err = err
+                _record_raw_close_attempted(fh, seen)
+
+        if counting_stream is not None:
+            try:
+                counting_stream.flush_progress()
+            except BaseException as err:
+                if first_err is None:
+                    first_err = err
+            finally:
+                counting_stream.set_progress_callback(None)
+
+        remaining = [
+            h
+            for h in (counting_stream, raw_fh, sftp_file, sftp_client, ssh_client, ftp, progress)
+            if h is not None and id(h) not in seen
+        ]
+        try:
+            _close_handles(*remaining)
+        except BaseException as err:
+            if first_err is None:
+                first_err = err
+
+        if first_err is not None:
+            raise first_err
 
 
 def openas(
@@ -2873,8 +3047,8 @@ def openas(
         before overwriting. Defaults to `True` in write modes and `False` in append modes; passing
         `backup=True` with an append mode raises `ValueError`.
     show_progress : bool, optional
-        Display a `tqdm` progress bar tracking raw bytes read (read modes only; passing `True` in
-        write/append modes raises `NotImplementedError`). Default is `False`.
+        Display a `tqdm` progress bar tracking exact raw bytes read (`OpenAsReader`) or written
+        (`OpenAsWriter`, with `total=None`). Default is `False`.
     compresslevel : int or None, optional
         Optional compression level/preset forwarded to `.zst` (default 3), `.xz` (default 6),
         `.bz2` (default 9), and `.gz` (default 9) writers; ignored in read modes.
@@ -2923,8 +3097,6 @@ def openas(
         an empty name or CR/LF/NUL characters, `key_filename` is empty, a URL omits a hostname, specifies
         an invalid or zero port (outside `1..65535`), or has an empty path on `file://`, `ftp://`,
         `ssh://`, or `sftp://`, or `compresslevel` is out of range.
-    NotImplementedError
-        If `show_progress=True` is passed with write or append modes.
 
     Examples
     --------
@@ -2936,11 +3108,6 @@ def openas(
     ...     raw_line = f.readline()
     """
     filename = os.fsdecode(filename)
-    if show_progress and mode in ('w', 'wt', 'wb', 'a', 'at', 'ab'):
-        raise NotImplementedError(
-            "show_progress=True is only supported for reading ('r', 'rt', 'rb' or OpenAsReader). "
-            "Pass show_progress=False (default) when writing or appending."
-        )
     if mode in ('r', 'rt', 'rb'):
         return OpenAsReader(
             filename,
@@ -3032,7 +3199,7 @@ def main():
             "  openas --write source.gz copy.txt backup.bz2\n"
             "  openas --write -i source.gz copy.txt sftp://user@host/abs/path/dest.zst\n\n"
             "Notes:\n"
-            "  --write moves existing destination files to sequential .001.bu backups before overwriting.\n"
+            "  --write moves existing destination files to sequential .001.bu backups before overwriting (pass --no-backup to disable).\n"
             "  sftp://user@host/abs/path uses absolute remote paths and system SSH keys / ~/.ssh/known_hosts."
         ),
     )
@@ -3060,6 +3227,31 @@ def main():
         default=None,
         help='Source path or URL for --write mode (makes all positional file arguments destinations).',
     )
+    parser.add_argument(
+        '--no-backup',
+        action='store_true',
+        default=False,
+        help='Overwrite existing destination files in --write mode without creating .001.bu backups.',
+    )
+    parser.add_argument(
+        '--compresslevel',
+        '-c',
+        type=int,
+        default=None,
+        help='Compression level or preset for compressed --write destinations (.gz 0..9, .bz2 1..9, .xz 0..9, .zst up to 22).',
+    )
+    parser.add_argument(
+        '--timeout',
+        type=float,
+        default=None,
+        help='Network timeout in seconds for HTTP/HTTPS, FTP, and SSH/SFTP transfers (finite positive number).',
+    )
+    parser.add_argument(
+        '--progress',
+        action='store_true',
+        default=False,
+        help='Display a tqdm raw-byte progress bar on stderr while reading the input stream.',
+    )
 
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument(
@@ -3068,7 +3260,7 @@ def main():
         action='store_true',
         help=(
             'Read one source stream in 64 KiB binary chunks and broadcast exact bytes to one or more destinations '
-            '(moves existing destinations to sequential .001.bu backups before writing).'
+            '(moves existing destinations to sequential .001.bu backups before writing unless --no-backup is set).'
         ),
     )
     group.add_argument(
@@ -3083,11 +3275,21 @@ def main():
     if args.read:
         if args.input_file is not None:
             parser.error("--input-file/-i is only valid with --write")
+        if args.no_backup:
+            parser.error("--no-backup is only valid with --write")
+        if args.compresslevel is not None:
+            parser.error("--compresslevel/-c is only valid with --write")
         if len(args.files) < 1:
             parser.error("Read mode requires at least one file (e.g., 'openas -r path/to/file.gz')")
+        _validate_timeout(args.timeout)
         for input_file in args.files:
             print(f"Reading {_redact_url(input_file)}")
-            with OpenAsReader(input_file, binary=True) as reader:
+            with OpenAsReader(
+                input_file,
+                show_progress=args.progress,
+                timeout=args.timeout,
+                binary=True,
+            ) as reader:
                 line_count = 0
                 bytes_count = 0
                 last_byte = None
@@ -3115,12 +3317,14 @@ def main():
             source_file = args.files[0]
             output_files = args.files[1:]
 
-        # Pre-validate destination schemes, archive guards, local directories, and duplicates
-        # before backing up or truncating earlier outputs.
+        # Pre-validate timeout, destination schemes, archive guards, compression levels,
+        # local directories, and duplicates before backing up or truncating earlier outputs.
+        _validate_timeout(args.timeout)
         seen_destinations = set()
         for output_file in output_files:
             resolved_out, parsed_out, scheme_out = _resolve_target(output_file)
-            if _normalized_path(resolved_out, parsed_out).endswith(UNSUPPORTED_ARCHIVES):
+            norm_out = _normalized_path(resolved_out, parsed_out)
+            if norm_out.endswith(UNSUPPORTED_ARCHIVES):
                 raise UnsupportedArchiveError(
                     f"openas does not support writing or appending to archive formats safely: {_redact_url(output_file)}. "
                     f"Use Python's zipfile or tarfile module instead."
@@ -3130,6 +3334,7 @@ def main():
                     f"Protocol '{parsed_out.scheme}' does not support write/append operations in openas. "
                     "HTTP/HTTPS is read-only; write to a local path, ftp://, or sftp:// target instead."
                 )
+            _validate_write_options(norm_out, args.compresslevel)
             if not scheme_out:
                 if os.path.isdir(resolved_out) and not os.path.islink(resolved_out):
                     raise IsADirectoryError(errno.EISDIR, os.strerror(errno.EISDIR), resolved_out)
@@ -3162,10 +3367,27 @@ def main():
         dest_names = []
         t0 = time.monotonic()
         with contextlib.ExitStack() as stack:
-            reader = stack.enter_context(OpenAsReader(source_file, binary=True))
+            reader = stack.enter_context(
+                OpenAsReader(
+                    source_file,
+                    show_progress=args.progress,
+                    timeout=args.timeout,
+                    binary=True,
+                )
+            )
             writers = []
             for output_file in output_files:
-                writer = stack.enter_context(OpenAsWriter(output_file, binary=True))
+                writer = stack.enter_context(
+                    OpenAsWriter(
+                        output_file,
+                        timeout=args.timeout,
+                        binary=True,
+                    ).open(
+                        append=False,
+                        backup=not args.no_backup,
+                        compresslevel=args.compresslevel,
+                    )
+                )
                 print(f"Writing {_redact_url(writer.filename)}")
                 writers.append(writer)
                 dest_names.append(_redact_url(writer.filename))

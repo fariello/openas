@@ -2181,3 +2181,129 @@ def test_ssh_key_filename_forwarding_omission_and_repr(mock_ssh, tmp_path):
     with reader_d:
         assert reader_d.read() == "defensive\n"
     assert client_d.connect.call_args.kwargs["key_filename"] == [str(key1)]
+
+
+@pytest.mark.parametrize("ext", ["", ".gz", ".bz2", ".xz", ".zst"])
+@pytest.mark.parametrize("binary", [False, True])
+def test_remote_writer_progress_ftp_and_sftp_exact_raw_bytes(ext, binary):
+    """va1pd2 E-01: OpenAsWriter(show_progress=True) tracks exact raw wire bytes across FTP and SFTP writes/appends."""
+    text_payload = ("remote writer progress café 0123456789abcdef\n" * 60)
+    bytes_payload = text_payload.encode("utf-8")
+    append_text = "remote appended line\n"
+    append_bytes = append_text.encode("utf-8")
+    w_mode = "wb" if binary else "w"
+    a_mode = "ab" if binary else "a"
+
+    # 1. FTP write with strict _StrictFTPFileProxy (write() returns None)
+    with patch("ftputil.FTPHost") as mock_ftp:
+        host = MagicMock()
+        mock_ftp.return_value = host
+        ftp_buf = _StrictFTPFileProxy()
+        host.open.return_value = ftp_buf
+
+        with openas(f"ftp://u:p@host/dir/out{ext or '.txt'}", w_mode, backup=False, show_progress=True) as w:
+            pbar = w._progress
+            assert pbar is not None
+            assert pbar.total is None
+            w.write(bytes_payload if binary else text_payload)
+
+        assert ftp_buf.closed is True
+        assert host.close.call_count == 1
+        assert len(ftp_buf.saved_bytes) > 0
+        assert pbar.n == len(ftp_buf.saved_bytes)
+        if ext:
+            expected = text_payload if binary else text_payload.replace("\n", os.linesep)
+            assert _decompress_bytes(ftp_buf.saved_bytes, ext) == expected
+        else:
+            expected_raw = bytes_payload if binary else text_payload.replace("\n", os.linesep).encode("utf-8")
+            assert ftp_buf.saved_bytes == expected_raw
+
+    # 2. SFTP write and append (exact raw bytes, single underlying close, zero double-close)
+    with patch("paramiko.SSHClient") as mock_ssh:
+        client = MagicMock()
+        sftp = MagicMock()
+        mock_ssh.return_value = client
+        client.open_sftp.return_value = sftp
+
+        sftp_write_buf = _InspectableBytesIO()
+        sftp.file.return_value = sftp_write_buf
+        with openas(f"sftp://u@host/dir/out{ext or '.txt'}", w_mode, backup=False, show_progress=True) as w:
+            pbar_w = w._progress
+            assert pbar_w is not None
+            assert pbar_w.total is None
+            w.write(bytes_payload if binary else text_payload)
+
+        assert sftp_write_buf.closed is True
+        assert sftp_write_buf.close_count == 1
+        assert sftp.close.call_count == 1
+        assert client.close.call_count == 1
+        assert pbar_w.n == len(sftp_write_buf.saved_bytes)
+
+        # SFTP append using strict None-returning proxy
+        client.reset_mock()
+        sftp.reset_mock()
+        sftp_append_buf = _StrictFTPFileProxy()
+        sftp.file.return_value = sftp_append_buf
+        with openas(f"sftp://u@host/dir/out{ext or '.txt'}", a_mode, show_progress=True) as w_app:
+            pbar_app = w_app._progress
+            assert pbar_app is not None
+            assert pbar_app.total is None
+            w_app.write(append_bytes if binary else append_text)
+
+        assert sftp_append_buf.closed is True
+        assert sftp.close.call_count == 1
+        assert client.close.call_count == 1
+        assert pbar_app.n == len(sftp_append_buf.saved_bytes)
+
+        combined = sftp_write_buf.saved_bytes + sftp_append_buf.saved_bytes
+        if ext:
+            expected = (text_payload + append_text) if binary else (text_payload + append_text).replace("\n", os.linesep)
+            assert _decompress_bytes(combined, ext) == expected
+        else:
+            expected_raw = (
+                (bytes_payload + append_bytes)
+                if binary
+                else (text_payload + append_text).replace("\n", os.linesep).encode("utf-8")
+            )
+            assert combined == expected_raw
+
+
+def test_remote_writer_progress_keyboard_interrupt_cleanup():
+    """va1pd2 E-01: KeyboardInterrupt during tqdm init on FTP/SFTP writers closes all transport handles once."""
+    import tqdm as tqdm_mod
+
+    # 1. FTP writer mid-open KeyboardInterrupt
+    with patch("ftputil.FTPHost") as mock_ftp:
+        host = MagicMock()
+        raw_ftp = _StrictFTPFileProxy()
+        host.open.return_value = raw_ftp
+        mock_ftp.return_value = host
+        w_ftp = OpenAsWriter("ftp://u:p@host/dir/out.gz", show_progress=True)
+        with patch.object(tqdm_mod, "tqdm", side_effect=KeyboardInterrupt("ctrl-c ftp tqdm")):
+            with pytest.raises(KeyboardInterrupt, match="ctrl-c ftp tqdm"):
+                w_ftp.open(backup=False)
+        assert raw_ftp.closed is True
+        assert host.close.call_count == 1
+        assert w_ftp.closed is True
+        assert w_ftp._progress is None
+        assert w_ftp._counting_stream is None
+
+    # 2. SFTP writer mid-open KeyboardInterrupt
+    with patch("paramiko.SSHClient") as mock_ssh:
+        client = MagicMock()
+        sftp = MagicMock()
+        buf = _InspectableBytesIO()
+        mock_ssh.return_value = client
+        client.open_sftp.return_value = sftp
+        sftp.file.return_value = buf
+        w_sftp = OpenAsWriter("sftp://u@host/dir/out.zst", show_progress=True)
+        with patch.object(tqdm_mod, "tqdm", side_effect=KeyboardInterrupt("ctrl-c sftp tqdm")):
+            with pytest.raises(KeyboardInterrupt, match="ctrl-c sftp tqdm"):
+                w_sftp.open(backup=False)
+        assert buf.closed is True
+        assert buf.close_count == 1
+        assert sftp.close.call_count == 1
+        assert client.close.call_count == 1
+        assert w_sftp.closed is True
+        assert w_sftp._progress is None
+        assert w_sftp._counting_stream is None

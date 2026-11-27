@@ -914,3 +914,256 @@ def test_cli_write_local_directory_prevalidation_leaves_earlier_destination_unto
     assert "IsADirectoryError" in res.stderr
     assert first_dst.read_bytes() == b"keep intact\n"
     assert not (tmp_path / "first.txt.001.bu").exists()
+
+
+def test_cli_no_backup_flag_and_default_backup(tmp_path):
+    """va1pd2 E-03: --write --no-backup overwrites without creating .001.bu while default --write rotates .001.bu."""
+    src = tmp_path / "src.txt"
+    src.write_bytes(b"new content\n")
+
+    # 1. Default --write creates .001.bu
+    dst_default = tmp_path / "default_dst.txt"
+    dst_default.write_bytes(b"old default\n")
+    res_def = subprocess.run(
+        [sys.executable, "-m", "openas", "--write", str(src), str(dst_default)],
+        capture_output=True,
+        text=True,
+        env=_cli_env(),
+    )
+    assert res_def.returncode == 0, res_def.stderr
+    assert (tmp_path / "default_dst.txt.001.bu").read_bytes() == b"old default\n"
+    assert dst_default.read_bytes() == b"new content\n"
+
+    # 2. --write --no-backup overwrites in place without creating .001.bu
+    dst_nobu = tmp_path / "nobu_dst.txt"
+    dst_nobu.write_bytes(b"old nobu\n")
+    res_nobu = subprocess.run(
+        [sys.executable, "-m", "openas", "--write", "--no-backup", str(src), str(dst_nobu)],
+        capture_output=True,
+        text=True,
+        env=_cli_env(),
+    )
+    assert res_nobu.returncode == 0, res_nobu.stderr
+    assert not (tmp_path / "nobu_dst.txt.001.bu").exists()
+    assert dst_nobu.read_bytes() == b"new content\n"
+
+    # 3. Also works with --input-file / -i
+    dst_nobu_i = tmp_path / "nobu_i_dst.txt"
+    dst_nobu_i.write_bytes(b"old nobu i\n")
+    res_nobu_i = subprocess.run(
+        [sys.executable, "-m", "openas", "--write", "--no-backup", "-i", str(src), str(dst_nobu_i)],
+        capture_output=True,
+        text=True,
+        env=_cli_env(),
+    )
+    assert res_nobu_i.returncode == 0, res_nobu_i.stderr
+    assert not (tmp_path / "nobu_i_dst.txt.001.bu").exists()
+    assert dst_nobu_i.read_bytes() == b"new content\n"
+
+
+def test_cli_compresslevel_valid_and_invalid_prevalidation(tmp_path):
+    """va1pd2 E-03: --write -c / --compresslevel forwards compression levels and pre-validates before backups."""
+    from openas import OpenAsReader
+
+    payload = (b"compressible line 0123456789abcdef\n" * 400)
+    src = tmp_path / "src.txt"
+    src.write_bytes(payload)
+
+    # 1. Valid -c 1 and --compresslevel 9 produce valid compressed outputs
+    for ext in (".gz", ".bz2", ".xz", ".zst"):
+        dst_fast = tmp_path / f"fast{ext}"
+        dst_max = tmp_path / f"max{ext}"
+        res_fast = subprocess.run(
+            [sys.executable, "-m", "openas", "--write", "-c", "1", str(src), str(dst_fast)],
+            capture_output=True,
+            text=True,
+            env=_cli_env(),
+        )
+        assert res_fast.returncode == 0, res_fast.stderr
+        res_max = subprocess.run(
+            [sys.executable, "-m", "openas", "--write", "--compresslevel", "9", str(src), str(dst_max)],
+            capture_output=True,
+            text=True,
+            env=_cli_env(),
+        )
+        assert res_max.returncode == 0, res_max.stderr
+        for dst in (dst_fast, dst_max):
+            with OpenAsReader(dst, binary=True) as r:
+                assert r.read() == payload
+
+    # 2. Invalid --compresslevel 999 exits 1 cleanly BEFORE creating backups on earlier targets
+    for bad_ext in (".gz", ".bz2", ".xz", ".zst"):
+        first_dst = tmp_path / f"keep_first_{bad_ext.lstrip('.')}.txt"
+        first_dst.write_bytes(b"preserve me\n")
+        bad_dst = tmp_path / f"bad_level{bad_ext}"
+        res_bad = subprocess.run(
+            [sys.executable, "-m", "openas", "--write", "--compresslevel", "999", str(src), str(first_dst), str(bad_dst)],
+            capture_output=True,
+            text=True,
+            env=_cli_env(),
+        )
+        assert res_bad.returncode == 1, res_bad.stderr
+        assert "openas: error (ValueError):" in res_bad.stderr
+        assert "Traceback (most recent call last):" not in res_bad.stderr
+        assert first_dst.read_bytes() == b"preserve me\n"
+        assert not (tmp_path / f"{first_dst.name}.001.bu").exists()
+        assert not bad_dst.exists()
+
+    # 3. Non-integer --compresslevel exits 2 via argparse
+    res_nonint = subprocess.run(
+        [sys.executable, "-m", "openas", "--write", "--compresslevel", "fast", str(src), str(tmp_path / "x.gz")],
+        capture_output=True,
+        text=True,
+        env=_cli_env(),
+    )
+    assert res_nonint.returncode == 2
+
+
+def test_cli_timeout_validation_and_loopback_http(tmp_path):
+    """va1pd2 E-03: --timeout rejects invalid values (exit 1/2) before touching outputs and works over loopback HTTP."""
+    import http.server
+    import threading
+
+    src = tmp_path / "src.txt"
+    src.write_bytes(b"timeout test\n")
+    existing_dst = tmp_path / "keep_timeout.txt"
+    existing_dst.write_bytes(b"original\n")
+
+    # 1. Invalid numeric timeouts exit 1 cleanly without touching outputs or creating .001.bu
+    for bad_timeout in ("0", "-1", "nan", "inf"):
+        res_r = subprocess.run(
+            [sys.executable, "-m", "openas", "--read", "--timeout", bad_timeout, str(src)],
+            capture_output=True,
+            text=True,
+            env=_cli_env(),
+        )
+        assert res_r.returncode == 1, f"--read --timeout {bad_timeout}: {res_r.stderr!r}"
+        assert "openas: error (ValueError):" in res_r.stderr
+        assert "Traceback (most recent call last):" not in res_r.stderr
+
+        res_w = subprocess.run(
+            [sys.executable, "-m", "openas", "--write", "--timeout", bad_timeout, str(src), str(existing_dst)],
+            capture_output=True,
+            text=True,
+            env=_cli_env(),
+        )
+        assert res_w.returncode == 1, f"--write --timeout {bad_timeout}: {res_w.stderr!r}"
+        assert "openas: error (ValueError):" in res_w.stderr
+        assert "Traceback (most recent call last):" not in res_w.stderr
+        assert existing_dst.read_bytes() == b"original\n"
+        assert not (tmp_path / "keep_timeout.txt.001.bu").exists()
+
+    # 2. Non-numeric --timeout exits 2 via argparse
+    res_bad = subprocess.run(
+        [sys.executable, "-m", "openas", "--read", "--timeout", "bad", str(src)],
+        capture_output=True,
+        text=True,
+        env=_cli_env(),
+    )
+    assert res_bad.returncode == 2
+
+    # 3. Valid --timeout 5 succeeds against a real loopback ThreadingHTTPServer
+    body = b"http line 1\nhttp line 2\n"
+
+    class SimpleHandler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, format, *args):  # noqa: A002
+            return
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), SimpleHandler)
+    port = server.server_address[1]
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        url = f"http://127.0.0.1:{port}/data.txt"
+        res_http_read = subprocess.run(
+            [sys.executable, "-m", "openas", "--read", "--timeout", "5", url],
+            capture_output=True,
+            text=True,
+            env=_cli_env(),
+        )
+        assert res_http_read.returncode == 0, res_http_read.stderr
+        assert "FINISHED Reading." in res_http_read.stdout
+        assert "2 lines" in res_http_read.stdout
+
+        http_dst = tmp_path / "from_http.txt"
+        res_http_write = subprocess.run(
+            [sys.executable, "-m", "openas", "--write", "--timeout", "5", url, str(http_dst)],
+            capture_output=True,
+            text=True,
+            env=_cli_env(),
+        )
+        assert res_http_write.returncode == 0, res_http_write.stderr
+        assert "FINISHED Writing." in res_http_write.stdout
+        assert http_dst.read_bytes() == body
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+def test_cli_progress_flag_and_invalid_read_combinations(tmp_path):
+    """va1pd2 E-03: --read/--write --progress keep stdout summaries intact; --read rejects --no-backup and --compresslevel."""
+    import gzip
+
+    payload = b"progress line 1\nprogress line 2\nprogress line 3\n"
+    src_gz = tmp_path / "prog_src.txt.gz"
+    with gzip.open(src_gz, "wb") as fh:
+        fh.write(payload)
+    dst_txt = tmp_path / "prog_dst.txt"
+
+    # 1. --read --progress
+    res_r = subprocess.run(
+        [sys.executable, "-m", "openas", "--read", "--progress", str(src_gz)],
+        capture_output=True,
+        text=True,
+        env=_cli_env(),
+    )
+    assert res_r.returncode == 0, res_r.stderr
+    assert f"Reading {src_gz}" in res_r.stdout
+    assert f"FINISHED Reading. {src_gz}. 3 lines / {len(payload):.1f}B" in res_r.stdout
+
+    # 2. --write --progress
+    res_w = subprocess.run(
+        [sys.executable, "-m", "openas", "--write", "--progress", str(src_gz), str(dst_txt)],
+        capture_output=True,
+        text=True,
+        env=_cli_env(),
+    )
+    assert res_w.returncode == 0, res_w.stderr
+    assert f"Will Read from {src_gz}" in res_w.stdout
+    assert f"Writing {dst_txt}" in res_w.stdout
+    assert f"FINISHED Writing. {dst_txt}. 3 lines / {len(payload):.1f}B" in res_w.stdout
+    assert dst_txt.read_bytes() == payload
+
+    # 3. Invalid flag combinations with --read exit 2 via parser.error
+    for bad_args in (
+        ["--read", "--no-backup", str(src_gz)],
+        ["--read", "--compresslevel", "3", str(src_gz)],
+        ["--read", "-c", "3", str(src_gz)],
+    ):
+        res_bad = subprocess.run(
+            [sys.executable, "-m", "openas", *bad_args],
+            capture_output=True,
+            text=True,
+            env=_cli_env(),
+        )
+        assert res_bad.returncode == 2, f"{bad_args}: rc={res_bad.returncode}, stderr={res_bad.stderr!r}"
+        assert "--write" in res_bad.stderr
+
+    # 4. --help displays all four new flags
+    res_help = subprocess.run(
+        [sys.executable, "-m", "openas", "--help"],
+        capture_output=True,
+        text=True,
+        env=_cli_env(),
+    )
+    assert res_help.returncode == 0
+    for flag in ("--no-backup", "--compresslevel", "-c", "--timeout", "--progress"):
+        assert flag in res_help.stdout
