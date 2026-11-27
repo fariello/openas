@@ -599,3 +599,146 @@ def test_cli_compressed_formats_subprocess_roundtrip(tmp_path, ext):
     )
     assert res_decode.returncode == 0, res_decode.stderr
     assert plain_back.read_bytes() == payload_bytes
+
+
+def test_cli_write_rejects_duplicate_destinations_and_redacts_credentials(tmp_path):
+    """kfvf7i E-05: CLI --write rejects duplicate resolved destinations (exit 2) without touching files or leaking secrets."""
+    src = tmp_path / "src.txt"
+    src.write_bytes(b"fresh payload\n")
+    existing = tmp_path / "out.txt"
+    existing.write_bytes(b"original content\n")
+
+    # 1. Identical local path
+    res_same = subprocess.run(
+        [sys.executable, "-m", "openas", "--write", str(src), str(existing), str(existing)],
+        capture_output=True,
+        text=True,
+        env=_cli_env(),
+    )
+    assert res_same.returncode == 2
+    assert "Duplicate destination specified" in res_same.stderr
+    assert existing.read_bytes() == b"original content\n"
+    assert not (tmp_path / "out.txt.001.bu").exists()
+
+    # 2. ./ alias
+    res_dot = subprocess.run(
+        [sys.executable, "-m", "openas", "--write", str(src), "out.txt", "./out.txt"],
+        capture_output=True,
+        text=True,
+        env=_cli_env(),
+        cwd=str(tmp_path),
+    )
+    assert res_dot.returncode == 2
+    assert "Duplicate destination specified" in res_dot.stderr
+    assert existing.read_bytes() == b"original content\n"
+    assert not (tmp_path / "out.txt.001.bu").exists()
+
+    # 3. file:// alias
+    res_uri = subprocess.run(
+        [sys.executable, "-m", "openas", "--write", str(src), str(existing), existing.as_uri()],
+        capture_output=True,
+        text=True,
+        env=_cli_env(),
+    )
+    assert res_uri.returncode == 2
+    assert "Duplicate destination specified" in res_uri.stderr
+    assert existing.read_bytes() == b"original content\n"
+    assert not (tmp_path / "out.txt.001.bu").exists()
+
+    # 4. ssh:// vs sftp:// alias (default port 22)
+    res_ssh_sftp = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "openas",
+            "--write",
+            str(src),
+            "ssh://alice@Example.COM/dir/out.txt",
+            "sftp://bob@example.com:22/dir/out.txt",
+        ],
+        capture_output=True,
+        text=True,
+        env=_cli_env(),
+    )
+    assert res_ssh_sftp.returncode == 2
+    assert "Duplicate destination specified" in res_ssh_sftp.stderr
+
+    # 5. Remote URL with inline password & query string: exit 2 and no password/token leak in stderr
+    secret_url = "sftp://alice:supersecret@host/dir/out.txt?token=tok123"
+    res_secret = subprocess.run(
+        [sys.executable, "-m", "openas", "--write", str(src), secret_url, secret_url],
+        capture_output=True,
+        text=True,
+        env=_cli_env(),
+    )
+    assert res_secret.returncode == 2
+    assert "Duplicate destination specified" in res_secret.stderr
+    assert "supersecret" not in res_secret.stderr
+    assert "tok123" not in res_secret.stderr
+    assert "sftp://alice:***@host/dir/out.txt?<redacted>" in res_secret.stderr
+
+
+def test_cli_write_distinct_local_symlinks_allowed_and_symlinked_parent_collides(tmp_path):
+    """kfvf7i E-05: Distinct local symlinks (link.txt vs real.txt) remain allowed while symlinked parent dirs collide."""
+    src = tmp_path / "src.txt"
+    src.write_bytes(b"broadcast payload\n")
+    real_dir = tmp_path / "real_dir"
+    real_dir.mkdir()
+    real_file = real_dir / "real.txt"
+    real_file.write_bytes(b"real original\n")
+    link_file = real_dir / "link.txt"
+    sym_dir = tmp_path / "sym_dir"
+    try:
+        link_file.symlink_to(real_file)
+        sym_dir.symlink_to(real_dir)
+    except OSError:
+        if os.name == "nt":
+            pytest.skip("Windows symlink creation requires Developer Mode or elevated privileges")
+        raise
+
+    # Symlinked parent dir alias collides (exit 2) without touching files
+    res_parent = subprocess.run(
+        [sys.executable, "-m", "openas", "--write", str(src), str(real_file), str(sym_dir / "real.txt")],
+        capture_output=True,
+        text=True,
+        env=_cli_env(),
+    )
+    assert res_parent.returncode == 2
+    assert "Duplicate destination specified" in res_parent.stderr
+    assert real_file.read_bytes() == b"real original\n"
+    assert not (real_dir / "real.txt.001.bu").exists()
+
+    # Distinct local symlink (link.txt) and its target (real.txt) remain allowed
+    res_distinct = subprocess.run(
+        [sys.executable, "-m", "openas", "--write", str(src), str(link_file), str(real_file)],
+        capture_output=True,
+        text=True,
+        env=_cli_env(),
+    )
+    assert res_distinct.returncode == 0, res_distinct.stderr
+    assert os.path.islink(real_dir / "link.txt.001.bu")
+    assert (real_dir / "real.txt.001.bu").read_bytes() == b"real original\n"
+    assert not os.path.islink(link_file)
+    assert link_file.read_bytes() == b"broadcast payload\n"
+    assert real_file.read_bytes() == b"broadcast payload\n"
+
+
+def test_cli_write_local_directory_prevalidation_leaves_earlier_destination_untouched(tmp_path):
+    """kfvf7i E-05: Existing local directory as 2nd destination raises IsADirectoryError before backing up 1st destination."""
+    src = tmp_path / "src.txt"
+    src.write_bytes(b"new payload\n")
+    first_dst = tmp_path / "first.txt"
+    first_dst.write_bytes(b"keep intact\n")
+    existing_dir = tmp_path / "target_dir"
+    existing_dir.mkdir()
+
+    res = subprocess.run(
+        [sys.executable, "-m", "openas", "--write", str(src), str(first_dst), str(existing_dir)],
+        capture_output=True,
+        text=True,
+        env=_cli_env(),
+    )
+    assert res.returncode == 1
+    assert "IsADirectoryError" in res.stderr
+    assert first_dst.read_bytes() == b"keep intact\n"
+    assert not (tmp_path / "first.txt.001.bu").exists()

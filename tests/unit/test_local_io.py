@@ -1447,3 +1447,311 @@ def test_streaming_memory_bound_o1_tracemalloc(tmp_path, ext):
             )
         else:
             assert peak_16 < 2 * 1024 * 1024, f"{ext} ({mode}) 16 MiB peak {peak_16} >= 2 MiB"
+
+
+def test_local_backup_moves_broken_and_valid_symlinks_without_following(tmp_path, monkeypatch):
+    """kfvf7i E-02: Local backup=True moves broken and valid symlinks as symlinks across both link paths."""
+    probe_link = tmp_path / "_symlink_probe"
+    try:
+        probe_link.symlink_to(tmp_path / "_probe_target")
+    except OSError:
+        if os.name == "nt":
+            pytest.skip("Windows symlink creation requires Developer Mode or elevated privileges")
+        raise
+    probe_link.unlink()
+
+    def _run_case(case_dir):
+        case_dir.mkdir()
+        # 1. Broken symlink: moved to .001.bu, dangling target never created, new regular file at path
+        dangling_target = case_dir / "missing_target.txt"
+        broken_link = case_dir / "broken.txt"
+        broken_link.symlink_to(dangling_target)
+
+        with openas(broken_link, "w", backup=True) as w:
+            w.write("fresh regular\n")
+
+        broken_bu = case_dir / "broken.txt.001.bu"
+        assert os.path.islink(broken_bu)
+        assert os.readlink(broken_bu) == str(dangling_target)
+        assert not os.path.lexists(dangling_target)
+        assert not os.path.islink(broken_link)
+        assert broken_link.read_text(encoding="utf-8") == "fresh regular\n"
+
+        # 2. Valid symlink to existing file: moved to .001.bu without hard-linking or modifying real target
+        real_file = case_dir / "real.txt"
+        real_file.write_text("precious target\n", encoding="utf-8")
+        valid_link = case_dir / "alias.txt"
+        valid_link.symlink_to(real_file)
+
+        with openas(valid_link, "w", backup=True) as w:
+            w.write("replacement file\n")
+
+        valid_bu = case_dir / "alias.txt.001.bu"
+        assert os.path.islink(valid_bu)
+        assert os.readlink(valid_bu) == str(real_file)
+        assert os.stat(real_file).st_nlink == 1
+        assert real_file.read_text(encoding="utf-8") == "precious target\n"
+        assert not os.path.islink(valid_link)
+        assert valid_link.read_text(encoding="utf-8") == "replacement file\n"
+
+    # Path A: native supports_follow_symlinks behavior (os.link(..., follow_symlinks=False) on POSIX)
+    _run_case(tmp_path / "native")
+
+    # Path B: fallback branch when os.link not in os.supports_follow_symlinks
+    fallback_dir = tmp_path / "no_follow_support"
+    with monkeypatch.context() as mp:
+        mp.setattr(os, "supports_follow_symlinks", set())
+        link_calls = []
+        real_link = os.link
+
+        def spy_link(*args, **kwargs):
+            link_calls.append((args, kwargs))
+            return real_link(*args, **kwargs)
+
+        mp.setattr(os, "link", spy_link)
+        _run_case(fallback_dir)
+        assert link_calls == []
+
+        # Existing broken symlink at .001.bu is never overwritten on rename fallback; advances to .002.bu
+        pre_bu = fallback_dir / "collide.txt.001.bu"
+        pre_bu.symlink_to(fallback_dir / "nonexistent_bu_target")
+        target_sym = fallback_dir / "collide.txt"
+        dangling2 = fallback_dir / "dangling2.txt"
+        target_sym.symlink_to(dangling2)
+        with openas(target_sym, "w", backup=True) as w:
+            w.write("after collision\n")
+        assert os.path.islink(pre_bu)
+        assert os.readlink(pre_bu) == str(fallback_dir / "nonexistent_bu_target")
+        bu2 = fallback_dir / "collide.txt.002.bu"
+        assert os.path.islink(bu2)
+        assert os.readlink(bu2) == str(dangling2)
+        assert target_sym.read_text(encoding="utf-8") == "after collision\n"
+
+    # Path C: os.link raises FileNotFoundError on a broken symlink (following symlink) while lexists(src) is True
+    fnf_dir = tmp_path / "link_fnf"
+    fnf_dir.mkdir()
+    dangling3 = fnf_dir / "dangling3.txt"
+    sym3 = fnf_dir / "sym3.txt"
+    sym3.symlink_to(dangling3)
+    with patch("os.link", side_effect=FileNotFoundError("followed broken symlink")):
+        with patch.object(os, "supports_follow_symlinks", {os.link}):
+            with openas(sym3, "w", backup=True) as w:
+                w.write("recovered\n")
+    bu3 = fnf_dir / "sym3.txt.001.bu"
+    assert os.path.islink(bu3)
+    assert os.readlink(bu3) == str(dangling3)
+    assert not os.path.lexists(dangling3)
+    assert not os.path.islink(sym3)
+    assert sym3.read_text(encoding="utf-8") == "recovered\n"
+
+
+def test_keyboard_interrupt_in_close_and_flush_progress_closes_all_remaining_handles(tmp_path):
+    """kfvf7i E-03: KeyboardInterrupt in _flush_progress() or _close_handles() still closes all remaining handles."""
+    from openas.openas import _close_handles
+
+    # 1. _close_handles: KeyboardInterrupt in first handle still closes all remaining handles
+    h1 = MagicMock()
+    h1.closed = False
+    h1.close.side_effect = KeyboardInterrupt("ctrl-c h1")
+    h2 = MagicMock()
+    h2.closed = False
+    h3 = MagicMock()
+    h3.closed = False
+    with pytest.raises(KeyboardInterrupt, match="ctrl-c h1"):
+        _close_handles(h1, h2, h3)
+    assert h1.close.call_count == 1
+    assert h2.close.call_count == 1
+    assert h3.close.call_count == 1
+
+    fp = tmp_path / "ki_close.txt"
+    fp.write_bytes(b"line1\nline2\n")
+
+    # 2. OpenAsReader.close: KeyboardInterrupt in _flush_progress() alone still closes all handles
+    r1 = OpenAsReader(fp, show_progress=True).open()
+    orig_fh1 = r1._fh
+    pbar1 = r1._progress
+    assert orig_fh1 is not None and pbar1 is not None
+    it1 = iter(r1)
+    assert next(it1) == "line1\n"
+    pbar1_closed = []
+    orig_pbar1_close = pbar1.close
+
+    def spy_pbar1_close():
+        pbar1_closed.append(True)
+        return orig_pbar1_close()
+
+    pbar1.close = spy_pbar1_close
+    pbar1.update = MagicMock(side_effect=KeyboardInterrupt("ctrl-c flush alone"))
+    sibling1 = MagicMock()
+    sibling1.closed = False
+    r1._ssh_client = sibling1
+
+    with pytest.raises(KeyboardInterrupt, match="ctrl-c flush alone"):
+        r1.close()
+    assert orig_fh1.closed is True
+    assert sibling1.close.call_count == 1
+    assert pbar1_closed == [True]
+    assert r1.closed is True
+    assert r1._ssh_client is None
+
+    # 3. OpenAsReader.close: KeyboardInterrupt in _flush_progress() + secondary handle close error
+    for secondary_exc in (OSError("secondary os error"), KeyboardInterrupt("secondary ki")):
+        r2 = OpenAsReader(fp, show_progress=True).open()
+        orig_fh2 = r2._fh
+        pbar2 = r2._progress
+        assert orig_fh2 is not None and pbar2 is not None
+        it2 = iter(r2)
+        assert next(it2) == "line1\n"
+        pbar2_closed = []
+        orig_pbar2_close = pbar2.close
+
+        def spy_pbar2_close(closed_list=pbar2_closed, orig=orig_pbar2_close):
+            closed_list.append(True)
+            return orig()
+
+        pbar2.close = spy_pbar2_close
+        pbar2.update = MagicMock(side_effect=KeyboardInterrupt("primary ki flush"))
+        failing_fh = MagicMock()
+        failing_fh.closed = False
+        failing_fh.close.side_effect = secondary_exc
+        sibling2 = MagicMock()
+        sibling2.closed = False
+        r2._fh = failing_fh
+        r2._ssh_client = sibling2
+        try:
+            with pytest.raises(KeyboardInterrupt, match="primary ki flush"):
+                r2.close()
+        finally:
+            if not orig_fh2.closed:
+                orig_fh2.close()
+        assert failing_fh.close.call_count == 1
+        assert sibling2.close.call_count == 1
+        assert pbar2_closed == [True]
+        assert r2.closed is True
+        assert r2._ssh_client is None
+
+
+def test_readinto_typed_buffers_and_zero_length_across_stream_adapters():
+    """kfvf7i E-04: Typed buffers (array('I')) and zero-length buffers work across all four stream adapters."""
+    import array
+    import io as _io
+    from openas.openas import (
+        _BinaryStreamAdapter,
+        _CountingByteStream,
+        _HttpRawStream,
+        _ZstdFrameValidatingStream,
+    )
+
+    class ReadOnlyStream:
+        """Minimal binary stream supporting only read() (no readinto)."""
+
+        def __init__(self, data: bytes):
+            self._buf = _io.BytesIO(data)
+            self.closed = False
+
+        def read(self, size: int = -1):
+            return self._buf.read() if (size is None or size < 0) else self._buf.read(size)
+
+        def close(self):
+            self.closed = True
+            self._buf.close()
+
+    class NonBlockingStream:
+        """Binary stream whose readinto/read returns None to signal EAGAIN (not EOF)."""
+
+        def __init__(self, *, with_readinto: bool):
+            self._with_readinto = with_readinto
+            if with_readinto:
+                self.readinto = self._readinto
+
+        def _readinto(self, b):
+            return None
+
+        def read(self, size: int = -1):
+            return None
+
+    payload = b"0123456789ABCDEF"  # 16 bytes (multiple of 4-byte uint32)
+
+    # 1. _BinaryStreamAdapter & _HttpRawStream (delegating readinto and fallback read-only)
+    for make_adapter in (
+        lambda raw: _BinaryStreamAdapter(raw, readable=True),
+        lambda raw: _HttpRawStream(raw),
+    ):
+        for make_raw in (_io.BytesIO, ReadOnlyStream):
+            adapter = make_adapter(make_raw(payload))
+            assert adapter.readinto(bytearray(0)) == 0
+            assert adapter.readinto(array.array("I")) == 0
+            buf = array.array("I", [0, 0, 0, 0])
+            n = adapter.readinto(buf)
+            assert n == 16
+            assert buf.tobytes() == payload
+            assert adapter.readinto(buf) == 0
+            adapter.close()
+
+        for with_ri in (True, False):
+            nb_adapter = make_adapter(NonBlockingStream(with_readinto=with_ri))
+            assert nb_adapter.readinto(array.array("I", [0])) is None
+
+    # 2. _CountingByteStream (delegating readinto, fallback read-only, zero-length, and non-blocking None)
+    for make_raw in (_io.BytesIO, ReadOnlyStream):
+        flushes = []
+        counting = _CountingByteStream(make_raw(payload), on_progress=flushes.append, batch_size=1024)
+        assert counting.readinto(bytearray(0)) == 0
+        assert flushes == []
+        buf = array.array("I", [0, 0])  # 8 bytes
+        assert counting.readinto(buf) == 8
+        assert buf.tobytes() == payload[:8]
+        assert counting.bytes_read == 8
+        assert flushes == []
+        assert counting.readinto(buf) == 8
+        assert buf.tobytes() == payload[8:]
+        assert counting.bytes_read == 16
+        # EOF triggers flush
+        assert counting.readinto(buf) == 0
+        assert flushes == [16]
+
+    for with_ri in (True, False):
+        flushes = []
+        counting_nb = _CountingByteStream(
+            NonBlockingStream(with_readinto=with_ri),
+            on_progress=flushes.append,
+            batch_size=1024,
+        )
+        counting_nb._pending = 5
+        assert counting_nb.readinto(array.array("I", [0])) is None
+        assert flushes == []
+
+    # 3. _ZstdFrameValidatingStream: valid and truncated .zst read via array('I') across both paths
+    full_zst = zstd.ZstdCompressor(write_checksum=True).compress(b"hello zstd typed buffer\n" * 40)
+    trunc_zst = full_zst[: max(12, len(full_zst) // 2)]
+
+    for make_raw in (_io.BytesIO, ReadOnlyStream):
+        # Valid .zst succeeds and reaches clean EOF
+        valid_stream = _ZstdFrameValidatingStream(make_raw(full_zst))
+        assert valid_stream.readinto(bytearray(0)) == 0
+        collected = bytearray()
+        while True:
+            arr = array.array("I", [0] * 4)
+            n = valid_stream.readinto(arr)
+            if n == 0:
+                break
+            collected.extend(arr.tobytes()[:n])
+        assert bytes(collected) == full_zst
+        assert valid_stream._state == valid_stream._S_MAGIC
+
+        # Truncated .zst raises EOFError instead of transitioning to _S_PASSTHROUGH
+        trunc_stream = _ZstdFrameValidatingStream(make_raw(trunc_zst))
+        assert trunc_stream.readinto(bytearray(0)) == 0
+        with pytest.raises(EOFError, match="Truncated zstd stream"):
+            while True:
+                arr = array.array("I", [0] * 4)
+                n = trunc_stream.readinto(arr)
+                if n == 0:
+                    break
+        assert trunc_stream._state != trunc_stream._S_PASSTHROUGH
+
+    # Non-blocking None on _ZstdFrameValidatingStream does not falsely trigger EOFError mid-frame
+    for with_ri in (True, False):
+        nb_zst = _ZstdFrameValidatingStream(NonBlockingStream(with_readinto=with_ri))
+        nb_zst._feed(full_zst[:8])
+        assert nb_zst.readinto(array.array("I", [0])) is None

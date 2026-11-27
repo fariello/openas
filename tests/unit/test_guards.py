@@ -220,10 +220,121 @@ def test_single_colon_local_paths_and_file_uris(tmp_path, monkeypatch):
     [
         "sftp://u@h/dir/archive%2Ezip",
         "https://h/dir/archive.tar%2egz",
+        "sftp://user@host/dir/a;archive.zip",
+        "https://example.com/dir/a;archive.tar.gz",
     ],
 )
 @pytest.mark.parametrize("mode", ["r", "w", "a"])
 def test_percent_encoded_remote_archives_rejected(url, mode):
-    """iev841 E-01: Percent-encoded archive extensions in network URLs raise UnsupportedArchiveError."""
+    """iev841 E-01 & kfvf7i E-01: Percent-encoded and semicolon archive extensions raise UnsupportedArchiveError."""
     with pytest.raises(UnsupportedArchiveError):
         openas(url, mode)
+
+
+@pytest.mark.parametrize(
+    "url,expected_authority",
+    [
+        ("file://alice:supersecret@remote.example/a.txt", "alice:***@remote.example"),
+        ("file://alice:supersecret@/a.txt", "alice:***@"),
+        ("file://alice:supersecret@localhost/a.txt", "alice:***@localhost"),
+    ],
+)
+@pytest.mark.parametrize("mode", ["r", "w"])
+def test_file_uri_authority_errors_redact_credentials_without_none(url, expected_authority, mode):
+    """kfvf7i E-01: Unsupported file:// authorities redact credentials and never print 'None'."""
+    with pytest.raises(UnsupportedProtocolError) as excinfo:
+        openas(url, mode)
+    msg = str(excinfo.value)
+    assert "supersecret" not in msg
+    assert "'None'" not in msg
+    assert expected_authority in msg
+
+
+@pytest.mark.parametrize(
+    "url,expected_redacted",
+    [
+        ("sftp://user:supersecret:1234/file.txt", "sftp://user:***/file.txt"),
+        ("ftp://user:supersecret:1234/file.txt", "ftp://user:***/file.txt"),
+        ("sftp://user:supersecret/file.txt", "sftp://user:***/file.txt"),
+        ("sftp://[::1]:supersecret/file.txt", "sftp://[::1]:***/file.txt"),
+    ],
+)
+@pytest.mark.parametrize("mode", ["r", "w"])
+def test_malformed_port_and_no_at_credential_urls_fail_redacted(url, expected_redacted, mode):
+    """kfvf7i E-01: Malformed port/credential URLs without '@' raise redacted ValueError and redact in repr()."""
+    from openas import OpenAsReader, OpenAsWriter
+    from openas.openas import _redact_url
+
+    assert _redact_url(url) == expected_redacted
+    for obj in (OpenAsReader(url), OpenAsWriter(url)):
+        rep = repr(obj)
+        assert "supersecret" not in rep
+        assert expected_redacted in rep
+
+    with pytest.raises(ValueError) as excinfo:
+        openas(url, mode)
+    msg = str(excinfo.value)
+    assert "supersecret" not in msg
+    assert expected_redacted in msg
+    assert excinfo.value.__suppress_context__ is True
+
+
+def test_redact_url_preserves_valid_numeric_and_empty_ports_and_masks_non_digits():
+    """kfvf7i E-01: _redact_url masks non-digit port suffixes while keeping numeric/empty ports unmasked."""
+    from openas.openas import _redact_url
+
+    assert _redact_url("sftp://host:8080/a.txt") == "sftp://host:8080/a.txt"
+    assert _redact_url("sftp://host:0/a.txt") == "sftp://host:0/a.txt"
+    assert _redact_url("sftp://host:99999/a.txt") == "sftp://host:99999/a.txt"
+    assert _redact_url("sftp://host:/a.txt") == "sftp://host:/a.txt"
+    assert _redact_url("sftp://[::1]:2222/a.txt") == "sftp://[::1]:2222/a.txt"
+    assert _redact_url("sftp://[::1]:/a.txt") == "sftp://[::1]:/a.txt"
+    assert _redact_url("sftp://alice:pw@host:badport/a.txt") == "sftp://alice:***@host:***/a.txt"
+    assert _redact_url("sftp://alice:pw@[::1]:badport/a.txt?tok=1") == "sftp://alice:***@[::1]:***/a.txt?<redacted>"
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "sftp://host:0/a.txt",
+        "sftp://host:99999/a.txt",
+        "ftp://host:0/a.txt",
+        "https://example.com:65536/a.txt",
+    ],
+)
+def test_invalid_zero_and_out_of_range_ports_rejected(url):
+    """kfvf7i E-01: Port 0 and out-of-range ports fail fast with ValueError."""
+    with pytest.raises(ValueError, match="port"):
+        openas(url, "r")
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "file://",
+        "file://localhost",
+        "ftp://user:supersecret@host",
+        "ssh://user:supersecret@host",
+        "sftp://user:supersecret@host",
+        "sftp://user@host:2222",
+    ],
+)
+@pytest.mark.parametrize("mode", ["r", "w"])
+def test_empty_path_rejected_for_file_ftp_ssh_sftp(url, mode):
+    """kfvf7i E-01: Empty path on file://, ftp://, ssh://, and sftp:// raises redacted ValueError."""
+    with pytest.raises(ValueError) as excinfo:
+        openas(url, mode)
+    msg = str(excinfo.value)
+    assert "supersecret" not in msg
+
+
+@pytest.mark.parametrize("bad_timeout", [float("nan"), float("inf"), float("-inf")])
+def test_non_finite_timeout_and_format_bytes(tmp_path, bad_timeout):
+    """kfvf7i E-01: Non-finite timeout raises ValueError; non-finite format_bytes returns '<num>B'."""
+    from openas.openas import format_bytes
+
+    target = tmp_path / "timeout_nonfinite.txt"
+    with pytest.raises(ValueError, match="timeout"):
+        openas(target, "r", timeout=bad_timeout)
+
+    assert format_bytes(bad_timeout) == f"{bad_timeout}B"

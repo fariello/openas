@@ -26,19 +26,19 @@ Prefer `openas` or `python -m openas` to avoid Python's `runpy` `RuntimeWarning`
   - With `--write` (without `--input-file`): `file[0]` is the source and `file[1:]` are destinations (at least two paths required).
   - With `--write --input-file SRC`: all positional arguments are destinations (at least one destination required).
 - `--read`, `-r` (Mutually Exclusive): Reads every positional file in 64 KiB binary chunks and reports `b'\n'`-delimited line count (empty files report 0 lines; non-empty files without a trailing newline count the final line), 1-decimal base-1024 human-readable byte size (`B` through `YB`), line rate, byte rate (empty files or zero-byte rates format as `(0.0B/s)`), and elapsed seconds.
-- `--write`, `-w` (Mutually Exclusive): Pre-validates destination protocol and archive guards, opens the source and all destinations in binary mode inside a single `contextlib.ExitStack`, reads the source once in 64 KiB chunks, writes exact bytes (preserving CRLF and arbitrary non-UTF-8 binary payloads) synchronously to each destination (moving existing destinations to sequential `.bu` backups), and closes all handles on error.
+- `--write`, `-w` (Mutually Exclusive): Pre-validates each destination before opening or rotating files (checking URL syntax/ports/paths, container-archive guards, read-only `http://`/`https://` protocols, existing non-symlink local directories with `IsADirectoryError`, and duplicate resolved destinations via `parser.error` exit code 2 with redacted URLs). Duplicate detection normalizes local paths (`./`, `file://`, and symlinked parent directories collide while distinct local symlinks such as `link.txt` and `real.txt` stay distinct) and remote URLs (`ssh://` and `sftp://` on the same host, effective port, and decoded path collide). Opens the source and all destinations in binary mode inside a single `contextlib.ExitStack`, reads the source once in 64 KiB chunks, writes exact bytes (preserving CRLF and arbitrary non-UTF-8 binary payloads) synchronously to each destination (moving existing destinations to sequential `.bu` backups), and closes all handles on error.
 - `--input-file INPUT_FILE`, `-i INPUT_FILE`: Explicit source path or URL for `--write` mode. Rejected via `parser.error` if combined with `--read` or if no destination is given.
 - `--version`: Prints `openas <version>` and exits 0.
 
 ## Exit Codes
 
 - `0`: Command completed successfully, or `--help` / `--version` was printed.
-- `2`: Usage or argument validation error reported by `argparse` / `parser.error` (for example missing `--read`/`--write`, zero files passed to `--read`, fewer than two positional files passed to `--write` without `--input-file`, `--input-file` combined with `--read`, or `--input-file` with no destinations).
-- Non-zero (`1` on uncaught Python exceptions): Guard or I/O failure during execution (for example `UnsupportedArchiveError`, `ReadOnlyProtocolError`, `UnsupportedProtocolError`, `FileNotFoundError`, `IsADirectoryError`, or remote connection errors).
+- `2`: Usage or argument validation error reported by `argparse` / `parser.error` (for example missing `--read`/`--write`, zero files passed to `--read`, fewer than two positional files passed to `--write` without `--input-file`, `--input-file` combined with `--read`, `--input-file` with no destinations, or duplicate resolved `--write` destinations).
+- Non-zero (`1` on uncaught Python exceptions): Guard or I/O failure during execution (for example `UnsupportedArchiveError`, `ReadOnlyProtocolError`, `UnsupportedProtocolError`, `ValueError`, `FileNotFoundError`, `IsADirectoryError`, or remote connection errors).
 
 ## Credential Redaction
 
-URL passwords and query strings are automatically masked (`user:***@host/path?<redacted>`) in CLI stdout messages. Even so, avoid passing inline passwords on shell command lines because they can remain visible in shell history and process listings; prefer SSH keys (`sftp://user@host/path/to/file`).
+URL passwords, non-numeric port suffixes on malformed URLs, and query strings are automatically masked (`user:***@host/path?<redacted>`) in CLI stdout and stderr messages (including duplicate-destination usage errors). Even so, avoid passing inline passwords on shell command lines because they can remain visible in shell history and process listings; prefer SSH keys (`sftp://user@host/path/to/file`).
 
 ## Examples
 
