@@ -1167,3 +1167,140 @@ def test_cli_progress_flag_and_invalid_read_combinations(tmp_path):
     assert res_help.returncode == 0
     for flag in ("--no-backup", "--compresslevel", "-c", "--timeout", "--progress"):
         assert flag in res_help.stdout
+
+
+def test_cli_write_rejects_source_equals_destination_and_no_backup_symlink_alias(tmp_path):
+    """S7-X1: CLI --write rejects source==destination aliases and --no-backup symlink destination collisions without truncating."""
+    payload = b"important source data\nsecond line\n"
+    src = tmp_path / "source.txt"
+    src.write_bytes(payload)
+
+    # 1. Identical path with and without --no-backup
+    for extra in ([], ["--no-backup"]):
+        res = subprocess.run(
+            [sys.executable, "-m", "openas", "--write", *extra, str(src), str(src)],
+            capture_output=True,
+            text=True,
+            env=_cli_env(),
+        )
+        assert res.returncode == 2, f"extra={extra}: {res.stderr!r}"
+        assert "Destination cannot be the same as source" in res.stderr
+        assert src.read_bytes() == payload
+        assert not (tmp_path / "source.txt.001.bu").exists()
+
+    # 2. ./ alias and file:// URI alias
+    res_dot = subprocess.run(
+        [sys.executable, "-m", "openas", "--write", "--no-backup", "source.txt", "./source.txt"],
+        capture_output=True,
+        text=True,
+        env=_cli_env(),
+        cwd=str(tmp_path),
+    )
+    assert res_dot.returncode == 2
+    assert "Destination cannot be the same as source" in res_dot.stderr
+    assert src.read_bytes() == payload
+
+    res_uri = subprocess.run(
+        [sys.executable, "-m", "openas", "--write", "--no-backup", str(src), src.as_uri()],
+        capture_output=True,
+        text=True,
+        env=_cli_env(),
+    )
+    assert res_uri.returncode == 2
+    assert "Destination cannot be the same as source" in res_uri.stderr
+    assert src.read_bytes() == payload
+
+    # 3. Remote ssh:// vs sftp:// source==destination alias redacts credentials
+    res_remote = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "openas",
+            "--write",
+            "--no-backup",
+            "sftp://alice:topsecret1@Example.COM/dir/file.txt?tok=secretq1",
+            "ssh://bob:topsecret2@example.com:22/dir/file.txt?tok=secretq2",
+        ],
+        capture_output=True,
+        text=True,
+        env=_cli_env(),
+    )
+    assert res_remote.returncode == 2
+    assert "Destination cannot be the same as source" in res_remote.stderr
+    assert "topsecret1" not in res_remote.stderr
+    assert "topsecret2" not in res_remote.stderr
+    assert "secretq1" not in res_remote.stderr
+    assert "secretq2" not in res_remote.stderr
+    assert "ssh://bob:***@example.com:22/dir/file.txt?<redacted>" in res_remote.stderr
+
+    # 4. Symlink pointing to source, and symlink+target duplicate destinations under --no-backup
+    link_to_src = tmp_path / "link_to_source.txt"
+    dst = tmp_path / "dest.txt"
+    dst.write_bytes(b"original dest\n")
+    link_to_dst = tmp_path / "link_to_dest.txt"
+    try:
+        link_to_src.symlink_to(src)
+        link_to_dst.symlink_to(dst)
+    except OSError:
+        if os.name == "nt":
+            pytest.skip("Windows symlink creation requires Developer Mode or elevated privileges")
+        raise
+
+    for args in (
+        ["--write", "--no-backup", str(src), str(link_to_src)],
+        ["--write", "--no-backup", str(link_to_src), str(src)],
+    ):
+        res_sym_src = subprocess.run(
+            [sys.executable, "-m", "openas", *args],
+            capture_output=True,
+            text=True,
+            env=_cli_env(),
+        )
+        assert res_sym_src.returncode == 2, f"args={args}: {res_sym_src.stderr!r}"
+        assert "Destination cannot be the same as source" in res_sym_src.stderr
+        assert src.read_bytes() == payload
+
+    res_nobu_dup = subprocess.run(
+        [sys.executable, "-m", "openas", "--write", "--no-backup", str(src), str(link_to_dst), str(dst)],
+        capture_output=True,
+        text=True,
+        env=_cli_env(),
+    )
+    assert res_nobu_dup.returncode == 2, res_nobu_dup.stderr
+    assert "Duplicate destination specified" in res_nobu_dup.stderr
+    assert dst.read_bytes() == b"original dest\n"
+
+
+def test_cli_operational_urllib3_and_http_client_errors_redacted(monkeypatch, capsys):
+    """S7-X2: Mid-stream urllib3 and http.client errors exit 1 via _cli_main() with redacted URLs."""
+    import http.client
+    import importlib
+    import urllib3.exceptions
+
+    mod = importlib.import_module("openas.openas")
+
+    cases = [
+        urllib3.exceptions.ProtocolError(
+            "Connection broken for https://alice:pw123@example.com/a.gz?token=tok1"
+        ),
+        urllib3.exceptions.ReadTimeoutError(
+            None,
+            "https://bob:pw456@example.com/b.txt?key=k2",
+            "Read timed out.",
+        ),
+        http.client.IncompleteRead(b"partial", expected=100),
+        http.client.RemoteDisconnected("Remote end closed connection without response"),
+    ]
+    for exc in cases:
+        assert mod._is_cli_operational_error(exc) is True
+        monkeypatch.setattr(mod, "main", lambda _e=exc: (_ for _ in ()).throw(_e))
+        with pytest.raises(SystemExit) as sysexit:
+            mod._cli_main()
+        assert sysexit.value.code == 1
+        err = capsys.readouterr().err
+        assert err.startswith(f"openas: error ({type(exc).__name__}): ")
+        assert "pw123" not in err
+        assert "tok1" not in err
+        assert "pw456" not in err
+        assert "k2" not in err
+        assert "Traceback (most recent call last):" not in err

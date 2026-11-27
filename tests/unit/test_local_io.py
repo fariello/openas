@@ -2253,3 +2253,86 @@ def test_local_writer_progress_error_teardown_keyboard_interrupt_and_zero_overhe
     assert pbar2_closed == [True]
     assert pbar2.n == fh_err_fp.stat().st_size
     assert w_fh_err.closed is True
+
+
+def test_plain_local_text_progress_bom_and_lossy_error_handlers(tmp_path):
+    """S7-X4: Plain local text progress never overshoots and finishes at file_size for BOM encodings and lossy errors."""
+    # 1. BOM encodings (utf-16, utf-32, utf-8-sig with BOM) across iteration and readline
+    lines = [f"bom line {i} café\n" for i in range(40)]
+    text = "".join(lines)
+    for enc in ("utf-16", "utf-32", "utf-8-sig"):
+        fp = tmp_path / f"sample_{enc}.txt"
+        fp.write_bytes(text.encode(enc))
+        fsize = fp.stat().st_size
+
+        with OpenAsReader(fp, show_progress=True, encoding=enc) as r:
+            pbar = r._progress
+            assert pbar is not None and pbar.total == fsize
+            read_lines = []
+            for ln in r:
+                read_lines.append(ln)
+                assert pbar.n <= fsize
+        assert read_lines == lines
+        assert pbar.n == fsize
+
+        with OpenAsReader(fp, show_progress=True, encoding=enc) as r2:
+            pbar2 = r2._progress
+            assert pbar2 is not None and pbar2.total == fsize
+            got = []
+            while True:
+                ln = r2.readline()
+                assert pbar2.n <= fsize
+                if not ln:
+                    break
+                got.append(ln)
+        assert got == lines
+        assert pbar2.n == fsize
+
+    # 2. utf-8-sig on a file WITHOUT a BOM does not overshoot
+    no_bom_fp = tmp_path / "no_bom.txt"
+    no_bom_fp.write_bytes(b"a\nb\nc\n")
+    with OpenAsReader(no_bom_fp, show_progress=True, encoding="utf-8-sig") as r_nb:
+        pbar_nb = r_nb._progress
+        assert r_nb.read() == "a\nb\nc\n"
+    assert pbar_nb is not None
+    assert pbar_nb.n == no_bom_fp.stat().st_size
+
+    # 3. errors='replace' on invalid UTF-8 bytes (>64 KiB so batching triggers) never overshoots
+    bad_chunk = b"ok-" + b"\x80\x81\x82\xff" * 20 + b"-end\n"
+    rep_fp = tmp_path / "lossy_replace.txt"
+    rep_fp.write_bytes(bad_chunk * 1000)
+    rep_size = rep_fp.stat().st_size
+    assert rep_size > 65536
+    with OpenAsReader(rep_fp, show_progress=True, errors="replace") as r_rep:
+        pbar_rep = r_rep._progress
+        assert pbar_rep is not None and pbar_rep.total == rep_size
+        count = 0
+        for _ in r_rep:
+            count += 1
+            assert pbar_rep.n <= rep_size
+    assert count == 1000
+    assert pbar_rep.n == rep_size
+
+    # 4. errors='ignore' on dropped bytes finishes at exact file_size even with explicit newline='\n'
+    ign_fp = tmp_path / "lossy_ignore.txt"
+    ign_fp.write_bytes(b"abc\xff\xfe\x80def\n123\xff456\n")
+    ign_size = ign_fp.stat().st_size
+    with OpenAsReader(ign_fp, show_progress=True, errors="ignore", newline="\n") as r_ign:
+        pbar_ign = r_ign._progress
+        assert r_ign.read() == "abcdef\n123456\n"
+    assert pbar_ign is not None
+    assert pbar_ign.n == ign_size
+
+
+def test_typing_get_type_hints_resolves_public_and_helper_signatures():
+    """S7-X6: typing.get_type_hints() resolves annotations on openas, OpenAsReader, OpenAsWriter, and validators."""
+    import typing
+    from openas.openas import _validate_headers, _validate_key_filename
+
+    for obj in (openas, OpenAsReader.__init__, OpenAsWriter.__init__, _validate_headers, _validate_key_filename):
+        hints = typing.get_type_hints(obj)
+        assert isinstance(hints, dict)
+        assert len(hints) > 0
+    assert "headers" in typing.get_type_hints(openas)
+    assert "key_filename" in typing.get_type_hints(OpenAsReader.__init__)
+    assert "key_filename" in typing.get_type_hints(OpenAsWriter.__init__)

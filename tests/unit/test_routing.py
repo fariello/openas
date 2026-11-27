@@ -2307,3 +2307,130 @@ def test_remote_writer_progress_keyboard_interrupt_cleanup():
         assert w_sftp.closed is True
         assert w_sftp._progress is None
         assert w_sftp._counting_stream is None
+
+
+def test_sftp_channel_settimeout_applied_on_read_and_write():
+    """S7-X3: OpenAsReader and OpenAsWriter propagate timeout to SFTP channel settimeout() when available."""
+    with patch("paramiko.SSHClient") as mock_ssh:
+        # 1. Reader with timeout=12.5 sets channel timeout
+        client_r = MagicMock()
+        sftp_r = MagicMock()
+        chan_r = MagicMock()
+        sftp_r.get_channel.return_value = chan_r
+        sftp_r.file.return_value = io.BytesIO(b"hello\n")
+        client_r.open_sftp.return_value = sftp_r
+        mock_ssh.return_value = client_r
+
+        with openas("sftp://user@host/dir/in.txt", "r", timeout=12.5) as r:
+            assert r.read() == "hello\n"
+        chan_r.settimeout.assert_called_once_with(12.5)
+
+        # 2. Writer with timeout=7.25 sets channel timeout
+        client_w = MagicMock()
+        sftp_w = MagicMock()
+        chan_w = MagicMock()
+        sftp_w.get_channel.return_value = chan_w
+        buf_w = _InspectableBytesIO()
+        sftp_w.file.return_value = buf_w
+        client_w.open_sftp.return_value = sftp_w
+        mock_ssh.return_value = client_w
+
+        with openas("sftp://user@host/dir/out.txt", "w", backup=False, timeout=7.25) as w:
+            w.write("written\n")
+        chan_w.settimeout.assert_called_once_with(7.25)
+
+        # 3. No timeout -> settimeout not called
+        client_n = MagicMock()
+        sftp_n = MagicMock()
+        chan_n = MagicMock()
+        sftp_n.get_channel.return_value = chan_n
+        sftp_n.file.return_value = io.BytesIO(b"no-timeout\n")
+        client_n.open_sftp.return_value = sftp_n
+        mock_ssh.return_value = client_n
+
+        with openas("sftp://user@host/dir/in.txt", "r") as r_no:
+            assert r_no.read() == "no-timeout\n"
+        chan_n.settimeout.assert_not_called()
+
+        # 4. Channel returning None is handled gracefully
+        client_none = MagicMock()
+        sftp_none = MagicMock()
+        sftp_none.get_channel.return_value = None
+        sftp_none.file.return_value = io.BytesIO(b"ok\n")
+        client_none.open_sftp.return_value = sftp_none
+        mock_ssh.return_value = client_none
+
+        with openas("sftp://user@host/dir/in.txt", "r", timeout=3.0) as r_none:
+            assert r_none.read() == "ok\n"
+
+
+def test_zstd_close_does_not_double_close_failing_raw_handle_on_ftp_and_sftp():
+    """S7-X5: zstd stream_reader/stream_writer use closefd=False so failing raw.close() is invoked exactly once."""
+
+    class _FailingCloseStream:
+        def __init__(self, data: bytes = b""):
+            self._buf = io.BytesIO(data)
+            self.closed = False
+            self.close_calls = 0
+
+        def read(self, size=-1):
+            return self._buf.read(size)
+
+        def write(self, data):
+            self._buf.write(data)
+            return None
+
+        def flush(self):
+            return None
+
+        def close(self):
+            self.close_calls += 1
+            # Deliberately leave self.closed = False and raise to prove _close_handles does not double-close
+            raise OSError("underlying transport close failed")
+
+    compressed = zstd.ZstdCompressor().compress(b"zstd line 1\n")
+
+    # 1. FTP .zst reader
+    with patch("ftputil.FTPHost") as mock_ftp:
+        host = MagicMock()
+        raw_r = _FailingCloseStream(compressed)
+        host.open.return_value = raw_r
+        mock_ftp.return_value = host
+
+        reader = OpenAsReader("ftp://u:p@host/dir/data.zst").open()
+        assert reader.read() == "zstd line 1\n"
+        with pytest.raises(OSError, match="underlying transport close failed"):
+            reader.close()
+        assert raw_r.close_calls == 1
+        assert host.close.call_count == 1
+
+    # 2. FTP .zst writer
+    with patch("ftputil.FTPHost") as mock_ftp:
+        host = MagicMock()
+        raw_w = _FailingCloseStream()
+        host.open.return_value = raw_w
+        mock_ftp.return_value = host
+
+        writer = OpenAsWriter("ftp://u:p@host/dir/out.zst").open(backup=False)
+        writer.write("hello zstd\n")
+        with pytest.raises(OSError, match="underlying transport close failed"):
+            writer.close()
+        assert raw_w.close_calls == 1
+        assert host.close.call_count == 1
+
+    # 3. SFTP .zst writer
+    with patch("paramiko.SSHClient") as mock_ssh:
+        client = MagicMock()
+        sftp = MagicMock()
+        raw_sw = _FailingCloseStream()
+        sftp.file.return_value = raw_sw
+        client.open_sftp.return_value = sftp
+        mock_ssh.return_value = client
+
+        writer_s = OpenAsWriter("sftp://u@host/dir/out.zst").open(backup=False)
+        writer_s.write("hello sftp zstd\n")
+        with pytest.raises(OSError, match="underlying transport close failed"):
+            writer_s.close()
+        assert raw_sw.close_calls == 1
+        assert sftp.close.call_count == 1
+        assert client.close.call_count == 1

@@ -1,11 +1,10 @@
-#!/usr/bin/env python3
 """
 openas - Unified streaming I/O across local files, remote protocols, and compression formats.
 
 Supports plain, `.gz`, `.bz2`, `.xz`, and `.zst` streams over local files (`file://` or plain
 paths), `http://` and `https://` (read-only), `ftp://` (read and write), and `ssh://` / `sftp://`
-(read, write, and append). Text modes (`'r'`/`'rt'`, `'w'`/`'wt'`, `'a'`/`'at'`) operate on UTF-8
-`str`; binary modes (`'rb'`, `'wb'`, `'ab'`) operate on raw `bytes`.
+(read, write, and append). Text modes (`'r'`/`'rt'`, `'w'`/`'wt'`, `'a'`/`'at'`) operate on encoded
+`str` (UTF-8 by default); binary modes (`'rb'`, `'wb'`, `'ab'`) operate on raw `bytes`.
 
 Public API
 ----------
@@ -69,6 +68,7 @@ UNSUPPORTED_ARCHIVES = (
     '.tbz', '.tbz2', '.txz', '.tzst', '.tlz',
 )
 
+from collections.abc import Mapping, Sequence
 import errno
 import io
 import os
@@ -77,7 +77,6 @@ import time
 from typing import TYPE_CHECKING, Optional, Union
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping, Sequence
     from urllib.parse import SplitResult
 
 _NETWORK_SCHEMES = frozenset(('http', 'https', 'ftp', 'ssh', 'sftp', 's3', 'gs', 'az', 'hdfs'))
@@ -872,8 +871,7 @@ def _validate_headers(headers: Optional[Mapping[str, str]]) -> Optional[dict[str
     """Validate optional HTTP headers and return a defensive dict copy (never echoing secret values)."""
     if headers is None:
         return None
-    from collections.abc import Mapping as _Mapping
-    if not isinstance(headers, _Mapping):
+    if not isinstance(headers, Mapping):
         raise TypeError(f"headers must be a mapping of str to str or None, got {type(headers).__name__}.")
     validated: dict[str, str] = {}
     for name, value in headers.items():
@@ -907,8 +905,7 @@ def _validate_key_filename(
         if not path_str:
             raise ValueError("key_filename must not be an empty path.")
         return path_str
-    from collections.abc import Sequence as _Sequence
-    if isinstance(key_filename, _Sequence):
+    if isinstance(key_filename, Sequence):
         if len(key_filename) == 0:
             raise ValueError("key_filename sequence must not be empty.")
         normalized: list[str] = []
@@ -1413,6 +1410,13 @@ class OpenAsReader:
         self._progress = None
         self._counting_stream = None
         self._progress_pending = 0
+        self._progress_encoder = None
+        self._progress_bom_encoding = False
+        if not self.binary:
+            import codecs
+            self._progress_bom_encoding = (
+                codecs.lookup(self._encoding or 'utf-8').name in ('utf-16', 'utf-32', 'utf-8-sig')
+            )
         self._http_file_size = None
 
     def _make_counted_stream(self, stream):
@@ -1430,6 +1434,16 @@ class OpenAsReader:
         """Compute an approximate byte length for plain-local text progress without raising on lossy text."""
         enc = self._encoding or 'utf-8'
         err = self._errors or 'strict'
+        if self._progress_bom_encoding:
+            encoder = self._progress_encoder
+            if encoder is None:
+                import codecs
+                encoder = codecs.getincrementalencoder(enc)(err)
+                self._progress_encoder = encoder
+            try:
+                return len(encoder.encode(text))
+            except (UnicodeError, LookupError, TypeError):
+                pass
         try:
             return len(text.encode(enc, err))
         except (UnicodeError, LookupError, TypeError):
@@ -1437,6 +1451,21 @@ class OpenAsReader:
                 return len(text.encode(enc, 'replace'))
             except (UnicodeError, LookupError, TypeError):
                 return len(text)
+
+    def _apply_plain_progress(self, progress, delta: int) -> None:
+        """Update plain-local tqdm progress, clamping BOM/lossy codec estimates to total."""
+        if delta <= 0:
+            return
+        if (
+            (self._progress_bom_encoding or self._errors not in (None, 'strict'))
+            and progress.total is not None
+        ):
+            remaining = progress.total - progress.n
+            if remaining <= 0:
+                return
+            if delta > remaining:
+                delta = remaining
+        progress.update(delta)
 
     def _flush_progress(self) -> None:
         """Apply any buffered progress delta to the progress bar once."""
@@ -1451,7 +1480,7 @@ class OpenAsReader:
         if self._progress_pending > 0:
             pending = self._progress_pending
             self._progress_pending = 0
-            progress.update(pending)
+            self._apply_plain_progress(progress, pending)
 
     def _update_progress(self, data: Union[str, bytes] = ""):
         if not (self.show_progress and self._progress is not None):
@@ -1462,28 +1491,26 @@ class OpenAsReader:
         if self._progress_pending > 0:
             self._flush_progress()
         if data:
-            self._progress.update(
-                len(data) if isinstance(data, (bytes, bytearray)) else self._encoded_byte_len(data)
-            )
+            delta = len(data) if isinstance(data, (bytes, bytearray)) else self._encoded_byte_len(data)
+            self._apply_plain_progress(self._progress, delta)
 
     def _reconcile_crlf_eof_progress(self) -> None:
-        """Advance plain local text progress to total at natural EOF when universal newlines stripped CR bytes."""
+        """Advance plain local text progress to total at natural EOF when decoding/newlines shortened estimates."""
         if (
             self._counting_stream is not None
             or self.binary
-            or self._newline is not None
             or self._progress is None
             or self._progress.total is None
         ):
             return
-        newlines = getattr(self._fh, 'newlines', None)
-        if isinstance(newlines, str):
-            has_cr_translation = newlines in ('\r\n', '\r')
-        elif isinstance(newlines, tuple):
-            has_cr_translation = '\r\n' in newlines or '\r' in newlines
-        else:
-            has_cr_translation = False
-        if not has_cr_translation:
+        should_reconcile = self._progress_bom_encoding or self._errors not in (None, 'strict')
+        if not should_reconcile and self._newline is None:
+            newlines = getattr(self._fh, 'newlines', None)
+            if isinstance(newlines, str):
+                should_reconcile = newlines in ('\r\n', '\r')
+            elif isinstance(newlines, tuple):
+                should_reconcile = '\r\n' in newlines or '\r' in newlines
+        if not should_reconcile:
             return
         self._flush_progress()
         remaining = self._progress.total - self._progress.n
@@ -1591,16 +1618,18 @@ class OpenAsReader:
                     yield line
             elif is_text:
                 byte_len = self._encoded_byte_len
+                apply_delta = self._apply_plain_progress
                 for line in fh:
                     self._progress_pending += byte_len(line)
                     if self._progress_pending >= _PROGRESS_BATCH_BYTES:
                         pending = self._progress_pending
                         self._progress_pending = 0
-                        update(pending)
+                        apply_delta(progress, pending)
                     yield line
                 self._reconcile_crlf_eof_progress()
             else:
                 byte_len = self._encoded_byte_len
+                apply_delta = self._apply_plain_progress
                 for line in fh:
                     if isinstance(line, bytes):
                         line_bytes = len(line)
@@ -1611,7 +1640,7 @@ class OpenAsReader:
                     if self._progress_pending >= _PROGRESS_BATCH_BYTES:
                         pending = self._progress_pending
                         self._progress_pending = 0
-                        update(pending)
+                        apply_delta(progress, pending)
                     yield line
                 self._reconcile_crlf_eof_progress()
         finally:
@@ -1709,7 +1738,7 @@ class OpenAsReader:
         import zstandard as zstd
         dctx = zstd.ZstdDecompressor(max_window_size=2**31)
         validated = _ZstdFrameValidatingStream(stream)
-        sr = dctx.stream_reader(validated, read_across_frames=True, read_size=_ZST_BUFFER_SIZE)
+        sr = dctx.stream_reader(validated, read_across_frames=True, read_size=_ZST_BUFFER_SIZE, closefd=False)
         buffered = io.BufferedReader(sr, buffer_size=_ZST_BUFFER_SIZE)
         return (
             buffered
@@ -1749,6 +1778,7 @@ class OpenAsReader:
         raw_fh = self._ftp.open(remote_path, 'rb')
         self._raw_fh = raw_fh
         adapted = _BinaryStreamAdapter(raw_fh, readable=True, writable=False)
+        self._raw_fh = adapted
         stream = self._make_counted_stream(adapted)
 
         norm = _normalized_path(self.filename, parsed)
@@ -1820,6 +1850,12 @@ class OpenAsReader:
             client.connect(parsed.hostname, **connect_kwargs)
             sftp = client.open_sftp()
             self._sftp_client = sftp
+            if self.timeout is not None:
+                get_ch = getattr(sftp, 'get_channel', None)
+                channel = get_ch() if get_ch is not None else None
+                settimeout_fn = getattr(channel, 'settimeout', None)
+                if settimeout_fn is not None:
+                    settimeout_fn(self.timeout)
             sftp_file = sftp.file(remote_path, 'rb')
             self._sftp_file = sftp_file
 
@@ -2161,12 +2197,13 @@ class OpenAsReader:
             self._progress = None
             self._counting_stream = None
             self._progress_pending = 0
+            self._progress_encoder = None
 
         try:
             _close_handles(fh, raw_fh, sftp_file, sftp_client, ssh_client, ftp, response, progress)
-        except BaseException:
+        except BaseException as close_err:
             if flush_err is not None:
-                raise flush_err
+                raise flush_err from close_err
             raise
         if flush_err is not None:
             raise flush_err
@@ -2400,12 +2437,13 @@ class OpenAsWriter:
         raw_fh = self._ftp.open(remote_path, 'wb')
         self._raw_fh = raw_fh
         adapted = _BinaryStreamAdapter(raw_fh, readable=False, writable=True)
+        self._raw_fh = adapted
         target = self._make_counted_stream(adapted)
         norm = _normalized_path(self.filename, parsed)
         if norm.endswith('.zst'):
             import zstandard as zstd
             cctx = zstd.ZstdCompressor() if compresslevel is None else zstd.ZstdCompressor(level=compresslevel)
-            sw = cctx.stream_writer(target)
+            sw = cctx.stream_writer(target, closefd=False)
             self._fh = (
                 sw
                 if self.binary
@@ -2561,6 +2599,12 @@ class OpenAsWriter:
             client.connect(parsed.hostname, **connect_kwargs)
             sftp = client.open_sftp()
             self._sftp_client = sftp
+            if self.timeout is not None:
+                get_ch = getattr(sftp, 'get_channel', None)
+                channel = get_ch() if get_ch is not None else None
+                settimeout_fn = getattr(channel, 'settimeout', None)
+                if settimeout_fn is not None:
+                    settimeout_fn(self.timeout)
 
             if backup:
                 self._ssh_backup_if(sftp, remote_path)
@@ -2580,7 +2624,7 @@ class OpenAsWriter:
             import zstandard as zstd
             cctx = zstd.ZstdCompressor() if compresslevel is None else zstd.ZstdCompressor(level=compresslevel)
             target = self._make_counted_stream(self._sftp_file)
-            sw = cctx.stream_writer(target)
+            sw = cctx.stream_writer(target, closefd=False)
             self._fh = (
                 sw
                 if self.binary
@@ -2746,7 +2790,7 @@ class OpenAsWriter:
             cctx = zstd.ZstdCompressor() if compresslevel is None else zstd.ZstdCompressor(level=compresslevel)
             self._raw_fh = open(self.filename, mode)
             target = self._make_counted_stream(self._raw_fh)
-            sw = cctx.stream_writer(target)
+            sw = cctx.stream_writer(target, closefd=False)
             self._fh = (
                 sw
                 if self.binary
@@ -3162,16 +3206,16 @@ def openas(
 
 def main():
     """
-    CLI entry point for `openas` (`python -m openas` or `openas`).
+    Core CLI runner for `openas` (wrapped by `_cli_main()` for console-script and `python -m openas` invocation).
 
     Streams 64 KiB binary chunks for `--read` (with newline-delimited line and byte
     throughput reporting) and single-pass multi-target `--write` across plain, `.gz`,
     `.bz2`, `.xz`, and `.zst` files over local paths, HTTP/HTTPS, FTP, and SSH/SFTP.
     """
-    def format_rate(rate: float, unit: str = "") -> str:
-        """Format rate with standard units."""
+    def format_rate(rate: float) -> str:
+        """Format byte rate with standard units."""
         if not rate:
-            return f"0.0{unit or 'B'}/s"
+            return "0.0B/s"
         return f"{format_bytes(rate)}/s"
 
     def pinfo(preface: str, filename: str, line_count: int, bytes_count: int, seconds: float):
@@ -3318,9 +3362,36 @@ def main():
             output_files = args.files[1:]
 
         # Pre-validate timeout, destination schemes, archive guards, compression levels,
-        # local directories, and duplicates before backing up or truncating earlier outputs.
+        # local directories, source aliasing, and duplicates before backing up or truncating outputs.
         _validate_timeout(args.timeout)
+
+        def _canonical_target_keys(resolved_target: str, parsed_target, scheme_target: str):
+            if not scheme_target:
+                abs_path = os.path.abspath(resolved_target)
+                entry_key = (
+                    'local',
+                    os.path.normcase(
+                        os.path.join(os.path.realpath(os.path.dirname(abs_path)), os.path.basename(abs_path))
+                    ),
+                )
+                real_key = ('local-real', os.path.normcase(os.path.realpath(abs_path)))
+                return entry_key, real_key
+            from urllib.parse import unquote
+            default_port = 21 if scheme_target == 'ftp' else (80 if scheme_target == 'http' else (443 if scheme_target == 'https' else 22))
+            effective_port = default_port if parsed_target.port is None else parsed_target.port
+            remote_key = (
+                'sftp' if scheme_target == 'ssh' else scheme_target,
+                parsed_target.hostname.lower(),
+                effective_port,
+                unquote(parsed_target.path),
+            )
+            return remote_key, remote_key
+
+        resolved_src, parsed_src, scheme_src = _resolve_target(source_file)
+        src_entry_key, src_real_key = _canonical_target_keys(resolved_src, parsed_src, scheme_src)
+
         seen_destinations = set()
+        seen_real_destinations = set()
         for output_file in output_files:
             resolved_out, parsed_out, scheme_out = _resolve_target(output_file)
             norm_out = _normalized_path(resolved_out, parsed_out)
@@ -3338,26 +3409,13 @@ def main():
             if not scheme_out:
                 if os.path.isdir(resolved_out) and not os.path.islink(resolved_out):
                     raise IsADirectoryError(errno.EISDIR, os.strerror(errno.EISDIR), resolved_out)
-                abs_path = os.path.abspath(resolved_out)
-                dest_key = (
-                    'local',
-                    os.path.normcase(
-                        os.path.join(os.path.realpath(os.path.dirname(abs_path)), os.path.basename(abs_path))
-                    ),
-                )
-            else:
-                from urllib.parse import unquote
-                default_port = 21 if scheme_out == 'ftp' else 22
-                effective_port = default_port if parsed_out.port is None else parsed_out.port
-                dest_key = (
-                    'sftp' if scheme_out == 'ssh' else scheme_out,
-                    parsed_out.hostname.lower(),
-                    effective_port,
-                    unquote(parsed_out.path),
-                )
-            if dest_key in seen_destinations:
+            dest_key, dest_real_key = _canonical_target_keys(resolved_out, parsed_out, scheme_out)
+            if dest_key == src_entry_key or (args.no_backup and dest_real_key == src_real_key):
+                parser.error(f"Destination cannot be the same as source: {_redact_url(output_file)}")
+            if dest_key in seen_destinations or (args.no_backup and dest_real_key in seen_real_destinations):
                 parser.error(f"Duplicate destination specified: {_redact_url(output_file)}")
             seen_destinations.add(dest_key)
+            seen_real_destinations.add(dest_real_key)
 
         import contextlib
         print(f"Will Read from {_redact_url(source_file)}")
@@ -3410,7 +3468,7 @@ def main():
 
 
 _CLI_OPERATIONAL_EXCEPTION_MODULES = frozenset((
-    'paramiko', 'ftputil', 'ftplib', 'zstandard', 'requests', 'lzma', '_lzma', 'zlib',
+    'paramiko', 'ftputil', 'ftplib', 'zstandard', 'requests', 'urllib3', 'http', 'lzma', '_lzma', 'zlib',
 ))
 
 
