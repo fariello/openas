@@ -1837,3 +1837,101 @@ def test_remote_truncated_zst_raises_and_closes_handles_across_http_ftp_and_sftp
             assert sftp.close.call_count == 1
             assert client.close.call_count == 1
             assert reader_sftp.closed is True
+
+
+def test_semicolon_url_paths_preserved_across_sftp_and_http_and_empty_http_path_allowed():
+    """kfvf7i E-01: Semicolons stay part of URL paths (urlsplit) and empty HTTP/HTTPS paths remain allowed."""
+    payload = "semicolon path line 1\nline 2\n"
+    gz_wire = gzip.compress(payload.encode("utf-8"))
+
+    # 1. SFTP write & read with semicolon in filename uses full path and gzip codec
+    with patch("paramiko.SSHClient") as mock_ssh:
+        client = MagicMock()
+        sftp = MagicMock()
+        mock_ssh.return_value = client
+        client.open_sftp.return_value = sftp
+
+        write_buf = _InspectableBytesIO()
+        sftp.file.return_value = write_buf
+        with openas("sftp://user@host/dir/a;b.gz", "w", backup=False) as w:
+            w.write(payload)
+        sftp.file.assert_called_once_with("/dir/a;b.gz", "wb")
+        assert gzip.decompress(write_buf.saved_bytes).decode("utf-8") == payload.replace("\n", os.linesep)
+
+        sftp.reset_mock()
+        sftp.file.return_value = io.BytesIO(write_buf.saved_bytes)
+        with openas("sftp://user@host/dir/a;b.gz", "r") as r:
+            assert r.read() == payload
+        sftp.file.assert_called_once_with("/dir/a;b.gz", "rb")
+
+    # 2. HTTPS with semicolon in filename selects gzip and sends Accept-Encoding: identity (both open() and _wrap_http(parsed=None))
+    with patch("requests.Session.get") as mock_get:
+        resp = MagicMock()
+        resp.headers = {"Content-Length": str(len(gz_wire))}
+        resp.raw = io.BytesIO(gz_wire)
+        mock_get.return_value = resp
+        with openas("https://example.com/file;v=1.gz", "r") as r:
+            assert r.read() == payload
+        assert mock_get.call_args.kwargs["headers"] == {"Accept-Encoding": "identity"}
+
+        mock_get.reset_mock()
+        resp2 = MagicMock()
+        resp2.headers = {"Content-Length": str(len(gz_wire))}
+        resp2.raw = io.BytesIO(gz_wire)
+        mock_get.return_value = resp2
+        direct_reader = OpenAsReader("https://example.com/file;v=1.gz")
+        try:
+            direct_reader._wrap_http(parsed=None)
+            assert direct_reader.read() == payload
+        finally:
+            direct_reader.close()
+        assert mock_get.call_args.kwargs["headers"] == {"Accept-Encoding": "identity"}
+
+    # 3. HTTP and HTTPS empty paths remain allowed
+    for url in ("http://example.com", "https://example.com"):
+        with patch("requests.Session.get") as mock_get:
+            resp = MagicMock()
+            resp.headers = {"Content-Length": "3"}
+            resp.raw = io.BytesIO(b"ok\n")
+            mock_get.return_value = resp
+            with openas(url, "r") as r:
+                assert r.read() == "ok\n"
+            mock_get.assert_called_once_with(url, stream=True)
+
+
+def test_exited_thread_http_session_reclaimed_and_closed_after_gc():
+    """kfvf7i E-03: Exited worker thread's HTTP session is closed and removed from _http_sessions_registry after gc.collect()."""
+    import gc
+    import sys
+
+    openas_mod = sys.modules["openas.openas"]
+    main_session = openas_mod._get_http_session()
+    assert any(s is main_session for s in openas_mod._http_sessions_registry)
+
+    closed_count = []
+    worker_session_ids = []
+
+    def worker():
+        sess = openas_mod._get_http_session()
+        orig_close = sess.close
+
+        def spy_close():
+            closed_count.append(id(sess))
+            return orig_close()
+
+        sess.close = spy_close
+        worker_session_ids.append(id(sess))
+        assert any(s is sess for s in openas_mod._http_sessions_registry)
+
+    t = threading.Thread(target=worker)
+    t.start()
+    t.join(timeout=5)
+    assert not t.is_alive()
+
+    gc.collect()
+    gc.collect()
+
+    assert len(worker_session_ids) == 1
+    assert closed_count == worker_session_ids
+    assert all(id(s) != worker_session_ids[0] for s in openas_mod._http_sessions_registry)
+    assert any(s is main_session for s in openas_mod._http_sessions_registry)

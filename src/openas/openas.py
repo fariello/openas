@@ -75,7 +75,7 @@ import time
 from typing import TYPE_CHECKING, Optional, Union
 
 if TYPE_CHECKING:
-    from urllib.parse import ParseResult
+    from urllib.parse import SplitResult
 
 _NETWORK_SCHEMES = frozenset(('http', 'https', 'ftp', 'ssh', 'sftp', 's3', 'gs', 'az', 'hdfs'))
 _SUPPORTED_SCHEMES = frozenset(('file', 'http', 'https', 'ftp', 'ssh', 'sftp'))
@@ -134,13 +134,18 @@ class _BinaryStreamAdapter(io.BufferedIOBase):
     def readinto(self, b):
         if self._closed:
             raise ValueError("I/O operation on closed file.")
-        readinto_fn = getattr(self._raw, 'readinto', None)
-        if readinto_fn is not None:
-            return readinto_fn(b)
-        data = self.read(len(b))
-        n = len(data)
-        b[:n] = data
-        return n
+        with memoryview(b) as raw_mv, raw_mv.cast('B') as mv:
+            if len(mv) == 0:
+                return 0
+            readinto_fn = getattr(self._raw, 'readinto', None)
+            if readinto_fn is not None:
+                return readinto_fn(mv)
+            data = self.read(len(mv))
+            if data is None:
+                return None
+            n = len(data)
+            mv[:n] = data
+            return n
 
     def write(self, b):
         if self._closed:
@@ -195,13 +200,18 @@ class _HttpRawStream(io.BufferedIOBase):
     def readinto(self, b):
         if self._closed:
             raise ValueError("I/O operation on closed file.")
-        readinto_fn = getattr(self._raw, 'readinto', None)
-        if readinto_fn is not None:
-            return readinto_fn(b)
-        data = self._raw.read(len(b))
-        n = len(data)
-        b[:n] = data
-        return n
+        with memoryview(b) as raw_mv, raw_mv.cast('B') as mv:
+            if len(mv) == 0:
+                return 0
+            readinto_fn = getattr(self._raw, 'readinto', None)
+            if readinto_fn is not None:
+                return readinto_fn(mv)
+            data = self._raw.read(len(mv))
+            if data is None:
+                return None
+            n = len(data)
+            mv[:n] = data
+            return n
 
     def close(self):
         if not self._closed:
@@ -363,13 +373,13 @@ class _BoundedSFTPReadStream(io.BufferedIOBase):
     def readinto(self, b) -> int:
         if self._closed:
             raise ValueError("I/O operation on closed file.")
-        mv = memoryview(b).cast('B')
-        if not mv:
-            return 0
-        data = self.read(len(mv))
-        n = len(data)
-        mv[:n] = data
-        return n
+        with memoryview(b) as raw_mv, raw_mv.cast('B') as mv:
+            if len(mv) == 0:
+                return 0
+            data = self.read(len(mv))
+            n = len(data)
+            mv[:n] = data
+            return n
 
     def close(self):
         if not self._closed:
@@ -436,22 +446,27 @@ class _CountingByteStream:
         return data
 
     def readinto(self, b):
-        readinto_fn = getattr(self._stream, 'readinto', None)
-        if readinto_fn is not None:
-            n = readinto_fn(b)
+        with memoryview(b) as raw_mv, raw_mv.cast('B') as mv:
+            if len(mv) == 0:
+                return 0
+            readinto_fn = getattr(self._stream, 'readinto', None)
+            if readinto_fn is not None:
+                n = readinto_fn(mv)
+                if n:
+                    self._account(n)
+                elif n == 0:
+                    self.flush_progress()
+                return n
+            data = self._stream.read(len(mv))
+            if data is None:
+                return None
+            n = len(data)
             if n:
+                mv[:n] = data
                 self._account(n)
-            elif len(b) > 0:
+            else:
                 self.flush_progress()
             return n
-        data = self._stream.read(len(b))
-        n = len(data)
-        if n:
-            b[:n] = data
-            self._account(n)
-        elif len(b) > 0:
-            self.flush_progress()
-        return n
 
     def readable(self) -> bool:
         fn = getattr(self._stream, 'readable', None)
@@ -505,105 +520,105 @@ class _ZstdFrameValidatingStream:
         self._has_checksum = False
 
     def _feed(self, data) -> None:
-        mv = memoryview(data)
-        pos = 0
-        n = len(mv)
-        while pos < n:
-            st = self._state
-            if st == self._S_PASSTHROUGH:
-                return
-            if st == self._S_SKIP_BYTES:
-                take = min(self._skip, n - pos)
-                self._skip -= take
+        with memoryview(data) as raw_mv, raw_mv.cast('B') as mv:
+            pos = 0
+            n = len(mv)
+            while pos < n:
+                st = self._state
+                if st == self._S_PASSTHROUGH:
+                    return
+                if st == self._S_SKIP_BYTES:
+                    take = min(self._skip, n - pos)
+                    self._skip -= take
+                    pos += take
+                    if self._skip == 0:
+                        self._state = self._next_state
+                        if self._state == self._S_MAGIC:
+                            self._need = 4
+                        elif self._state == self._S_BLK_HDR:
+                            self._need = 3
+                    continue
+
+                rem = self._need - len(self._buf)
+                take = min(rem, n - pos)
+                self._buf.extend(mv[pos:pos + take])
                 pos += take
-                if self._skip == 0:
-                    self._state = self._next_state
-                    if self._state == self._S_MAGIC:
+                if len(self._buf) < self._need:
+                    return
+
+                buf = self._buf
+                if st == self._S_MAGIC:
+                    magic = int.from_bytes(buf, 'little')
+                    buf.clear()
+                    if magic == _ZSTD_MAGIC:
+                        self._state = self._S_FHD
+                        self._need = 1
+                    elif (magic & _ZSTD_SKIPPABLE_MAGIC_MASK) == _ZSTD_SKIPPABLE_MAGIC_BASE:
+                        self._state = self._S_SKIP_LEN
                         self._need = 4
-                    elif self._state == self._S_BLK_HDR:
+                    else:
+                        # Unknown magic: defer to zstandard so it raises ZstdError.
+                        self._state = self._S_PASSTHROUGH
+                        return
+                elif st == self._S_SKIP_LEN:
+                    skip_len = int.from_bytes(buf, 'little')
+                    buf.clear()
+                    if skip_len == 0:
+                        self._state = self._S_MAGIC
+                        self._need = 4
+                    else:
+                        self._skip = skip_len
+                        self._next_state = self._S_MAGIC
+                        self._state = self._S_SKIP_BYTES
+                elif st == self._S_FHD:
+                    fhd = buf[0]
+                    buf.clear()
+                    fcs_flag = (fhd >> 6) & 3
+                    single_seg = (fhd >> 5) & 1
+                    self._has_checksum = bool((fhd >> 2) & 1)
+                    did_flag = fhd & 3
+                    win_len = 0 if single_seg else 1
+                    did_len = _ZSTD_DID_SIZES[did_flag]
+                    if fcs_flag == 0:
+                        fcs_len = 1 if single_seg else 0
+                    elif fcs_flag == 1:
+                        fcs_len = 2
+                    elif fcs_flag == 2:
+                        fcs_len = 4
+                    else:
+                        fcs_len = 8
+                    rest_len = win_len + did_len + fcs_len
+                    if rest_len == 0:
+                        self._state = self._S_BLK_HDR
                         self._need = 3
-                continue
-
-            rem = self._need - len(self._buf)
-            take = min(rem, n - pos)
-            self._buf.extend(mv[pos:pos + take])
-            pos += take
-            if len(self._buf) < self._need:
-                return
-
-            buf = self._buf
-            if st == self._S_MAGIC:
-                magic = int.from_bytes(buf, 'little')
-                buf.clear()
-                if magic == _ZSTD_MAGIC:
-                    self._state = self._S_FHD
-                    self._need = 1
-                elif (magic & _ZSTD_SKIPPABLE_MAGIC_MASK) == _ZSTD_SKIPPABLE_MAGIC_BASE:
-                    self._state = self._S_SKIP_LEN
-                    self._need = 4
-                else:
-                    # Unknown magic: defer to zstandard so it raises ZstdError.
-                    self._state = self._S_PASSTHROUGH
-                    return
-            elif st == self._S_SKIP_LEN:
-                skip_len = int.from_bytes(buf, 'little')
-                buf.clear()
-                if skip_len == 0:
-                    self._state = self._S_MAGIC
-                    self._need = 4
-                else:
-                    self._skip = skip_len
-                    self._next_state = self._S_MAGIC
-                    self._state = self._S_SKIP_BYTES
-            elif st == self._S_FHD:
-                fhd = buf[0]
-                buf.clear()
-                fcs_flag = (fhd >> 6) & 3
-                single_seg = (fhd >> 5) & 1
-                self._has_checksum = bool((fhd >> 2) & 1)
-                did_flag = fhd & 3
-                win_len = 0 if single_seg else 1
-                did_len = _ZSTD_DID_SIZES[did_flag]
-                if fcs_flag == 0:
-                    fcs_len = 1 if single_seg else 0
-                elif fcs_flag == 1:
-                    fcs_len = 2
-                elif fcs_flag == 2:
-                    fcs_len = 4
-                else:
-                    fcs_len = 8
-                rest_len = win_len + did_len + fcs_len
-                if rest_len == 0:
-                    self._state = self._S_BLK_HDR
-                    self._need = 3
-                else:
-                    self._skip = rest_len
-                    self._next_state = self._S_BLK_HDR
-                    self._state = self._S_SKIP_BYTES
-            elif st == self._S_BLK_HDR:
-                hdr = buf[0] | (buf[1] << 8) | (buf[2] << 16)
-                buf.clear()
-                last_block = bool(hdr & 1)
-                btype = (hdr >> 1) & 3
-                bsize = hdr >> 3
-                if btype == 3:
-                    # Reserved block type: defer to zstandard so it raises ZstdError.
-                    self._state = self._S_PASSTHROUGH
-                    return
-                wire_len = 1 if btype == 1 else bsize
-                if last_block:
-                    if self._has_checksum:
-                        wire_len += 4
-                    after = self._S_MAGIC
-                else:
-                    after = self._S_BLK_HDR
-                if wire_len == 0:
-                    self._state = after
-                    self._need = 4 if after == self._S_MAGIC else 3
-                else:
-                    self._skip = wire_len
-                    self._next_state = after
-                    self._state = self._S_SKIP_BYTES
+                    else:
+                        self._skip = rest_len
+                        self._next_state = self._S_BLK_HDR
+                        self._state = self._S_SKIP_BYTES
+                elif st == self._S_BLK_HDR:
+                    hdr = buf[0] | (buf[1] << 8) | (buf[2] << 16)
+                    buf.clear()
+                    last_block = bool(hdr & 1)
+                    btype = (hdr >> 1) & 3
+                    bsize = hdr >> 3
+                    if btype == 3:
+                        # Reserved block type: defer to zstandard so it raises ZstdError.
+                        self._state = self._S_PASSTHROUGH
+                        return
+                    wire_len = 1 if btype == 1 else bsize
+                    if last_block:
+                        if self._has_checksum:
+                            wire_len += 4
+                        after = self._S_MAGIC
+                    else:
+                        after = self._S_BLK_HDR
+                    if wire_len == 0:
+                        self._state = after
+                        self._need = 4 if after == self._S_MAGIC else 3
+                    else:
+                        self._skip = wire_len
+                        self._next_state = after
+                        self._state = self._S_SKIP_BYTES
 
     def _check_eof(self) -> None:
         if self._state == self._S_PASSTHROUGH:
@@ -629,22 +644,28 @@ class _ZstdFrameValidatingStream:
         return data
 
     def readinto(self, b):
-        readinto_fn = getattr(self._stream, 'readinto', None)
-        if readinto_fn is not None:
-            n = readinto_fn(b)
+        with memoryview(b) as raw_mv, raw_mv.cast('B') as mv:
+            if len(mv) == 0:
+                return 0
+            readinto_fn = getattr(self._stream, 'readinto', None)
+            if readinto_fn is not None:
+                n = readinto_fn(mv)
+                if n:
+                    with mv[:n] as chunk:
+                        self._feed(chunk)
+                elif n == 0:
+                    self._check_eof()
+                return n
+            data = self._stream.read(len(mv))
+            if data is None:
+                return None
+            n = len(data)
             if n:
-                self._feed(memoryview(b)[:n])
-            elif len(b) > 0:
+                mv[:n] = data
+                self._feed(data)
+            else:
                 self._check_eof()
             return n
-        data = self._stream.read(len(b))
-        n = len(data)
-        if n:
-            b[:n] = data
-            self._feed(data)
-        elif len(b) > 0:
-            self._check_eof()
-        return n
 
     def readable(self) -> bool:
         fn = getattr(self._stream, 'readable', None)
@@ -667,6 +688,9 @@ class _ZstdFrameValidatingStream:
 
 def format_bytes(num: float) -> str:
     """Format bytes to human readable sizes."""
+    import math
+    if not math.isfinite(num):
+        return f"{num}B"
     for unit in ['B', 'KB', 'MB', 'GB', 'TB', 'PB', 'EB', 'ZB']:
         if abs(num) < 1024.0:
             return f"{num:3.1f}{unit}"
@@ -674,8 +698,34 @@ def format_bytes(num: float) -> str:
     return f"{num:3.1f}YB"
 
 
+def _redact_authority(authority: str) -> str:
+    """Mask userinfo passwords and non-numeric hostport suffixes in a URL authority."""
+    if '@' in authority:
+        userinfo, hostport = authority.rsplit('@', 1)
+        if ':' in userinfo:
+            user, _ = userinfo.split(':', 1)
+            userinfo = f"{user}:***"
+    else:
+        userinfo = None
+        hostport = authority
+
+    if hostport.startswith('['):
+        if ']:' in hostport:
+            host_part, suffix = hostport.split(']:', 1)
+            if suffix and not (suffix.isascii() and suffix.isdigit()):
+                hostport = f"{host_part}]:***"
+    elif ':' in hostport:
+        host_part, suffix = hostport.split(':', 1)
+        if suffix and not (suffix.isascii() and suffix.isdigit()):
+            hostport = f"{host_part}:***"
+
+    if userinfo is not None:
+        return f"{userinfo}@{hostport}"
+    return hostport
+
+
 def _redact_url(target: str) -> str:
-    """Mask URL passwords and query strings so credentials/tokens never leak in logs or errors."""
+    """Mask URL passwords, non-numeric port suffixes, and query strings so credentials never leak."""
     if '://' not in target:
         return target
     from urllib.parse import urlsplit, urlunsplit
@@ -687,37 +737,29 @@ def _redact_url(target: str) -> str:
         before_frag, has_frag, frag = rest.partition('#')
         before_query, _, query = before_frag.partition('?')
         authority, has_slash, path = before_query.partition('/')
-        if '@' in authority:
-            userinfo, hostport = authority.rsplit('@', 1)
-            if ':' in userinfo:
-                user, _ = userinfo.split(':', 1)
-                authority = f"{user}:***@{hostport}"
+        authority = _redact_authority(authority)
         return (
             f"{scheme_prefix}{authority}"
             + (f"/{path}" if has_slash else "")
             + ("?<redacted>" if query else "")
             + (f"#{frag}" if has_frag else "")
         )
-    if parts.password is None and not parts.query:
+    netloc = _redact_authority(parts.netloc)
+    if netloc == parts.netloc and not parts.query:
         return target
-    netloc = parts.netloc
-    if parts.password is not None and '@' in netloc:
-        userinfo, hostport = netloc.rsplit('@', 1)
-        if ':' in userinfo:
-            user, _ = userinfo.split(':', 1)
-            netloc = f"{user}:***@{hostport}"
-        else:
-            netloc = f"***@{hostport}"
     query = '<redacted>' if parts.query else ''
     return urlunsplit((parts.scheme, netloc, parts.path, query, parts.fragment))
 
 
 def _validate_timeout(timeout: Optional[float]) -> Optional[float]:
-    """Validate optional network timeout (positive float/int or None)."""
+    """Validate optional network timeout (finite positive float/int or None)."""
     if timeout is None:
         return None
-    if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or timeout <= 0:
-        raise ValueError(f"timeout must be a positive number (seconds) or None, got {timeout!r}.")
+    if isinstance(timeout, bool) or not isinstance(timeout, (int, float)):
+        raise ValueError(f"timeout must be a finite positive number (seconds) or None, got {timeout!r}.")
+    import math
+    if not math.isfinite(timeout) or timeout <= 0:
+        raise ValueError(f"timeout must be a finite positive number (seconds) or None, got {timeout!r}.")
     return float(timeout)
 
 
@@ -748,17 +790,21 @@ def _resolve_target(filename: str):
     """Parse and validate target URL or local path, returning (resolved_filename, parsed, scheme)."""
     if '://' not in filename:
         return filename, None, ''
-    from urllib.parse import urlparse
-    parsed = urlparse(filename)
+    from urllib.parse import urlsplit
+    parsed = urlsplit(filename)
     scheme = parsed.scheme.lower()
     if not scheme or not filename.lower().startswith(f"{scheme}://"):
         return filename, None, ''
     if scheme == 'file':
         if parsed.netloc and parsed.netloc.lower() != 'localhost':
+            redacted = _redact_url(filename)
+            redacted_netloc = urlsplit(redacted).netloc
             raise UnsupportedProtocolError(
-                f"Unsupported remote host '{parsed.netloc}' in file:// URI: {_redact_url(filename)}. "
+                f"Unsupported remote host '{redacted_netloc}' in file:// URI: {redacted}. "
                 f"Only local file:// URIs (empty host or localhost) are supported."
             )
+        if not parsed.path:
+            raise ValueError(f"Missing path in file:// URI: {_redact_url(filename)}")
         from urllib.request import url2pathname
         local_path = url2pathname(parsed.path)
         return local_path, None, ''
@@ -773,6 +819,16 @@ def _resolve_target(filename: str):
                 f"Missing hostname in {scheme}:// URL: {_redact_url(filename)} "
                 f"(expected '{scheme}://host/path')"
             )
+        try:
+            port = parsed.port
+        except ValueError:
+            raise ValueError(f"Invalid port in {scheme}:// URL: {_redact_url(filename)}") from None
+        if port is not None and not (1 <= port <= 65535):
+            raise ValueError(
+                f"Invalid port in {scheme}:// URL (must be between 1 and 65535): {_redact_url(filename)}"
+            )
+        if scheme in ('ftp', 'ssh', 'sftp') and not parsed.path:
+            raise ValueError(f"Missing path in {scheme}:// URL: {_redact_url(filename)}")
         return filename, parsed, scheme
     if len(scheme) > 1 and f"{scheme}://" in filename.lower():
         raise UnsupportedProtocolError(
@@ -782,7 +838,7 @@ def _resolve_target(filename: str):
     return filename, parsed, ''
 
 
-def _unquote_remote_parts(parsed: ParseResult):
+def _unquote_remote_parts(parsed: SplitResult):
     """Percent-decode username, password, and path components of FTP/SSH/SFTP URLs."""
     from urllib.parse import unquote
     username = unquote(parsed.username) if parsed.username is not None else None
@@ -791,7 +847,7 @@ def _unquote_remote_parts(parsed: ParseResult):
     return username, password, remote_path
 
 
-def _normalized_path(filename: str, parsed: Optional[ParseResult] = None) -> str:
+def _normalized_path(filename: str, parsed: Optional[SplitResult] = None) -> str:
     """Return percent-decoded lowercase path component for network URLs and lowercase filename for local paths."""
     if parsed is not None and parsed.scheme.lower() in _NETWORK_SCHEMES:
         from urllib.parse import unquote
@@ -842,7 +898,7 @@ def _close_handles(*handles):
             continue
         try:
             close_fn()
-        except Exception as err:
+        except BaseException as err:
             if first_err is None:
                 first_err = err
         _record_raw_close_attempted(handle, seen)
@@ -889,6 +945,31 @@ _http_sessions_registry = []
 _http_atexit_registered = False
 
 
+class _HttpSessionHolder:
+    """Weak-referenceable holder for a thread-local requests.Session."""
+
+    __slots__ = ('session', '__weakref__')
+
+    def __init__(self, session):
+        self.session = session
+
+
+def _reclaim_http_session(session):
+    """Remove and close an exited thread's requests.Session if still registered."""
+    found = False
+    with _http_session_lock:
+        for idx, reg_session in enumerate(_http_sessions_registry):
+            if reg_session is session:
+                del _http_sessions_registry[idx]
+                found = True
+                break
+    if found:
+        try:
+            session.close()
+        except Exception:
+            pass
+
+
 def _close_registered_http_sessions():
     """Close all thread-local requests.Session objects created by _get_http_session() at interpreter exit."""
     with _http_session_lock:
@@ -911,20 +992,24 @@ def _get_http_session():
             if local is None:
                 local = threading.local()
                 _http_session_local = local
-    session = getattr(local, 'session', None)
-    if session is None:
+    holder = getattr(local, 'holder', None)
+    if holder is None:
         import atexit
         import http.cookiejar
+        import weakref
         import requests
         session = requests.Session()
         session.cookies.set_policy(http.cookiejar.DefaultCookiePolicy(allowed_domains=[]))
-        local.session = session
+        holder = _HttpSessionHolder(session)
         with _http_session_lock:
             _http_sessions_registry.append(session)
             if not _http_atexit_registered:
                 atexit.register(_close_registered_http_sessions)
                 _http_atexit_registered = True
-    return session
+        finalizer = weakref.finalize(holder, _reclaim_http_session, session)
+        finalizer.atexit = False
+        local.holder = holder
+    return holder.session
 
 
 _FTP_SESSION_WRAPPER_CLASS = None
@@ -1388,13 +1473,13 @@ class OpenAsReader:
         buffered = io.BufferedReader(sr, buffer_size=_ZST_BUFFER_SIZE)
         return buffered if self.binary else io.TextIOWrapper(buffered, encoding='utf-8')
 
-    def _wrap_ftp(self, parsed: ParseResult):
+    def _wrap_ftp(self, parsed: SplitResult):
         """
         Wrap self._fh to handle FTP connections and file operations.
 
         Parameters
         ----------
-        parsed : ParseResult
+        parsed : SplitResult
             The parsed URL containing the FTP connection details and file path.
 
         Returns
@@ -1453,7 +1538,7 @@ class OpenAsReader:
                 else io.TextIOWrapper(stream, encoding='utf-8')
             )
 
-    def _wrap_ssh(self, parsed: ParseResult):
+    def _wrap_ssh(self, parsed: SplitResult):
         """
         Wrap self._fh to handle SSH/SFTP connections and file operations.
 
@@ -1463,7 +1548,7 @@ class OpenAsReader:
 
         Parameters
         ----------
-        parsed : ParseResult
+        parsed : SplitResult
             The parsed URL containing the SSH/SFTP connection details and file path.
 
         Returns
@@ -1554,7 +1639,7 @@ class OpenAsReader:
                 stream = self._make_counted_stream(raw_stream)
                 self._fh = io.TextIOWrapper(stream, encoding='utf-8')
 
-    def _wrap_http(self, parsed: Optional[ParseResult] = None):
+    def _wrap_http(self, parsed: Optional[SplitResult] = None):
         """
         Wrap self._fh to handle HTTP/HTTPS connections and file operations.
 
@@ -1564,7 +1649,7 @@ class OpenAsReader:
 
         Parameters
         ----------
-        parsed : ParseResult or None, optional
+        parsed : SplitResult or None, optional
             The parsed URL (parsed from self.filename if omitted).
 
         Returns
@@ -1572,8 +1657,8 @@ class OpenAsReader:
         None
         """
         if parsed is None:
-            from urllib.parse import urlparse
-            parsed = urlparse(self.filename)
+            from urllib.parse import urlsplit
+            parsed = urlsplit(self.filename)
         norm = _normalized_path(self.filename, parsed)
         is_compressed = norm.endswith(('.zst', '.bz2', '.xz', '.gz'))
         get_kwargs = {'stream': True}
@@ -1637,7 +1722,7 @@ class OpenAsReader:
                 else io.TextIOWrapper(stream, encoding='utf-8')
             )
 
-    def _wrap_local(self, parsed: Optional[ParseResult] = None):
+    def _wrap_local(self, parsed: Optional[SplitResult] = None):
         """
         Wrap self._fh to handle local file operations with optional decompression.
 
@@ -1646,7 +1731,7 @@ class OpenAsReader:
 
         Parameters
         ----------
-        parsed : ParseResult or None, optional
+        parsed : SplitResult or None, optional
             The parsed path/URL (optional; omitted for plain local paths).
 
         Returns
@@ -1783,7 +1868,7 @@ class OpenAsReader:
         flush_err = None
         try:
             self._flush_progress()
-        except Exception as err:
+        except BaseException as err:
             flush_err = err
         finally:
             if self._counting_stream is not None:
@@ -1814,7 +1899,7 @@ class OpenAsReader:
 
         try:
             _close_handles(fh, raw_fh, sftp_file, sftp_client, ssh_client, ftp, response, progress)
-        except Exception:
+        except BaseException:
             if flush_err is not None:
                 raise flush_err
             raise
@@ -1965,7 +2050,7 @@ class OpenAsWriter:
         """
         self.close()
 
-    def _wrap_ftp(self, parsed: ParseResult, append: bool, backup: bool, compresslevel: Optional[int] = None):
+    def _wrap_ftp(self, parsed: SplitResult, append: bool, backup: bool, compresslevel: Optional[int] = None):
         """
         Wrap self._fh to handle FTP connections and file operations.
 
@@ -1974,7 +2059,7 @@ class OpenAsWriter:
 
         Parameters
         ----------
-        parsed : ParseResult
+        parsed : SplitResult
             The parsed URL containing the FTP connection details and file path.
         append : bool
             Whether to open the file in append mode.
@@ -2122,7 +2207,7 @@ class OpenAsWriter:
         if last_err is not None:
             raise last_err
 
-    def _wrap_ssh(self, parsed: ParseResult, append: bool, backup: bool, compresslevel: Optional[int] = None):
+    def _wrap_ssh(self, parsed: SplitResult, append: bool, backup: bool, compresslevel: Optional[int] = None):
         """
         Wrap self._fh to handle SSH/SFTP connections and file operations.
 
@@ -2131,7 +2216,7 @@ class OpenAsWriter:
 
         Parameters
         ----------
-        parsed : ParseResult
+        parsed : SplitResult
             The parsed URL containing the SSH/SFTP connection details and file path.
         append : bool
             Whether to open the file in append mode.
@@ -2222,27 +2307,41 @@ class OpenAsWriter:
         if os.path.isdir(src) and not os.path.islink(src):
             raise IsADirectoryError(errno.EISDIR, os.strerror(errno.EISDIR), src)
 
+        def _rename_fallback(dst: str) -> str:
+            if os.path.lexists(dst):
+                return 'exists'
+            try:
+                os.rename(src, dst)
+            except FileNotFoundError:
+                if not os.path.lexists(src):
+                    return 'gone'
+                raise
+            return 'moved'
+
         def _try_move(dst: str) -> str:
             """Return 'moved', 'exists', or 'gone'."""
+            link_fn = getattr(os, 'link', None)
+            supports_no_follow = link_fn is not None and link_fn in getattr(os, 'supports_follow_symlinks', ())
+            if not supports_no_follow and os.path.islink(src):
+                return _rename_fallback(dst)
             try:
-                os.link(src, dst)
+                if supports_no_follow:
+                    os.link(src, dst, follow_symlinks=False)
+                else:
+                    os.link(src, dst)
             except FileExistsError:
                 return 'exists'
             except FileNotFoundError:
-                return 'gone'
+                if not os.path.lexists(src):
+                    return 'gone'
+                return _rename_fallback(dst)
             except (NotImplementedError, AttributeError):
-                if os.path.lexists(dst):
-                    return 'exists'
-                os.rename(src, dst)
-                return 'moved'
+                return _rename_fallback(dst)
             except OSError as exc:
                 if exc.errno in _LINK_FALLBACK_ERRNOS:
                     if os.path.isdir(src) and not os.path.islink(src):
                         raise IsADirectoryError(errno.EISDIR, os.strerror(errno.EISDIR), src) from exc
-                    if os.path.lexists(dst):
-                        return 'exists'
-                    os.rename(src, dst)
-                    return 'moved'
+                    return _rename_fallback(dst)
                 raise
             try:
                 os.unlink(src)
@@ -2285,7 +2384,7 @@ class OpenAsWriter:
             ts_ns += 1
         raise FileExistsError(f"Could not allocate unique backup name for {src}")
 
-    def _wrap_local(self, append: bool, backup: bool, parsed: Optional[ParseResult] = None, compresslevel: Optional[int] = None):
+    def _wrap_local(self, append: bool, backup: bool, parsed: Optional[SplitResult] = None, compresslevel: Optional[int] = None):
         """
         Wrap self._fh to handle local file operations with optional compression.
 
@@ -2298,7 +2397,7 @@ class OpenAsWriter:
             Whether to open the file in append mode.
         backup : bool
             Whether to create a backup of the file if it exists.
-        parsed : ParseResult or None, optional
+        parsed : SplitResult or None, optional
             The parsed path/URL (parsed from self.filename if omitted).
         compresslevel : int or None, optional
             Optional compression level/preset forwarded to the underlying compressor.
@@ -2536,7 +2635,9 @@ def openas(
     EOFError
         If reading a truncated `.zst` stream across local, HTTP, FTP, or SFTP transports.
     ValueError
-        If `mode` is unsupported, `backup=True` is combined with append, or `timeout` is non-positive.
+        If `mode` is unsupported, `backup=True` is combined with append, `timeout` is non-positive
+        or non-finite, a URL omits a hostname, specifies an invalid or zero port (outside `1..65535`),
+        or has an empty path on `file://`, `ftp://`, `ssh://`, or `sftp://`, or `compresslevel` is out of range.
     NotImplementedError
         If `show_progress=True` is passed with write or append modes.
 
@@ -2699,7 +2800,9 @@ def main():
             source_file = args.files[0]
             output_files = args.files[1:]
 
-        # Pre-validate destination schemes and archive guards before backing up or truncating earlier outputs.
+        # Pre-validate destination schemes, archive guards, local directories, and duplicates
+        # before backing up or truncating earlier outputs.
+        seen_destinations = set()
         for output_file in output_files:
             resolved_out, parsed_out, scheme_out = _resolve_target(output_file)
             if _normalized_path(resolved_out, parsed_out).endswith(UNSUPPORTED_ARCHIVES):
@@ -2712,6 +2815,29 @@ def main():
                     f"Protocol '{parsed_out.scheme}' does not support write/append operations in openas. "
                     "HTTP/HTTPS is read-only; write to a local path, ftp://, or sftp:// target instead."
                 )
+            if not scheme_out:
+                if os.path.isdir(resolved_out) and not os.path.islink(resolved_out):
+                    raise IsADirectoryError(errno.EISDIR, os.strerror(errno.EISDIR), resolved_out)
+                abs_path = os.path.abspath(resolved_out)
+                dest_key = (
+                    'local',
+                    os.path.normcase(
+                        os.path.join(os.path.realpath(os.path.dirname(abs_path)), os.path.basename(abs_path))
+                    ),
+                )
+            else:
+                from urllib.parse import unquote
+                default_port = 21 if scheme_out == 'ftp' else 22
+                effective_port = default_port if parsed_out.port is None else parsed_out.port
+                dest_key = (
+                    'sftp' if scheme_out == 'ssh' else scheme_out,
+                    parsed_out.hostname.lower(),
+                    effective_port,
+                    unquote(parsed_out.path),
+                )
+            if dest_key in seen_destinations:
+                parser.error(f"Duplicate destination specified: {_redact_url(output_file)}")
+            seen_destinations.add(dest_key)
 
         import contextlib
         print(f"Will Read from {_redact_url(source_file)}")
