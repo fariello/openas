@@ -1,6 +1,6 @@
 # openas
 
-A lightweight Python library and CLI for streaming plain and compressed files (`.gz`, `.bz2`, `.xz`, `.zst`) line-by-line or in chunks across local paths and remote protocols (`http://`, `https://`, `ftp://`, `ssh://`, `sftp://`), in both UTF-8 text (`str`) and binary (`bytes`) modes.
+A lightweight Python library and CLI for streaming plain and compressed files (`.gz`, `.bz2`, `.xz`, `.zst`) line-by-line or in chunks across local paths and remote protocols (`http://`, `https://`, `ftp://`, `ssh://`, `sftp://`), in both text (`str`, UTF-8 by default) and binary (`bytes`) modes.
 
 ## Background and Philosophy
 
@@ -9,11 +9,11 @@ A lightweight Python library and CLI for streaming plain and compressed files (`
 **How `openas` compares to `smart_open` and `fsspec`:**
 `smart_open` and `fsspec` also support streaming compressed files line-by-line and excel at cloud object stores (`s3://`, `gs://`, Azure) or full virtual filesystem APIs. `openas` focuses on a smaller, self-contained scope:
 
-- **Unified line-by-line compressed streaming across local and POSIX/network transports:** Reads and writes plain, `.gz`, `.bz2`, `.xz`, and multi-frame `.zst` streams line-by-line in both UTF-8 text (`str`) and raw binary (`bytes`) modes, without requiring manual `io.TextIOWrapper` or `io.BufferedReader` glue (including for `zstandard`, whose raw `stream_reader` does not support `readline()` directly).
+- **Unified line-by-line compressed streaming across local and POSIX/network transports:** Reads and writes plain, `.gz`, `.bz2`, `.xz`, and multi-frame `.zst` streams line-by-line in both text (`str`, UTF-8 by default) and raw binary (`bytes`) modes, without requiring manual `io.TextIOWrapper` or `io.BufferedReader` glue (including for `zstandard`, whose raw `stream_reader` does not support `readline()` directly).
 - **No cloud SDKs and fast startup:** Explicitly excludes cloud object stores (`s3://`, `gs://`, `az://`, `hdfs://`) so it never pulls in cloud SDKs (`boto3`, GCS, Azure). Optional standard-library codecs (`gzip`, `bz2`, `lzma`, `ftplib`, `argparse`, `urllib.parse`) and runtime transport libraries (`paramiko`, `ftputil`, `requests`, `zstandard`, `tqdm`) are imported lazily on first use, while all five runtime dependencies install by default so every documented protocol and codec works immediately.
 - **Built-in transfer tuning, progress, and overwrite safety:** Includes bounded 4 MiB sliding-window SFTP read streaming and write pipelining, thread-local cookie-free HTTP session reuse, raw-byte `tqdm` progress bars (`show_progress=True`), optional sequential `.NNN.bu` backups on overwrite, and a single-pass 64 KiB binary-chunk multi-destination CLI (`--read` / `--write`).
 
-See [GUIDING_PRINCIPLES.md](GUIDING_PRINCIPLES.md) and [DECISIONS.md](DECISIONS.md) for design boundaries and architectural trade-offs.
+See [GUIDING_PRINCIPLES.md](https://github.com/fariello/openas/blob/main/GUIDING_PRINCIPLES.md) and [DECISIONS.md](https://github.com/fariello/openas/blob/main/DECISIONS.md) for design boundaries and architectural trade-offs.
 
 ## Features
 
@@ -160,14 +160,14 @@ python benchmarks/bench_openas.py
 
 ## Documentation
 
-- [Public API Reference](docs/API.md): Signatures, text and binary modes, parameters, exceptions, and handle lifecycle semantics.
-- [CLI Guide](docs/CLI.md): `--read`, `--write`, `--input-file` / `-i`, `--no-backup`, `--compresslevel` / `-c`, `--timeout`, `--progress`, `--version`, and broadcast behavior.
-- [Architecture Overview](ARCHITECTURE.md): Stream layering, transport wrappers, sequential `.bu` backups, and test structure.
-- [Functional Specification](FUNCTIONAL_SPEC.md): Behavioral contracts, edge cases, non-goals, and security boundaries.
-- [Design Decisions](DECISIONS.md): Rationale and trade-offs behind load-bearing invariants.
-- [Guiding Principles](GUIDING_PRINCIPLES.md): Core engineering boundaries of `openas`.
-- [Changelog](CHANGELOG.md): Release history.
-- [Contributing](CONTRIBUTING.md): Development workflow and testing expectations.
+- [Public API Reference](https://github.com/fariello/openas/blob/main/docs/API.md): Signatures, text and binary modes, parameters, exceptions, and handle lifecycle semantics.
+- [CLI Guide](https://github.com/fariello/openas/blob/main/docs/CLI.md): `--read`, `--write`, `--input-file` / `-i`, `--no-backup`, `--compresslevel` / `-c`, `--timeout`, `--progress`, `--version`, and broadcast behavior.
+- [Architecture Overview](https://github.com/fariello/openas/blob/main/ARCHITECTURE.md): Stream layering, transport wrappers, sequential `.bu` backups, and test structure.
+- [Functional Specification](https://github.com/fariello/openas/blob/main/FUNCTIONAL_SPEC.md): Behavioral contracts, edge cases, non-goals, and security boundaries.
+- [Design Decisions](https://github.com/fariello/openas/blob/main/DECISIONS.md): Rationale and trade-offs behind load-bearing invariants.
+- [Guiding Principles](https://github.com/fariello/openas/blob/main/GUIDING_PRINCIPLES.md): Core engineering boundaries of `openas`.
+- [Changelog](https://github.com/fariello/openas/blob/main/CHANGELOG.md): Release history.
+- [Contributing](https://github.com/fariello/openas/blob/main/CONTRIBUTING.md): Development workflow and testing expectations.
 
 ## Troubleshooting and Tips
 
@@ -185,6 +185,6 @@ python benchmarks/bench_openas.py
 
 ## License and Citation
 
-Licensed under the Apache License, Version 2.0. See [LICENSE](LICENSE) and [NOTICE](NOTICE).
+Licensed under the Apache License, Version 2.0. See [LICENSE](https://github.com/fariello/openas/blob/main/LICENSE) and [NOTICE](https://github.com/fariello/openas/blob/main/NOTICE).
 
-If you use `openas` in academic work, technical reports, or publications, please cite it using [CITATION.cff](CITATION.cff).
+If you use `openas` in academic work, technical reports, or publications, please cite it using [CITATION.cff](https://github.com/fariello/openas/blob/main/CITATION.cff).
