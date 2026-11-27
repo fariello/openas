@@ -4,9 +4,10 @@ name: local-leaks
 # (home paths, usernames, hostnames, private repo names, session ids). Created by
 # agent-workflows. This class of leak is NOT caught by ordinary secret scanners.
 #
-# This installs agent-workflows from PyPI (assumes it is reachable). An air-gapped or
-# version-pinned adopter should replace the install line with a pinned/vendored install,
-# and may change the python-version below.
+# Installs agent-workflows from GitHub @main because the current PyPI release (1.2.0)
+# predates the `check-local-leaks` command. Switch back to a pinned PyPI release once
+# `agent-workflows > 1.2.0` is published, or replace the install line with a vendored
+# wheel in air-gapped environments.
 
 on:
   push:

@@ -55,23 +55,28 @@ jobs:
           python-version: "3.12"
           cache: pip
 
-      - name: Build wheel
-        run: python -m pip wheel --no-deps --wheel-dir dist .
-
-      - name: Install built wheel and run round-trip smoke test outside src/
+      - name: Build sdist and wheel and check metadata
         run: |
-          python -m pip install dist/*.whl
+          python -m pip install --upgrade pip build twine
+          python -m build --outdir dist .
+          python -m twine check dist/*
+
+      - name: Install built sdist and wheel and run round-trip smoke test outside src/
+        run: |
+          python -m pip install dist/*.tar.gz
+          python -m pip install --force-reinstall --no-deps dist/*.whl
           CHECKOUT_SRC="$(pwd)/src"
+          WHEEL_PATH="$(ls dist/*.whl)"
           SMOKE_DIR="$(mktemp -d)"
           trap 'rm -rf "$SMOKE_DIR"' EXIT
           cd "$SMOKE_DIR"
-          openas --version
           python -m openas --help
-          CHECKOUT_SRC="$CHECKOUT_SRC" python - <<'PY'
+          CHECKOUT_SRC="$CHECKOUT_SRC" WHEEL_PATH="$WHEEL_PATH" python - <<'PY'
           import os
           import pathlib
           import subprocess
           import sys
+          import zipfile
           import openas
           from openas import openas as open_stream
 
@@ -80,6 +85,19 @@ jobs:
           assert os.path.commonpath([checkout_src, imported_file]) != checkout_src, (
               f"Expected installed wheel, got checkout source: {imported_file}"
           )
+
+          with zipfile.ZipFile(os.environ["WHEEL_PATH"]) as zf:
+              names = set(zf.namelist())
+              assert any(n.endswith(".dist-info/licenses/LICENSE") for n in names), names
+              assert any(n.endswith(".dist-info/licenses/NOTICE") for n in names), names
+
+          res_ver = subprocess.run(
+              ["openas", "--version"],
+              capture_output=True,
+              text=True,
+              check=True,
+          )
+          assert res_ver.stdout.strip() == f"openas {openas.__version__}", res_ver.stdout
 
           work = pathlib.Path.cwd()
           text_payload = "wheel smoke café\nline 2\n"
@@ -101,14 +119,14 @@ jobs:
           cli_src = work / "smoke_text.gz"
           cli_dst = work / "cli_out.zst"
           res_r = subprocess.run(
-              [sys.executable, "-m", "openas", "--read", str(cli_src)],
+              ["openas", "--read", "--progress", str(cli_src)],
               capture_output=True,
               text=True,
               check=True,
           )
           assert "FINISHED Reading." in res_r.stdout
           res_w = subprocess.run(
-              [sys.executable, "-m", "openas", "--write", str(cli_src), str(cli_dst)],
+              ["openas", "--write", "-i", str(cli_src), "--no-backup", "-c", "1", "--progress", str(cli_dst)],
               capture_output=True,
               text=True,
               check=True,

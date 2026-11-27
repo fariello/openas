@@ -13,9 +13,25 @@ license-files = ["LICENSE", "NOTICE"]
 authors = [
   { name = "Gabriele Fariello" }
 ]
+keywords = [
+  "streaming",
+  "compression",
+  "gzip",
+  "bzip2",
+  "lzma",
+  "zstd",
+  "sftp",
+  "ftp",
+  "http",
+  "io",
+  "cli",
+]
 classifiers = [
   "Development Status :: 4 - Beta",
   "Intended Audience :: Developers",
+  "Topic :: Software Development :: Libraries :: Python Modules",
+  "Topic :: System :: Archiving :: Compression",
+  "Topic :: Utilities",
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3.9",
   "Programming Language :: Python :: 3.10",
@@ -26,11 +42,11 @@ classifiers = [
   "Operating System :: OS Independent",
 ]
 dependencies = [
-  "paramiko",
+  "paramiko>=2.1",
   "zstandard>=0.14.0",
-  "requests",
-  "tqdm",
-  "ftputil",
+  "requests>=2.20",
+  "tqdm>=4.0",
+  "ftputil>=5.0",
 ]
 
 [project.optional-dependencies]
