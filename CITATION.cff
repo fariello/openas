@@ -3,7 +3,7 @@ message: "If you use openas in academic work, reports, or publications, please c
 type: software
 title: "openas"
 version: "0.1.0"
-date-released: "2026-11-25"
+date-released: "2026-11-27"
 license: Apache-2.0
 repository-code: "https://github.com/fariello/openas"
 url: "https://github.com/fariello/openas"
